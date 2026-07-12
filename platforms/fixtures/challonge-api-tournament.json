@@ -1,0 +1,21 @@
+{
+  "tournament": {
+    "id": 12345678,
+    "name": "BLKO Weekly #42",
+    "tournament_type": "double elimination",
+    "state": "underway",
+    "participants": [
+      { "participant": { "id": 101, "display_name": "Flash", "seed": 1, "final_rank": 1, "group_player_ids": [] } },
+      { "participant": { "id": 102, "display_name": "Rival", "seed": 2, "final_rank": 2, "group_player_ids": [] } },
+      { "participant": { "id": 103, "display_name": "Zangief Main", "seed": 3, "final_rank": 4, "group_player_ids": [] } },
+      { "participant": { "id": 104, "display_name": "Newbie", "seed": 4, "final_rank": 3, "group_player_ids": [] } }
+    ],
+    "matches": [
+      { "match": { "id": 9001, "round": 1, "state": "complete", "player1_id": 101, "player2_id": 104, "winner_id": 101, "scores_csv": "2-0", "suggested_play_order": 1 } },
+      { "match": { "id": 9002, "round": 1, "state": "complete", "player1_id": 102, "player2_id": 103, "winner_id": 102, "scores_csv": "2-1", "suggested_play_order": 2 } },
+      { "match": { "id": 9003, "round": 2, "state": "open", "player1_id": 101, "player2_id": 102, "winner_id": null, "scores_csv": "1-1", "suggested_play_order": 3 } },
+      { "match": { "id": 9004, "round": -1, "state": "open", "player1_id": 104, "player2_id": 103, "winner_id": null, "scores_csv": "", "suggested_play_order": 4 } },
+      { "match": { "id": 9005, "round": 3, "state": "pending", "player1_id": null, "player2_id": null, "winner_id": null, "scores_csv": "", "suggested_play_order": 5 } }
+    ]
+  }
+}

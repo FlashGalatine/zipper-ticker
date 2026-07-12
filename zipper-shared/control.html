@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Zipper — ticker control</title>
+<!--
+  Browser control page — open http://127.0.0.1:7474/zipper-shared/control.html
+  in any browser (or dock it in OBS: Docks → Custom Browser Docks). Everything
+  goes through the "Ticker Command" Streamer.bot action; the sidecar answers
+  with ticker:status snapshots, and the live preview mirrors ticker:update.
+  ?sbport=<n> overrides the Streamer.bot WebSocket port.
+-->
+<style>
+  :root { --bg:#14171c; --panel:#1c2129; --ink:#e8ecf1; --muted:#8b94a3; --acc:#ffd166; --bad:#ff4d5e; --ok:#3ddc84; --edge:#2a3342; }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:18px; background:var(--bg); color:var(--ink); font:14px/1.5 'Segoe UI', system-ui, sans-serif; max-width:640px; }
+  h1 { font-size:17px; margin:0 0 4px; letter-spacing:.04em; }
+  h1 .dot { display:inline-block; width:9px; height:9px; border-radius:50%; background:var(--bad); margin-right:8px; vertical-align:1px; }
+  body:not(.offline) h1 .dot { background: var(--ok); }
+  .sub { color:var(--muted); font-size:12px; margin-bottom:14px; }
+  fieldset { border:1px solid var(--edge); border-radius:8px; background:var(--panel); margin:0 0 12px; padding:12px 14px; }
+  legend { padding:0 6px; color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.1em; }
+  label { display:block; color:var(--muted); font-size:12px; margin:8px 0 3px; }
+  input[type=text], input[type=number] { width:100%; padding:7px 9px; border:1px solid var(--edge); border-radius:6px; background:#10141a; color:var(--ink); font:inherit; }
+  .row { display:flex; gap:8px; align-items:flex-end; }
+  .row > div { flex:1 1 auto; }
+  button { padding:7px 14px; border:1px solid var(--edge); border-radius:6px; background:#232a35; color:var(--ink); font:inherit; font-weight:600; cursor:pointer; }
+  button:hover { border-color: var(--acc); }
+  button.primary { background:var(--acc); color:#14171c; border-color:var(--acc); }
+  button.danger { border-color: var(--bad); color: var(--bad); background:transparent; }
+  .btns { display:flex; gap:8px; margin-top:10px; }
+  .status { font-size:12.5px; }
+  .status b { color: var(--acc); }
+  .status .err { color: var(--bad); }
+  .status .dim { color: var(--muted); }
+  .preview { background:#10141a; border:1px solid var(--edge); border-radius:6px; padding:8px 10px; margin-top:8px;
+    font-size:12.5px; max-height:180px; overflow:auto; }
+  .preview .m { padding:2px 0; border-bottom:1px dashed #222a35; }
+  .preview .m:last-child { border-bottom:none; }
+  .preview .win { color:var(--acc); font-weight:700; }
+  .preview .live { color:var(--bad); font-weight:700; }
+  .preview .rnd { color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.06em; margin-right:6px; }
+</style>
+</head>
+<body>
+<h1><span class="dot"></span>Zipper — Tournament Ticker</h1>
+<div class="sub">Ticker Command → sidecar · needs the sidecar running (<code>npm run sidecar</code>)</div>
+
+<fieldset>
+  <legend>Tournament</legend>
+  <label for="url">Tournament URL (Challonge or start.gg; others coming)</label>
+  <div class="row">
+    <div><input type="text" id="url" placeholder="https://challonge.com/blko42 · https://www.start.gg/tournament/…/event/…"></div>
+    <button id="btn-seturl">Set</button>
+  </div>
+  <div class="btns">
+    <button class="primary" id="btn-start">Start polling</button>
+    <button id="btn-poll">Poll now</button>
+    <button class="danger" id="btn-stop">Stop</button>
+  </div>
+</fieldset>
+
+<fieldset>
+  <legend>Options</legend>
+  <div class="row">
+    <div>
+      <label for="interval">Poll interval (seconds, min 15)</label>
+      <input type="number" id="interval" min="15" max="3600" value="30">
+    </div>
+    <div>
+      <label for="maxitems">Max ticker items</label>
+      <input type="number" id="maxitems" min="1" max="100" value="20">
+    </div>
+    <div>
+      <label for="topn">Top N only (0 = all)</label>
+      <input type="number" id="topn" min="0" max="100" value="0">
+    </div>
+    <button id="btn-opts">Apply</button>
+  </div>
+</fieldset>
+
+<fieldset>
+  <legend>End caps</legend>
+  <label for="capstext">Static text (right cap — social handle, event name…)</label>
+  <input type="text" id="capstext" placeholder="@FlashGalatine">
+  <label for="capslogo">Logo URL (left cap — e.g. /zipper-overlay/assets/logo.png)</label>
+  <input type="text" id="capslogo" placeholder="(empty = no logo cap)">
+  <div class="btns"><button id="btn-caps">Apply caps</button></div>
+</fieldset>
+
+<fieldset>
+  <legend>Announcement</legend>
+  <div class="row">
+    <div style="flex:0 0 130px">
+      <label for="ann-kind">Kind</label>
+      <select id="ann-kind" style="width:100%;padding:7px 9px;border:1px solid var(--edge);border-radius:6px;background:#10141a;color:var(--ink);font:inherit">
+        <option value="custom">Custom</option>
+        <option value="sub">New Sub</option>
+        <option value="raid">Raid</option>
+        <option value="milestone">Milestone</option>
+      </select>
+    </div>
+    <div>
+      <label for="ann-text">Text (interrupts the strip for the duration)</label>
+      <input type="text" id="ann-text" placeholder="Back-to-back champion enters the bracket!">
+    </div>
+    <div style="flex:0 0 80px">
+      <label for="ann-dur">Seconds</label>
+      <input type="number" id="ann-dur" min="2" max="30" value="8">
+    </div>
+    <button class="primary" id="btn-announce">Send</button>
+  </div>
+</fieldset>
+
+<fieldset>
+  <legend>Status</legend>
+  <div class="status" id="status"><span class="dim">waiting for sidecar…</span></div>
+  <div class="preview" id="preview"><span class="dim">no ticker payload yet</span></div>
+</fieldset>
+
+<script src="panel-core.js"></script>
+<script>
+(() => {
+  'use strict';
+  const $ = (id) => document.getElementById(id);
+  const esc = (s) => { const d = document.createElement('div'); d.textContent = String(s ?? ''); return d.innerHTML; };
+  const send = (command, value) => {
+    if (!window.__ZIPPER_SEND_COMMAND || !window.__ZIPPER_SEND_COMMAND(command, value)) {
+      $('status').innerHTML = '<span class="err">Not connected to Streamer.bot — is its WebSocket Server running (auth off)?</span>';
+    }
+  };
+
+  $('btn-seturl').onclick = () => send('setUrl', $('url').value.trim());
+  $('btn-start').onclick = () => send('start');
+  $('btn-stop').onclick = () => send('stop');
+  $('btn-poll').onclick = () => send('pollNow');
+  $('btn-opts').onclick = () => {
+    send('setInterval', String(Math.round(Number($('interval').value) * 1000) || 30000));
+    send('setMaxItems', $('maxitems').value);
+    send('setTopN', $('topn').value);
+  };
+  $('btn-caps').onclick = () => {
+    send('setCapsText', $('capstext').value);
+    send('setCapsLogo', $('capslogo').value.trim());
+  };
+  $('btn-announce').onclick = () => {
+    const text = $('ann-text').value.trim();
+    if (!text) return;
+    window.__ZIPPER_DO_ACTION('Ticker Announce', {
+      kind: $('ann-kind').value,
+      text,
+      duration: $('ann-dur').value,
+    });
+    $('ann-text').value = '';
+  };
+
+  // Fields the operator is typing in shouldn't be clobbered by status echoes.
+  const dirty = new Set();
+  for (const id of ['url', 'interval', 'maxitems', 'topn', 'capstext', 'capslogo']) {
+    $(id).addEventListener('focus', () => dirty.add(id));
+    $(id).addEventListener('blur', () => dirty.delete(id));
+  }
+  const setIfClean = (id, v) => { if (!dirty.has(id)) $(id).value = v; };
+
+  // ticker:status rides the command relay as command "__status" (docs/PROTOCOL.md).
+  window.addEventListener('ticker:command', (e) => {
+    const d = e.detail || {};
+    if (d.command !== '__status') return;
+    let s; try { s = JSON.parse(d.value); } catch { return; }
+    setIfClean('url', s.url || '');
+    setIfClean('interval', Math.round((s.intervalMs || 30000) / 1000));
+    setIfClean('maxitems', s.maxItems || 20);
+    setIfClean('topn', s.topN ?? 0);
+    if (s.caps) { setIfClean('capstext', s.caps.text || ''); setIfClean('capslogo', s.caps.logo || ''); }
+    $('status').innerHTML =
+      `Polling: <b>${s.polling ? 'ON' : 'off'}</b>` +
+      ` · Platform: <b>${esc(s.platform || '—')}</b>` +
+      ` · Last poll: <span class="dim">${esc(s.lastPollAt ? new Date(s.lastPollAt).toLocaleTimeString() : 'never')}</span>` +
+      ` · Milestones: <b>${s.se?.configured ? 'ON' : 'off'}</b>` +
+      (s.lastError ? `<br><span class="err">${esc(s.lastError)}</span>` : '') +
+      (s.se?.lastError ? `<br><span class="err">SE: ${esc(s.se.lastError)}</span>` : '');
+  });
+
+  // Live mini-preview of what the strip is showing.
+  window.addEventListener('ticker:update', (e) => {
+    const p = e.detail || {};
+    const rows = [];
+    if (p.tournament?.name) rows.push(`<div class="m"><b>${esc(p.tournament.name)}</b></div>`);
+    for (const m of p.matches || []) {
+      const rnd = `<span class="rnd">${esc(m.round || '')}</span>`;
+      if (m.state === 'completed') {
+        rows.push(`<div class="m">${rnd}<span class="${m.winner === 1 ? 'win' : ''}">${esc(m.p1?.name)}</span> ${esc(m.p1?.score)}–${esc(m.p2?.score)} <span class="${m.winner === 2 ? 'win' : ''}">${esc(m.p2?.name)}</span></div>`);
+      } else if (m.state === 'in_progress') {
+        rows.push(`<div class="m">${rnd}<span class="live">LIVE</span> ${esc(m.p1?.name)} ${m.p1?.score ?? ''}–${m.p2?.score ?? ''} ${esc(m.p2?.name)}</div>`);
+      } else {
+        rows.push(`<div class="m">${rnd}up next · ${esc(m.p1?.name)} vs ${esc(m.p2?.name)}</div>`);
+      }
+    }
+    for (const s of p.standings || []) rows.push(`<div class="m">#${esc(s.placement)} ${esc(s.name)}</div>`);
+    $('preview').innerHTML = rows.length ? rows.join('') : '<span class="dim">empty ticker payload</span>';
+  });
+
+  // Ask the sidecar for a status snapshot once connected (small delay so the
+  // panel-core connect + subscribe settles first).
+  setTimeout(() => send('status'), 800);
+})();
+</script>
+</body>
+</html>

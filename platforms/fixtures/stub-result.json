@@ -1,0 +1,20 @@
+{
+  "tournamentName": "Stub Invitational",
+  "state": "in_progress",
+  "matches": [
+    { "id": "s1", "round": "Winners Final", "state": "completed",
+      "p1": { "name": "Flash", "score": 3 }, "p2": { "name": "Rival", "score": 1 }, "winner": 1, "order": 2 },
+    { "id": "s2", "round": "Losers Semis", "state": "in_progress",
+      "p1": { "name": "Newbie", "score": 1 }, "p2": { "name": "Zangief Main", "score": 1 }, "winner": 0, "order": 3 },
+    { "id": "s3", "round": "Grand Final", "state": "upcoming",
+      "p1": { "name": "Flash", "score": null }, "p2": { "name": "TBD", "score": null }, "winner": 0, "order": 4 },
+    { "id": "s4", "round": "True Final", "state": "upcoming",
+      "p1": { "name": "TBD", "score": null }, "p2": { "name": "TBD", "score": null }, "winner": 0, "order": 5 }
+  ],
+  "standings": [
+    { "placement": 1, "name": "Flash" },
+    { "placement": 2, "name": "Rival" },
+    { "placement": 3, "name": "Newbie" },
+    { "placement": 4, "name": "Zangief Main" }
+  ]
+}

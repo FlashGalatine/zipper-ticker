@@ -1,0 +1,21 @@
+{
+  "name": "zipper-ticker",
+  "version": "0.1.0",
+  "description": "Zipper — a scrolling tournament-results ticker overlay for OBS, driven by Streamer.bot",
+  "type": "module",
+  "license": "MIT",
+  "author": "Flash Galatine",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node mock-sb-server.mjs",
+    "sidecar": "node zipper-sidecar.mjs",
+    "verify": "node verify.mjs",
+    "verify:render": "node verify-render.mjs",
+    "shots": "node tools/shots.mjs"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

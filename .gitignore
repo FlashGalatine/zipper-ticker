@@ -1,0 +1,7 @@
+# Local config (API keys, tournament URL, caps) — copy config.example.json to config.json
+config.json
+
+node_modules/
+test-render*.png
+test-live*.png
+control-render*.png

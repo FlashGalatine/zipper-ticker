@@ -1,0 +1,25 @@
+{
+  "id": 111111,
+  "name": "SF6 Singles",
+  "state": 2,
+  "tournament": { "name": "Solution to Sunday 9" },
+  "sets": {
+    "nodes": [
+      { "id": "set-3", "state": 2, "round": 3, "fullRoundText": "Winners Final", "displayScore": "Flash 1 - Rival 1", "winnerId": null,
+        "slots": [
+          { "entrant": { "id": 201, "name": "Flash" }, "standing": { "stats": { "score": { "value": 1 } } } },
+          { "entrant": { "id": 202, "name": "Rival" }, "standing": { "stats": { "score": { "value": 1 } } } }
+        ] },
+      { "id": "set-2", "state": 3, "round": 2, "fullRoundText": "Winners Semi-Final", "displayScore": "Flash 2 - Newbie 0", "winnerId": 201,
+        "slots": [
+          { "entrant": { "id": 201, "name": "Flash" }, "standing": { "stats": { "score": { "value": 2 } } } },
+          { "entrant": { "id": 204, "name": "Newbie" }, "standing": { "stats": { "score": { "value": 0 } } } }
+        ] },
+      { "id": "set-4", "state": 1, "round": -2, "fullRoundText": "Losers Quarter-Final", "displayScore": null, "winnerId": null,
+        "slots": [
+          { "entrant": { "id": 204, "name": "Newbie" }, "standing": null },
+          { "entrant": null, "standing": null }
+        ] }
+    ]
+  }
+}

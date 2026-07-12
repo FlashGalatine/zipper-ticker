@@ -1,0 +1,12 @@
+{
+  "challongeApiKey": null,
+  "startggApiKey": null,
+  "tournamentUrl": null,
+  "pollIntervalMs": 30000,
+  "maxItems": 20,
+  "topN": 0,
+  "caps": { "text": "", "logo": "" },
+  "streamElements": { "jwtToken": null, "pollSeconds": 60 },
+  "milestones": { "followers": 0, "subs": 0, "tips": 0, "cheers": 0 },
+  "autoStart": false
+}

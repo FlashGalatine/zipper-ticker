@@ -1,0 +1,23 @@
+{
+  "tournament": { "name": "BLKO Weekly #42", "tournament_type": "double elimination" },
+  "matches_by_round": {
+    "1": [
+      { "id": 9001, "state": "complete", "round": 1, "winner_id": 101, "scores": [2, 0], "suggested_play_order": 1,
+        "player1": { "id": 101, "display_name": "Flash", "seed": 1 },
+        "player2": { "id": 104, "display_name": "Newbie", "seed": 4 } },
+      { "id": 9002, "state": "complete", "round": 1, "winner_id": 102, "scores_csv": "2-1", "suggested_play_order": 2,
+        "player1": { "id": 102, "display_name": "Rival", "seed": 2 },
+        "player2": { "id": 103, "display_name": "Zangief Main", "seed": 3 } }
+    ],
+    "2": [
+      { "id": 9003, "state": "open", "round": 2, "winner_id": null, "scores": [1, 1], "suggested_play_order": 3,
+        "player1": { "id": 101, "display_name": "Flash", "seed": 1 },
+        "player2": { "id": 102, "display_name": "Rival", "seed": 2 } }
+    ],
+    "-1": [
+      { "id": 9004, "state": "pending", "round": -1, "winner_id": null, "scores_csv": "", "suggested_play_order": 4,
+        "player1": { "id": 104, "display_name": "Newbie", "seed": 4 },
+        "player2": { "id": 103, "display_name": "Zangief Main", "seed": 3 } }
+    ]
+  }
+}

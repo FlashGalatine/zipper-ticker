@@ -1,0 +1,12 @@
+{
+  "body": {
+    "id": 424242,
+    "title": "Community Clash Cup",
+    "individualParticipants": [
+      { "userId": 1, "displayName": "Flash", "entryWeight": 1, "placement": 1 },
+      { "userId": 2, "displayName": "Rival", "entryWeight": 2, "placement": 2 },
+      { "userId": 3, "displayName": "Zangief Main", "entryWeight": 0, "placement": 3 },
+      { "userId": 4, "displayName": "Newbie", "entryWeight": 0, "placement": 0 }
+    ]
+  }
+}

@@ -1,0 +1,33 @@
+{
+  "tournament": { "tournament_type": "double elimination" },
+  "matches_by_round": {
+    "1": [
+      { "id": 1, "state": "complete", "round": 1, "winner_id": 1, "scores": [2, 0],
+        "player1": { "id": 1, "display_name": "Alpha", "seed": 1 },
+        "player2": { "id": 2, "display_name": "Bravo", "seed": 4 } },
+      { "id": 2, "state": "complete", "round": 1, "winner_id": 3, "scores": [2, 1],
+        "player1": { "id": 3, "display_name": "Charlie", "seed": 2 },
+        "player2": { "id": 4, "display_name": "Delta", "seed": 3 } }
+    ],
+    "2": [
+      { "id": 3, "state": "complete", "round": 2, "winner_id": 1, "scores": [2, 1],
+        "player1": { "id": 1, "display_name": "Alpha", "seed": 1 },
+        "player2": { "id": 3, "display_name": "Charlie", "seed": 2 } }
+    ],
+    "3": [
+      { "id": 5, "state": "complete", "round": 3, "winner_id": 1, "scores": [3, 1],
+        "player1": { "id": 1, "display_name": "Alpha", "seed": 1 },
+        "player2": { "id": 3, "display_name": "Charlie", "seed": 2 } }
+    ],
+    "-1": [
+      { "id": 4, "state": "complete", "round": -1, "winner_id": 2, "scores": [2, 0],
+        "player1": { "id": 2, "display_name": "Bravo", "seed": 4 },
+        "player2": { "id": 4, "display_name": "Delta", "seed": 3 } }
+    ],
+    "-2": [
+      { "id": 6, "state": "complete", "round": -2, "winner_id": 3, "scores": [2, 0],
+        "player1": { "id": 3, "display_name": "Charlie", "seed": 2 },
+        "player2": { "id": 2, "display_name": "Bravo", "seed": 4 } }
+    ]
+  }
+}

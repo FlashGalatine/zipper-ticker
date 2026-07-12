@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Zipper — tournament ticker</title>
+<!--
+  OBS Browser Source URL (served by Streamer.bot's HTTP server — the zipper-overlay
+  and zipper-shared Path→Folder maps, see README.md):
+
+    http://127.0.0.1:7474/zipper-overlay/ticker.html?w=1920
+
+  Query params (http:// only — OBS file:// sources ignore them):
+    ?w=<px>      strip width  (default 1920; e.g. 640 for retro layouts)
+    ?speed=<n>   scroll speed in px/s (default 80)
+    ?sbport=<n>  Streamer.bot WS port override
+  Set the OBS source width to match ?w and height to 72 (or your --ticker-height).
+-->
+<link rel="stylesheet" href="ticker.css">
+</head>
+<body>
+  <div class="zipper">
+    <div class="cap cap-left" id="cap-left"></div>
+    <div class="track-wrap" id="track-wrap">
+      <div class="track" id="track"></div>
+      <div class="announce-wrap" id="announce">
+        <span class="pill" id="announce-pill"></span>
+        <span class="text" id="announce-text"></span>
+      </div>
+    </div>
+    <div class="cap cap-right" id="cap-right"></div>
+  </div>
+  <script src="/zipper-shared/panel-core.js"></script>
+  <script src="ticker.js"></script>
+</body>
+</html>
