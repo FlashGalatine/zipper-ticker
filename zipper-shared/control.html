@@ -19,6 +19,11 @@
   h1 .dot { display:inline-block; width:9px; height:9px; border-radius:50%; background:var(--bad); margin-right:8px; vertical-align:1px; }
   body:not(.offline) h1 .dot { background: var(--ok); }
   .sub { color:var(--muted); font-size:12px; margin-bottom:14px; }
+  .warn { display:none; color:#ffd7dd; background:#241318; border:1px solid var(--bad);
+    border-radius:8px; padding:9px 12px; font-size:12.5px; line-height:1.45; margin:0 0 12px; }
+  body.no-sidecar .warn { display:block; }
+  .warn b { color:#fff; }
+  .warn code { background:#3a1a20; padding:.05em .4em; border-radius:4px; color:#ffd7dd; }
   fieldset { border:1px solid var(--edge); border-radius:8px; background:var(--panel); margin:0 0 12px; padding:12px 14px; }
   legend { padding:0 6px; color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.1em; }
   label { display:block; color:var(--muted); font-size:12px; margin:8px 0 3px; }
@@ -46,6 +51,12 @@
 <body>
 <h1><span class="dot"></span>Zipper — Tournament Ticker</h1>
 <div class="sub">Ticker Command → sidecar · needs the sidecar running (<code>npm run sidecar</code>)</div>
+<div id="sidecar-note" class="warn">
+  ⚠ <b>The Zipper sidecar isn't responding.</b> Streamer.bot is connected (announcements still work),
+  but <b>Start / Poll / Stop / Options / end-cap</b> buttons do nothing until the sidecar is running.
+  Launch <code>start-zipper.bat</code> (or run <code>npm run sidecar</code> in the Zipper folder), or add the
+  <code>Ticker Sidecar Start</code> action in Streamer.bot.
+</div>
 
 <fieldset>
   <legend>Tournament</legend>
@@ -125,10 +136,34 @@
   'use strict';
   const $ = (id) => document.getElementById(id);
   const esc = (s) => { const d = document.createElement('div'); d.textContent = String(s ?? ''); return d.innerHTML; };
+
+  // Sidecar liveness: every command should draw a ticker:status reply from the
+  // sidecar. If none arrives within the window, the sidecar is down — the
+  // commands are being broadcast into the void (announcements still work, since
+  // those go SB → overlay without the sidecar). Show a banner instead of
+  // silently swallowing the click.
+  let lastStatusAt = 0;
+  let heartbeatTimer = null;
+  const HEARTBEAT_MS = 3000;
+  function armHeartbeat() {
+    if (heartbeatTimer) clearTimeout(heartbeatTimer);
+    heartbeatTimer = setTimeout(() => {
+      heartbeatTimer = null;
+      if (Date.now() - lastStatusAt > HEARTBEAT_MS - 250) document.body.classList.add('no-sidecar');
+    }, HEARTBEAT_MS);
+  }
+  function noteSidecarAlive() {
+    lastStatusAt = Date.now();
+    document.body.classList.remove('no-sidecar');
+    if (heartbeatTimer) { clearTimeout(heartbeatTimer); heartbeatTimer = null; }
+  }
+
   const send = (command, value) => {
     if (!window.__ZIPPER_SEND_COMMAND || !window.__ZIPPER_SEND_COMMAND(command, value)) {
       $('status').innerHTML = '<span class="err">Not connected to Streamer.bot — is its WebSocket Server running (auth off)?</span>';
+      return;
     }
+    armHeartbeat(); // expect a status reply from the sidecar; warn if it never comes
   };
 
   $('btn-seturl').onclick = () => send('setUrl', $('url').value.trim());
@@ -167,6 +202,7 @@
   window.addEventListener('ticker:command', (e) => {
     const d = e.detail || {};
     if (d.command !== '__status') return;
+    noteSidecarAlive();
     let s; try { s = JSON.parse(d.value); } catch { return; }
     setIfClean('url', s.url || '');
     setIfClean('interval', Math.round((s.intervalMs || 30000) / 1000));
@@ -202,8 +238,10 @@
   });
 
   // Ask the sidecar for a status snapshot once connected (small delay so the
-  // panel-core connect + subscribe settles first).
+  // panel-core connect + subscribe settles first), then re-probe periodically so
+  // the liveness banner stays honest if the sidecar dies while the page is open.
   setTimeout(() => send('status'), 800);
+  setInterval(() => send('status'), 10000);
 })();
 </script>
 </body>

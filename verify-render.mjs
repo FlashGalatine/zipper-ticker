@@ -107,6 +107,11 @@ try {
   await page.waitForSelector('#preview .m', { timeout: 8000 });
   const rows = await page.locator('#preview .m').count();
   check('control: preview mirrors ticker payload', rows >= 5, String(rows));
+  // The mock has no sidecar consuming ticker:command, so no __status ever comes
+  // back → the liveness heartbeat should surface the "sidecar down" banner.
+  await page.waitForSelector('body.no-sidecar', { timeout: 6000 }).catch(() => {});
+  const warnShown = await page.locator('#sidecar-note').isVisible();
+  check('control: warns when sidecar is absent', warnShown, String(warnShown));
   await page.screenshot({ path: resolve(__dirname, 'control-render.png') });
   await page.close();
 } catch (err) {

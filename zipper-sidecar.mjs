@@ -176,6 +176,11 @@ function nextDelay() {
 }
 
 async function pollOnce() {
+  // Emit a status snapshot the moment a poll is requested. The control page's
+  // liveness heartbeat expects a reply per command, and a slow fetch would
+  // otherwise delay it past the window; this also reflects "polling on" the
+  // instant Start is clicked instead of only after the first fetch returns.
+  pushStatus();
   if (pollInFlight) return;
   pollInFlight = true;
   try {

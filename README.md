@@ -37,15 +37,19 @@ on `:8080` (authentication OFF) and its **HTTP Server** on `:7474`.
 
 ### 1. Streamer.bot actions
 
-Create two actions — names must match exactly:
+Create these actions — names must match exactly:
 
 | Action name      | Sub-action | Paste |
 |------------------|-----------|-------|
 | `Ticker Push`    | Core → C# → Execute C# Code | [`actions/ticker-push.cs`](actions/ticker-push.cs) |
 | `Ticker Command` | Core → C# → Execute C# Code | [`actions/ticker-command.cs`](actions/ticker-command.cs) |
 | `Ticker Announce` | Core → C# → Execute C# Code | [`actions/ticker-announce.cs`](actions/ticker-announce.cs) |
+| `Ticker Sidecar Start` *(optional)* | Core → C# → Execute C# Code | [`actions/ticker-sidecar-start.cs`](actions/ticker-sidecar-start.cs) |
 
-Click **Compile** on each — both must report success.
+Click **Compile** on each — all must report success. `Ticker Sidecar Start`
+also needs `System.dll` added on its References tab (see the file's header);
+edit its `BUNDLE` path and add SB's application-started trigger to auto-launch
+the sidecar with Streamer.bot.
 
 ### 2. HTTP maps
 
@@ -74,6 +78,12 @@ OBS `file://` sources ignore `?w=` and friends.
 npm install
 start-zipper.bat        (or: npm run sidecar)
 ```
+
+**The sidecar must be running** — it's what turns control-page clicks into
+polls and pushes. If it isn't up, the control page shows a red banner and the
+Start / Poll / Stop / end-cap buttons do nothing (announcements still work, as
+those go Streamer.bot → overlay without the sidecar). The `Ticker Sidecar
+Start` action above lets Streamer.bot launch it for you.
 
 Copy `config.example.json` → `config.json` for API keys (optional but
 recommended: `challongeApiKey`, `startggApiKey` — without them Zipper falls
