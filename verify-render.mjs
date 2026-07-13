@@ -78,6 +78,17 @@ try {
     await page.close();
   }
 
+  // ?h= sets the strip height (mirrors ?w=).
+  {
+    const H = 120;
+    const page = await browser.newPage({ viewport: { width: 1920, height: H } });
+    await page.goto(`${HTTP}/zipper-overlay/ticker.html?w=1920&h=${H}&sbport=${WS_PORT}`);
+    await page.waitForSelector('.track .seg .item', { timeout: 8000 });
+    const stripH = await page.locator('.zipper').evaluate((el) => el.getBoundingClientRect().height);
+    check(`height: strip honors ?h=${H}`, Math.round(stripH) === H, String(stripH));
+    await page.close();
+  }
+
   // Announcement takeover: strip pauses, announcement shows, then restores.
   {
     const page = await browser.newPage({ viewport: { width: 1920, height: 72 } });

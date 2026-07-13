@@ -8,7 +8,7 @@ custom properties in `overlay/ticker.css`. You never need to touch the JS.
 ```css
 :root {
   --ticker-width: 1920px;   /* strip width; ?w=<px> overrides over http */
-  --ticker-height: 72px;
+  --ticker-height: 72px;    /* strip height; ?h=<px> overrides over http */
   --ticker-speed: 80;       /* px per second (unitless); ?speed=<n> overrides */
 
   --ticker-bg: #101318;     /* strip background */
@@ -37,9 +37,11 @@ custom properties in `overlay/ticker.css`. You never need to touch the JS.
 2. **Edit `ticker.css`** — change the `:root` block; every OBS source picks it
    up on refresh.
 
-3. **URL params** (http-served sources only): `?w=640` width, `?speed=60`
-   scroll speed. OBS `file://` sources ignore query params — always load the
-   overlay through Streamer.bot's HTTP server (`http://127.0.0.1:7474/...`).
+3. **URL params** (http-served sources only): `?w=640` width, `?h=48` height,
+   `?speed=60` scroll speed. OBS `file://` sources ignore query params — always
+   load the overlay through Streamer.bot's HTTP server
+   (`http://127.0.0.1:7474/...`). Note the item text sizes off `--ticker-font-size`
+   (not the height), so for a very short strip also drop that var via Custom CSS.
 
 ## Anatomy
 

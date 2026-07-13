@@ -7,13 +7,14 @@
   OBS Browser Source URL (served by Streamer.bot's HTTP server — the zipper-overlay
   and zipper-shared Path→Folder maps, see README.md):
 
-    http://127.0.0.1:7474/zipper-overlay/ticker.html?w=1920
+    http://127.0.0.1:7474/zipper-overlay/ticker.html?w=1920&h=72
 
   Query params (http:// only — OBS file:// sources ignore them):
     ?w=<px>      strip width  (default 1920; e.g. 640 for retro layouts)
+    ?h=<px>      strip height (default 72; min 20)
     ?speed=<n>   scroll speed in px/s (default 80)
     ?sbport=<n>  Streamer.bot WS port override
-  Set the OBS source width to match ?w and height to 72 (or your --ticker-height).
+  Set the OBS source width to match ?w and height to match ?h.
 -->
 <link rel="stylesheet" href="ticker.css">
 </head>

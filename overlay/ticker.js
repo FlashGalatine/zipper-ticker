@@ -11,6 +11,9 @@
   // Width: ?w=<px> (http-served sources only) or window.__TICKER_WIDTH, default 1920.
   const w = Number(q.get('w')) || Number(window.__TICKER_WIDTH) || 0;
   if (w >= 200) document.documentElement.style.setProperty('--ticker-width', `${Math.round(w)}px`);
+  // Height: ?h=<px> or window.__TICKER_HEIGHT, default 72 (see ticker.css).
+  const h = Number(q.get('h')) || Number(window.__TICKER_HEIGHT) || 0;
+  if (h >= 20) document.documentElement.style.setProperty('--ticker-height', `${Math.round(h)}px`);
   const speedParam = Number(q.get('speed')) || Number(window.__TICKER_SPEED) || 0;
   if (speedParam > 0) document.documentElement.style.setProperty('--ticker-speed', String(speedParam));
 
