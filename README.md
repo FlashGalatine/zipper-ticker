@@ -66,11 +66,12 @@ Streamer.bot → Servers/Clients → HTTP Server → add two Path→Folder maps
 Add a Browser Source:
 
 ```
-http://127.0.0.1:7474/zipper-overlay/ticker.html?w=1920
+http://127.0.0.1:7474/zipper-overlay/ticker.html?w=1920&h=72
 ```
 
-Width 1920 (match `?w=`), height 72. Use the http URL, not a local file —
-OBS `file://` sources ignore `?w=` and friends.
+Set the OBS source size to match: `?w=` width (default 1920), `?h=` height
+(default 72). Use the http URL, not a local file — OBS `file://` sources ignore
+`?w=`/`?h=` and friends.
 
 ### 4. Sidecar
 
@@ -133,14 +134,26 @@ key (start.gg → developer settings).
 
 ```
 npm start               # mock Streamer.bot (:7474/:8080) + sample data at /mock/fixture
-npm run verify          # 63 checks: normalizer fixtures, panel-core, sidecar E2E — no network
+npm run verify          # 65 checks: normalizer fixtures, panel-core, sidecar E2E — no network
 npm run verify:render   # real-pixel screenshots at 1920/640 (npm i --no-save playwright-core)
 npm run shots           # regenerate docs/ screenshots
 ```
 
 Docs: [wire protocol](docs/PROTOCOL.md) · [theming](docs/THEMING.md)
 
-## License
+## Author & support
 
-MIT — see [LICENSE](LICENSE). Third-party notes in
+Built by **Ashe "Flash" Galatine**.
+
+- Email — [AsheJunius@gmail.com](mailto:AsheJunius@gmail.com)
+- X — [@AsheJunius](https://x.com/AsheJunius) · BlueSky — [@projectgalatine.com](https://bsky.app/profile/projectgalatine.com)
+- Twitch — [FlashGalatine](https://www.twitch.tv/FlashGalatine) · Discord — [Newbie Fight Club](https://discord.gg/NewbieFightClub)
+- Support — Patreon [ProjectGalatine](https://www.patreon.com/ProjectGalatine) · CashApp [$ProjectGalatine](https://cash.app/$ProjectGalatine)
+
+## Credits & license
+
+MIT — see [LICENSE](LICENSE). The tournament platform matchers/scrapers are
+adapted from the roster importer in [StreamScoreboard](https://github.com/FlashGalatine)
+(same author, MIT), extended here to read live match results. Sole runtime
+dependency is [ws](https://github.com/websockets/ws) (MIT). See
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

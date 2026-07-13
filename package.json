@@ -4,7 +4,7 @@
   "description": "Zipper — a scrolling tournament-results ticker overlay for OBS, driven by Streamer.bot",
   "type": "module",
   "license": "MIT",
-  "author": "Flash Galatine",
+  "author": "Ashe \"Flash\" Galatine <AsheJunius@gmail.com>",
   "engines": {
     "node": ">=18"
   },
