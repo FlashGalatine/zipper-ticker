@@ -77,11 +77,25 @@ which the sidecar consumes. Commands:
 | `stop`        | —                              | stop polling |
 | `pollNow`     | —                              | immediate poll (starts polling if stopped) |
 | `setInterval` | milliseconds (min 15000)       | poll cadence |
-| `setCapsText` | string (≤120 chars)            | right-cap static text |
-| `setCapsLogo` | URL/path (≤500 chars)          | left-cap logo image |
+| `setCaps`     | JSON `{text,logo}`             | **batched** — sets both end caps in one command (the control page uses this) |
+| `setOptions`  | JSON `{intervalMs,maxItems,topN}` | **batched** — sets all three options in one command |
+| `setCapsText` | string (≤120 chars)            | right-cap static text (single-field; for chat / Stream Deck) |
+| `setCapsLogo` | URL/path (≤500 chars)          | left-cap logo image (single-field) |
+| `setInterval` above, `setMaxItems`, `setTopN` | see below | single-field variants |
 | `setMaxItems` | 1–100                          | ticker item cap |
 | `setTopN`     | 0–100 (0 = off)                | only show matches involving the top-N placed participants (needs platform standings — start.gg always; Challonge via `final_rank` on the keyed API for your own tournaments, or derived from elimination order on finished brackets when scraping; also trims the standings crawl to N) |
 | `status`      | —                              | request a status re-broadcast |
+
+> **Why the batched `setCaps` / `setOptions` exist.** Streamer.bot bleeds
+> arguments between action invocations that arrive in a burst — firing two
+> `DoAction`s to the same action within a few milliseconds shuffles their args
+> together (verified on SB 1.0.4). A control page that set caps text and logo
+> as two back-to-back `setCapsText` + `setCapsLogo` commands would have the
+> second's value land on the first, silently blanking the text. So each control
+> button sends exactly **one** command carrying a JSON value, and `panel-core`
+> additionally serializes outbound `DoAction`s (one in flight at a time). The
+> single-field commands remain for chat / Stream Deck, where one action fires at
+> a time.
 
 ## ticker:announce
 

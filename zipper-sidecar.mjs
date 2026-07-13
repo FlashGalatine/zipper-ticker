@@ -147,6 +147,11 @@ function clampInt(v, min, max, fallback) {
   return Math.max(min, Math.min(max, n));
 }
 
+// Parse a JSON-string command value (batched setCaps / setOptions); null on junk.
+function parseJson(v) {
+  try { return JSON.parse(String(v ?? '')); } catch { return null; }
+}
+
 // ── Poll loop ─────────────────────────────────────────────────────────────────
 
 function startPolling() {
@@ -501,6 +506,34 @@ function dispatch(command, value) {
       persist();
       if (polling) schedulePoll(0); else pushStatus();
       return;
+    // Batched setters — the control page sends ONE of these per button so it
+    // never fires a burst of DoActions (Streamer.bot bleeds arguments between
+    // action invocations that arrive within a few ms, which corrupted the caps
+    // text). Value is a JSON object. The per-field commands above stay for chat
+    // / Stream Deck, where one action fires at a time.
+    case 'setCaps': {
+      const o = parseJson(value);
+      if (o && typeof o === 'object') {
+        if (typeof o.text === 'string') config.caps.text = o.text.slice(0, 120);
+        if (typeof o.logo === 'string') config.caps.logo = o.logo.slice(0, 500);
+      }
+      lastHash = null; // caps travel in the update payload — force a re-push
+      persist();
+      if (polling) schedulePoll(0); else pushStatus();
+      return;
+    }
+    case 'setOptions': {
+      const o = parseJson(value);
+      if (o && typeof o === 'object') {
+        if (o.intervalMs !== undefined) config.pollIntervalMs = clampInt(o.intervalMs, MIN_INTERVAL_MS, 3600000, config.pollIntervalMs);
+        if (o.maxItems !== undefined) config.maxItems = clampInt(o.maxItems, 1, 100, config.maxItems);
+        if (o.topN !== undefined) config.topN = clampInt(o.topN, 0, 100, config.topN);
+      }
+      lastHash = null;
+      persist();
+      if (polling) schedulePoll(0); else pushStatus();
+      return;
+    }
     case 'status': pushStatus(); return;
     default:
       log(`unknown command "${command}" — ignored`);

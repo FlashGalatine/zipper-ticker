@@ -170,14 +170,19 @@
   $('btn-start').onclick = () => send('start');
   $('btn-stop').onclick = () => send('stop');
   $('btn-poll').onclick = () => send('pollNow');
+  // One command per button — NOT several. Firing multiple DoActions to the same
+  // Streamer.bot action in a burst makes SB bleed their arguments together (the
+  // second command's value lands on the first), which silently blanked the caps
+  // text. Batched values ride as JSON; the sidecar unpacks them.
   $('btn-opts').onclick = () => {
-    send('setInterval', String(Math.round(Number($('interval').value) * 1000) || 30000));
-    send('setMaxItems', $('maxitems').value);
-    send('setTopN', $('topn').value);
+    send('setOptions', JSON.stringify({
+      intervalMs: Math.round(Number($('interval').value) * 1000) || 30000,
+      maxItems: Number($('maxitems').value) || 20,
+      topN: Number($('topn').value) || 0,
+    }));
   };
   $('btn-caps').onclick = () => {
-    send('setCapsText', $('capstext').value);
-    send('setCapsLogo', $('capslogo').value.trim());
+    send('setCaps', JSON.stringify({ text: $('capstext').value, logo: $('capslogo').value.trim() }));
   };
   $('btn-announce').onclick = () => {
     const text = $('ann-text').value.trim();

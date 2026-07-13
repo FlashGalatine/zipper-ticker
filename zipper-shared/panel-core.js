@@ -101,6 +101,9 @@
         return;
       }
 
+      // Ack for the in-flight queued DoAction → release the next one.
+      if (m && m.id && m.id === inFlightId && !m.event) { advanceQueue(); return; }
+
       // The payload we care about: General.Custom broadcasts.
       if (m && m.event && m.event.source === 'General' && m.event.type === 'Custom') {
         let d = m.data;
@@ -112,7 +115,16 @@
       }
     };
 
-    ws.onclose = () => { setOffline(true); log('closed; reconnecting'); scheduleReconnect(); };
+    ws.onclose = () => {
+      setOffline(true);
+      // Drop any queued/in-flight sends — replaying stale commands after a
+      // reconnect could clobber fresh state.
+      sendQueue.length = 0;
+      if (inFlightTimer) { clearTimeout(inFlightTimer); inFlightTimer = null; }
+      inFlightId = null;
+      log('closed; reconnecting');
+      scheduleReconnect();
+    };
     ws.onerror = () => { log('WebSocket error — is SB\'s WebSocket Server enabled on', WS_URL, 'with authentication OFF?'); };
   }
 
@@ -123,15 +135,38 @@
     }, reconnectDelay);
   }
 
-  // Exposed for the control page: fire a named action with arguments.
+  // Outbound DoActions are SERIALIZED — one in flight at a time, the next sent
+  // only after the previous is acked (or a short fail-safe timeout). Streamer.bot
+  // bleeds arguments between action invocations that arrive in a burst: two
+  // DoActions to the same action within a few ms get their args shuffled
+  // together (verified against SB 1.0.4). A control page firing several settings
+  // at once would corrupt them, so we never let two overlap on the wire.
+  const sendQueue = [];
+  let inFlightId = null;
+  let inFlightTimer = null;
+  const ACK_TIMEOUT_MS = 800;
+
+  function pumpQueue() {
+    if (inFlightId !== null || !sendQueue.length) return;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return; // resumes on reconnect
+    const req = sendQueue.shift();
+    req.id = String(++msgId);
+    inFlightId = req.id;
+    try { ws.send(JSON.stringify(req)); }
+    catch { inFlightId = null; return; }
+    inFlightTimer = setTimeout(advanceQueue, ACK_TIMEOUT_MS);
+  }
+  function advanceQueue() {
+    if (inFlightTimer) { clearTimeout(inFlightTimer); inFlightTimer = null; }
+    inFlightId = null;
+    pumpQueue();
+  }
+
+  // Exposed for the control page: fire a named action with arguments (queued).
   window.__ZIPPER_DO_ACTION = (name, args) => {
     if (!ws || ws.readyState !== WebSocket.OPEN) return false;
-    ws.send(JSON.stringify({
-      request: 'DoAction',
-      id: String(++msgId),
-      action: { name: String(name) },
-      args: args || {},
-    }));
+    sendQueue.push({ request: 'DoAction', action: { name: String(name) }, args: args || {} });
+    pumpQueue();
     return true;
   };
   // Shorthand for the common case: a Ticker Command.

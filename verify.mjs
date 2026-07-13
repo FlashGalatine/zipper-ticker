@@ -308,6 +308,19 @@ async function testSidecar() {
   const upd2 = await client.next((d) => d.type === 'ticker:update' && d.caps?.text === '@FlashGalatine');
   check('sidecar: caps change forces re-push', upd2.caps.text === '@FlashGalatine');
 
+  // Batched setCaps (one command, JSON value — the control page's burst-safe
+  // path). Sets both text and logo at once; '@'-leading text must survive.
+  cmd('setCaps', JSON.stringify({ text: '@NewbieFightClub', logo: '/zipper-overlay/x.png' }));
+  const updCaps = await client.next((d) => d.type === 'ticker:update' && d.caps?.text === '@NewbieFightClub');
+  check('sidecar: batched setCaps sets text + logo',
+    updCaps.caps.text === '@NewbieFightClub' && updCaps.caps.logo === '/zipper-overlay/x.png', JSON.stringify(updCaps.caps));
+
+  // Batched setOptions (one command, JSON value) — interval + maxItems + topN.
+  cmd('setOptions', JSON.stringify({ intervalMs: 20000, maxItems: 5, topN: 0 }));
+  const sOpts = await client.next((d) => isStatus(d) && parseStatus(d).intervalMs === 20000).then(parseStatus);
+  check('sidecar: batched setOptions applies all three', sOpts.intervalMs === 20000 && sOpts.maxItems === 5 && sOpts.topN === 0,
+    JSON.stringify({ intervalMs: sOpts.intervalMs, maxItems: sOpts.maxItems, topN: sOpts.topN }));
+
   // topN filter: only matches involving the top-2 placed (Flash, Rival) remain.
   cmd('setTopN', '2');
   const upd3 = await client.next((d) => d.type === 'ticker:update' && d.matches.length === 2);
