@@ -27,7 +27,11 @@
   fieldset { border:1px solid var(--edge); border-radius:8px; background:var(--panel); margin:0 0 12px; padding:12px 14px; }
   legend { padding:0 6px; color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.1em; }
   label { display:block; color:var(--muted); font-size:12px; margin:8px 0 3px; }
-  input[type=text], input[type=number] { width:100%; padding:7px 9px; border:1px solid var(--edge); border-radius:6px; background:#10141a; color:var(--ink); font:inherit; }
+  input[type=text], input[type=number], textarea { width:100%; padding:7px 9px; border:1px solid var(--edge); border-radius:6px; background:#10141a; color:var(--ink); font:inherit; }
+  textarea { resize:vertical; min-height:60px; }
+  .chk { display:flex; align-items:center; gap:7px; margin:0; color:var(--ink); font-size:13px; cursor:pointer; }
+  .chk input { accent-color: var(--acc); width:15px; height:15px; }
+  .hint { color:var(--muted); font-size:11.5px; margin-top:6px; }
   .row { display:flex; gap:8px; align-items:flex-end; }
   .row > div { flex:1 1 auto; }
   button { padding:7px 14px; border:1px solid var(--edge); border-radius:6px; background:#232a35; color:var(--ink); font:inherit; font-weight:600; cursor:pointer; }
@@ -53,7 +57,7 @@
 <div class="sub">Ticker Command → sidecar · needs the sidecar running (<code>npm run sidecar</code>)</div>
 <div id="sidecar-note" class="warn">
   ⚠ <b>The Zipper sidecar isn't responding.</b> Streamer.bot is connected (announcements still work),
-  but <b>Start / Poll / Stop / Options / end-cap</b> buttons do nothing until the sidecar is running.
+  but <b>Start / Poll / Stop / Options / end-cap / message</b> buttons do nothing until the sidecar is running.
   Launch <code>start-zipper.bat</code> (or run <code>npm run sidecar</code> in the Zipper folder), or add the
   <code>Ticker Sidecar Start</code> action in Streamer.bot.
 </div>
@@ -98,6 +102,18 @@
   <label for="capslogo">Logo URL (left cap — e.g. /zipper-overlay/assets/logo.png)</label>
   <input type="text" id="capslogo" placeholder="(empty = no logo cap)">
   <div class="btns"><button id="btn-caps">Apply caps</button></div>
+</fieldset>
+
+<fieldset>
+  <legend>Persistent message</legend>
+  <label for="msgtext">Message — one line per ticker item</label>
+  <textarea id="msgtext" rows="3" placeholder="Bracket starts at 8pm ET&#10;!discord for the lobby code"></textarea>
+  <div class="btns" style="align-items:center;justify-content:space-between">
+    <label class="chk"><input type="checkbox" id="msgon"> Show this instead of results</label>
+    <button id="btn-msg">Apply</button>
+  </div>
+  <div class="hint">Stays up until you switch it off — results keep polling underneath and come
+    straight back. Works with no tournament set at all. Announcements still interrupt it.</div>
 </fieldset>
 
 <fieldset>
@@ -184,6 +200,13 @@
   $('btn-caps').onclick = () => {
     send('setCaps', JSON.stringify({ text: $('capstext').value, logo: $('capslogo').value.trim() }));
   };
+  // Text and toggle ride one batched command, so flipping the checkbox can apply
+  // the text sitting in the box without a second (arg-bleeding) DoAction.
+  const sendMessage = () => send('setMessage', JSON.stringify({
+    text: $('msgtext').value, enabled: $('msgon').checked,
+  }));
+  $('btn-msg').onclick = sendMessage;
+  $('msgon').onchange = sendMessage;
   $('btn-announce').onclick = () => {
     const text = $('ann-text').value.trim();
     if (!text) return;
@@ -197,7 +220,7 @@
 
   // Fields the operator is typing in shouldn't be clobbered by status echoes.
   const dirty = new Set();
-  for (const id of ['url', 'interval', 'maxitems', 'topn', 'capstext', 'capslogo']) {
+  for (const id of ['url', 'interval', 'maxitems', 'topn', 'capstext', 'capslogo', 'msgtext']) {
     $(id).addEventListener('focus', () => dirty.add(id));
     $(id).addEventListener('blur', () => dirty.delete(id));
   }
@@ -214,8 +237,15 @@
     setIfClean('maxitems', s.maxItems || 20);
     setIfClean('topn', s.topN ?? 0);
     if (s.caps) { setIfClean('capstext', s.caps.text || ''); setIfClean('capslogo', s.caps.logo || ''); }
+    if (s.message) {
+      setIfClean('msgtext', s.message.text || '');
+      // The checkbox commits on change, so echoes always agree with it — except
+      // right after a reload, where the sidecar's value is the correct one.
+      $('msgon').checked = !!s.message.enabled;
+    }
     $('status').innerHTML =
       `Polling: <b>${s.polling ? 'ON' : 'off'}</b>` +
+      ` · Message: <b>${s.message?.enabled ? 'ON' : 'off'}</b>` +
       ` · Platform: <b>${esc(s.platform || '—')}</b>` +
       ` · Last poll: <span class="dim">${esc(s.lastPollAt ? new Date(s.lastPollAt).toLocaleTimeString() : 'never')}</span>` +
       ` · Milestones: <b>${s.se?.configured ? 'ON' : 'off'}</b>` +
@@ -227,6 +257,13 @@
   window.addEventListener('ticker:update', (e) => {
     const p = e.detail || {};
     const rows = [];
+    // Message mode covers the strip — preview it the same way, not the results
+    // still arriving underneath.
+    if (p.message?.lines?.length) {
+      for (const line of p.message.lines) rows.push(`<div class="m"><b>${esc(line)}</b></div>`);
+      $('preview').innerHTML = rows.join('');
+      return;
+    }
     if (p.tournament?.name) rows.push(`<div class="m"><b>${esc(p.tournament.name)}</b></div>`);
     for (const m of p.matches || []) {
       const rnd = `<span class="rnd">${esc(m.round || '')}</span>`;

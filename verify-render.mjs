@@ -112,6 +112,45 @@ try {
     await page.close();
   }
 
+  // Persistent message mode: the configured lines crawl instead of the results.
+  {
+    const page = await browser.newPage({ viewport: { width: 1920, height: 72 } });
+    await page.goto(`${HTTP}/zipper-overlay/ticker.html?w=1920&sbport=${WS_PORT}`);
+    await page.waitForSelector('.track .seg .item', { timeout: 8000 });
+
+    const sample = JSON.parse(await readFile(resolve(__dirname, 'platforms', 'fixtures', 'sample-update.json'), 'utf-8'));
+    const lines = ['Bracket starts at 8pm ET', '!discord for the lobby code'];
+    // Results stay in the payload — the message is expected to cover them.
+    await fetch(`${HTTP}/mock/push`, { method: 'POST', body: JSON.stringify({ ...sample, message: { lines } }) });
+    await page.waitForSelector('.item.message', { timeout: 5000 });
+    await sleep(300);
+
+    // One item per line, repeated whole until the segment fills the strip (two
+    // short lines don't span 1920px) so the -50% wrap stays seamless.
+    const msgs = await page.locator('.track .seg').first().locator('.item.message').count();
+    check('message: one item per line, repeated to fill the strip',
+      msgs >= lines.length && msgs % lines.length === 0, String(msgs));
+    const first = await page.locator('.track .seg .item.message .msg').first().textContent();
+    check('message: line text rendered', first === lines[0], String(first));
+    const names = await page.locator('.track .name').count();
+    check('message: results hidden while the message is up', names === 0, String(names));
+    const capText = await page.locator('.cap-right').textContent();
+    check('message: end caps still render', capText === '@FlashGalatine', String(capText));
+    const segs = await page.locator('.track .seg').count();
+    check('message: track still duplicated for a seamless loop', segs >= 2, String(segs));
+    const dur = await page.locator('.track').evaluate((el) => getComputedStyle(el).animationDuration);
+    check('message: crawl animating', parseFloat(dur) > 0, dur);
+    await page.screenshot({ path: resolve(__dirname, 'test-render-message.png') });
+
+    // Dropping the message restores results with no re-poll — and leaves the
+    // mock's stored payload clean for the control-page checks below.
+    await fetch(`${HTTP}/mock/push`, { method: 'POST', body: JSON.stringify(sample) });
+    await page.waitForSelector('.track .seg .item .name', { timeout: 5000 });
+    const msgsAfter = await page.locator('.item.message').count();
+    check('message: results return when the message drops', msgsAfter === 0, String(msgsAfter));
+    await page.close();
+  }
+
   // Control page: preview + status fields render.
   const page = await browser.newPage({ viewport: { width: 700, height: 900 } });
   await page.goto(`${HTTP}/zipper-shared/control.html?sbport=${WS_PORT}`);
@@ -133,5 +172,5 @@ try {
   try { mock.kill(); } catch {}
 }
 
-console.log(`\n${fail === 0 ? 'ALL GREEN' : 'FAILURES'} — ${pass} passed, ${fail} failed (screenshots: test-render-1920.png, test-render-640.png, control-render.png)`);
+console.log(`\n${fail === 0 ? 'ALL GREEN' : 'FAILURES'} — ${pass} passed, ${fail} failed (screenshots: test-render-1920.png, test-render-640.png, test-render-message.png, control-render.png)`);
 process.exit(fail === 0 ? 0 : 1);

@@ -16,7 +16,8 @@
 //             the control page via the "Ticker Command" action.
 //
 // Commands: setUrl, start, stop, pollNow, setInterval, setCapsText,
-//           setCapsLogo, setMaxItems, status.
+//           setCapsLogo, setMaxItems, setMessage, setMessageText,
+//           setMessageEnabled, status.
 //
 // Config lives in ./config.json (gitignored; seeded from config.example.json on
 // first run). API keys may also come from env: CHALLONGE_API_KEY, STARTGG_API_KEY.
@@ -46,6 +47,8 @@ const GUARD_PORT = Number(process.env.ZIPPER_GUARD_PORT) || 7496;
 
 const MIN_INTERVAL_MS = 15000;
 const MAX_BACKOFF_MS = 300000; // 5 min cap when the platform keeps erroring
+const MESSAGE_MAX_CHARS = 1000;
+const MESSAGE_MAX_LINES = 20;
 
 let config = {
   challongeApiKey: null,
@@ -55,6 +58,12 @@ let config = {
   maxItems: 20,
   topN: 0, // >0 = only show matches involving the top-N placed participants
   caps: { text: '', logo: '' },
+  // Persistent message mode — while enabled (and the text isn't blank) the
+  // overlay crawls these lines INSTEAD of tournament results. One non-blank
+  // line per ticker item. Independent of polling: a message shows with no
+  // tournament configured at all, so message changes push immediately rather
+  // than riding the next poll.
+  message: { enabled: false, text: '' },
   // Milestone announcements — StreamElements session counters polled with the
   // JWT (streamelements.com → account → Channel settings → Show secrets). The
   // token stays in this file; it NEVER travels the Streamer.bot bus. Each
@@ -73,6 +82,8 @@ let consecutiveErrors = 0;
 let lastError = '';
 let lastPollAt = null;
 let lastHash = null;
+let lastPayload = null; // last payload built, so config-only changes (message,
+                        // caps) can re-push without waiting for a poll
 let platformName = null;
 
 let sbWs = null;
@@ -114,6 +125,10 @@ function adoptConfig(parsed) {
       text: String(parsed.caps?.text ?? '').slice(0, 120),
       logo: String(parsed.caps?.logo ?? '').slice(0, 500),
     },
+    message: {
+      enabled: !!parsed.message?.enabled,
+      text: String(parsed.message?.text ?? '').slice(0, MESSAGE_MAX_CHARS),
+    },
     streamElements: {
       jwtToken: strOrNull(parsed.streamElements?.jwtToken),
       pollSeconds: clampInt(parsed.streamElements?.pollSeconds, 5, 3600, 60),
@@ -150,6 +165,14 @@ function clampInt(v, min, max, fallback) {
 // Parse a JSON-string command value (batched setCaps / setOptions); null on junk.
 function parseJson(v) {
   try { return JSON.parse(String(v ?? '')); } catch { return null; }
+}
+
+// Booleans arrive as JSON true/false from the control page, but as words from
+// chat and Stream Deck ("!ticker setMessageEnabled on").
+function truthy(v) {
+  if (typeof v === 'boolean') return v;
+  const s = String(v ?? '').trim().toLowerCase();
+  return s === 'true' || s === 'on' || s === '1' || s === 'yes';
 }
 
 // ── Poll loop ─────────────────────────────────────────────────────────────────
@@ -194,6 +217,7 @@ async function pollOnce() {
     lastError = '';
     lastPollAt = new Date().toISOString();
     const payload = buildPayload(result);
+    lastPayload = payload;
     const hash = hashPayload(payload);
     if (hash !== lastHash) {
       lastHash = hash;
@@ -259,7 +283,7 @@ function buildPayload(result) {
     })
     .slice(0, config.maxItems);
 
-  return {
+  const payload = {
     type: 'ticker:update',
     tournament: {
       name: result.tournamentName || '',
@@ -272,13 +296,61 @@ function buildPayload(result) {
     standings: standings.slice(0, config.topN > 0 ? Math.min(config.topN, config.maxItems) : config.maxItems),
     caps: { ...config.caps },
   };
+  const msg = messageBlock();
+  if (msg) payload.message = msg;
+  return payload;
 }
 
-// Change detection: only what the strip renders — ids, states, scores, caps.
+// The message-mode wire block, or null when it's off or blank — the overlay
+// falls back to results whenever the key is absent. Results keep flowing in the
+// same payload underneath, so toggling the message off restores them instantly.
+function messageBlock() {
+  if (!config.message.enabled) return null;
+  const lines = config.message.text
+    .split(/\r?\n/)
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .slice(0, MESSAGE_MAX_LINES);
+  return lines.length ? { lines } : null;
+}
+
+// A results-free payload, for pushing a message when no poll has ever run (the
+// message-only use case: no tournament configured at all).
+function blankPayload() {
+  return {
+    type: 'ticker:update',
+    tournament: { name: '', platform: platformName, url: config.tournamentUrl, state: 'in_progress' },
+    generatedAt: new Date().toISOString(),
+    matches: [],
+    standings: [],
+    caps: { ...config.caps },
+  };
+}
+
+// Re-push the current strip state NOW, restamped with the live message + caps.
+// Config-only changes have to reach the overlay even when polling is off, so
+// they can't wait for the next poll to carry them.
+function pushCurrent() {
+  const payload = {
+    ...(lastPayload || blankPayload()),
+    generatedAt: new Date().toISOString(),
+    caps: { ...config.caps },
+  };
+  const msg = messageBlock();
+  if (msg) payload.message = msg;
+  else delete payload.message;
+  lastPayload = payload;
+  lastHash = hashPayload(payload); // pushUpdate resets this to null if SB is down
+  pushUpdate(payload);
+}
+
+// Change detection: only what the strip renders — ids, states, scores, caps,
+// message.
 function hashPayload(p) {
   return JSON.stringify([
-    p.tournament.name,
+    p.tournament?.name ?? '',
     p.caps,
+    p.message ?? null,
     p.matches.map((m) => [m.id, m.state, m.p1?.score, m.p2?.score, m.p1?.name, m.p2?.name]),
     p.standings,
   ]);
@@ -389,6 +461,9 @@ function connectSb() {
       sbWs.send(JSON.stringify({ request: 'Subscribe', id: String(++sbMsgId), events: { general: ['Custom'] } }));
       log(`Connected to Streamer.bot at ${SB_WS_URL}`);
       pushStatus();
+      // A message-only setup never polls, so no other code path would ever put
+      // the configured message on screen after a restart.
+      if (!polling && messageBlock()) pushCurrent();
     });
     sbWs.on('close', () => { sbWs = null; scheduleSbReconnect(); });
     sbWs.on('error', (e) => { log(`SB WS error: ${e.message} — is SB's WebSocket Server on ${SB_WS_URL} with auth OFF?`); });
@@ -447,6 +522,7 @@ function pushStatus() {
     maxItems: config.maxItems,
     topN: config.topN,
     caps: { ...config.caps },
+    message: { ...config.message },
     // StreamElements milestone status — never the token itself.
     se: { configured: seConfigured(), lastPollAt: seLastPollAt, lastError: seLastError },
   };
@@ -454,6 +530,14 @@ function pushStatus() {
 }
 
 // ── Command dispatch (inbound half of the bus) ────────────────────────────────
+
+// Message edits push straight to the overlay: polling may be off, or there may
+// be no tournament at all, so "re-push on the next poll" would never arrive.
+function applyMessageChange() {
+  persist();
+  pushCurrent();
+  pushStatus();
+}
 
 function dispatch(command, value) {
   if (command === '__status') return; // our own status relay echoing back
@@ -486,13 +570,15 @@ function dispatch(command, value) {
       config.caps.text = String(value ?? '').slice(0, 120);
       lastHash = null; // caps travel in the update payload — force a re-push
       persist();
-      if (polling) schedulePoll(0); else pushStatus();
+      // Stopped (or message-only, with no tournament) still needs the new caps
+      // on screen, so push rather than wait for a poll that may never come.
+      if (polling) schedulePoll(0); else { pushCurrent(); pushStatus(); }
       return;
     case 'setCapsLogo':
       config.caps.logo = String(value ?? '').slice(0, 500);
       lastHash = null;
       persist();
-      if (polling) schedulePoll(0); else pushStatus();
+      if (polling) schedulePoll(0); else { pushCurrent(); pushStatus(); }
       return;
     case 'setTopN':
       config.topN = clampInt(value, 0, 100, config.topN);
@@ -519,9 +605,28 @@ function dispatch(command, value) {
       }
       lastHash = null; // caps travel in the update payload — force a re-push
       persist();
-      if (polling) schedulePoll(0); else pushStatus();
+      if (polling) schedulePoll(0); else { pushCurrent(); pushStatus(); }
       return;
     }
+    // Persistent message mode — batched (text + enabled in one command) for the
+    // control page; the single-field variants below are for chat / Stream Deck.
+    case 'setMessage': {
+      const o = parseJson(value);
+      if (o && typeof o === 'object') {
+        if (typeof o.text === 'string') config.message.text = o.text.slice(0, MESSAGE_MAX_CHARS);
+        if (o.enabled !== undefined) config.message.enabled = truthy(o.enabled);
+      }
+      applyMessageChange();
+      return;
+    }
+    case 'setMessageText':
+      config.message.text = String(value ?? '').slice(0, MESSAGE_MAX_CHARS);
+      applyMessageChange();
+      return;
+    case 'setMessageEnabled':
+      config.message.enabled = truthy(value);
+      applyMessageChange();
+      return;
     case 'setOptions': {
       const o = parseJson(value);
       if (o && typeof o === 'object') {

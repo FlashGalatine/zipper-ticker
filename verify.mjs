@@ -272,6 +272,21 @@ async function testSidecar() {
   const isStatus = (d) => d.type === 'ticker:command' && d.command === '__status';
   const parseStatus = (d) => JSON.parse(d.value);
 
+  // client.next() scans the WHOLE event log, so a predicate that also matches an
+  // earlier event ("3 matches", "no message key") resolves instantly on history
+  // instead of waiting for the push under test. Those need a scan of only the
+  // events that arrived after a recorded mark.
+  const mark = () => client.events.length;
+  const since = async (at, pred, timeoutMs = 4000) => {
+    for (let i = 0; i * 100 < timeoutMs; i++) {
+      const hit = client.events.slice(at).filter(pred).pop();
+      if (hit) return hit;
+      await sleep(100);
+    }
+    return null;
+  };
+  const isUpdate = (d) => d.type === 'ticker:update';
+
   // Startup status announces the connection.
   const s0 = await client.next(isStatus).then(parseStatus);
   check('sidecar: startup status broadcast', s0.polling === false && s0.url === null, JSON.stringify(s0));
@@ -328,13 +343,66 @@ async function testSidecar() {
     upd3.matches.every((m) => ['Flash', 'Rival'].includes(m.p1.name) || ['Flash', 'Rival'].includes(m.p2.name)),
     JSON.stringify(upd3.matches.map((m) => `${m.p1.name} vs ${m.p2.name}`)));
   check('sidecar: topN trims standings crawl', upd3.standings.length === 2, String(upd3.standings.length));
+  const atReset = mark();
   cmd('setTopN', '0');
-  await client.next((d) => d.type === 'ticker:update' && d.matches.length === 3);
+  const updReset = await since(atReset, (d) => isUpdate(d) && d.matches.length === 3);
+  check('sidecar: topN 0 restores every match', !!updReset, 'no re-push after setTopN 0');
+
+  // Persistent message mode: takes the strip over, results ride along underneath.
+  cmd('setMessage', JSON.stringify({ text: 'Bracket starts at 8pm ET\n\n!discord for the lobby ', enabled: true }));
+  const updMsg = await client.next((d) => d.type === 'ticker:update' && d.message);
+  check('sidecar: setMessage splits + trims lines, drops blanks',
+    JSON.stringify(updMsg.message.lines) === JSON.stringify(['Bracket starts at 8pm ET', '!discord for the lobby']),
+    JSON.stringify(updMsg.message));
+  check('sidecar: results still ride under the message', updMsg.matches.length === 3, String(updMsg.matches.length));
+  const sMsg = await client.next((d) => isStatus(d) && parseStatus(d).message?.enabled).then(parseStatus);
+  check('sidecar: message state in status', sMsg.message.text.startsWith('Bracket starts'), JSON.stringify(sMsg.message));
+
+  // Enabled + blank text === off (no message key → results show).
+  const atBlank = mark();
+  cmd('setMessageText', '   ');
+  const updBlank = await since(atBlank, (d) => isUpdate(d) && !d.message);
+  check('sidecar: enabled but blank text falls back to results',
+    updBlank?.matches.length === 3, JSON.stringify(updBlank?.message ?? updBlank?.matches.length));
+
+  // Toggle off → message key gone even with the text still set.
+  cmd('setMessageText', 'Back in 5');
+  await client.next((d) => d.type === 'ticker:update' && d.message?.lines?.[0] === 'Back in 5');
+  const atOff = mark();
+  cmd('setMessageEnabled', 'off'); // chat spelling, not a JSON boolean
+  const updOff = await since(atOff, (d) => isUpdate(d) && !d.message);
+  check('sidecar: setMessageEnabled off restores results',
+    updOff?.matches.length === 3, JSON.stringify(updOff?.message ?? updOff?.matches.length));
+
+  // Persisted for a restart (text survives the toggle).
+  await sleep(200);
+  const persistedMsg = JSON.parse(await readFile(cfgPath, 'utf-8'));
+  check('sidecar: message persisted',
+    persistedMsg.message?.text === 'Back in 5' && persistedMsg.message?.enabled === false,
+    JSON.stringify(persistedMsg.message));
 
   // stop → status shows polling off; config persisted autoStart=false.
   cmd('stop');
   const s2 = await client.next((d) => isStatus(d) && parseStatus(d).polling === false && parseStatus(d).lastPollAt).then(parseStatus);
   check('sidecar: stop round-trip', s2.polling === false);
+
+  // The headline case: message mode with polling off. Nothing polls, so the
+  // command itself has to put it on the strip.
+  const atStopped = mark();
+  cmd('setMessage', JSON.stringify({ text: 'Back in 5', enabled: true }));
+  const updStopped = await since(atStopped, isUpdate);
+  check('sidecar: message pushes immediately while polling is off',
+    updStopped?.message?.lines?.[0] === 'Back in 5', JSON.stringify(updStopped?.message));
+
+  // Same for end caps while stopped — they'd otherwise wait for a poll that
+  // message-only setups never run.
+  const atCaps = mark();
+  cmd('setCapsText', '@Stopped');
+  const updCapsStopped = await since(atCaps, isUpdate);
+  check('sidecar: caps push immediately while polling is off',
+    updCapsStopped?.caps?.text === '@Stopped', JSON.stringify(updCapsStopped?.caps));
+
+  cmd('setMessageEnabled', 'off');
   await sleep(200);
   const persisted = JSON.parse(await readFile(cfgPath, 'utf-8'));
   check('sidecar: config persisted (url + autoStart off)',

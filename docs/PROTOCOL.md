@@ -27,7 +27,8 @@ paints immediately.
       "winner": 1, "order": 1 }
   ],
   "standings": [ { "placement": 1, "name": "Flash" } ],
-  "caps": { "text": "@FlashGalatine", "logo": "/zipper-overlay/assets/logo.png" }
+  "caps": { "text": "@FlashGalatine", "logo": "/zipper-overlay/assets/logo.png" },
+  "message": { "lines": ["Bracket starts at 8pm ET", "!discord for the lobby code"] }
 }
 ```
 
@@ -44,6 +45,39 @@ Rules:
 - `caps` travels inside the payload so the overlay needs no separate config
   fetch; empty string hides that cap.
 - `tournament.state` ∈ `upcoming | in_progress | completed`.
+- `message` is present only while persistent message mode is on **and** its text
+  is non-blank; the overlay then crawls `message.lines` (one item per line)
+  instead of the results. See below.
+
+## Persistent message mode
+
+A configured message that holds the strip until you switch it off — for
+"bracket starts at 8pm", a Discord plug, a rules line. Set it from the control
+page's **Persistent message** box (textarea + a *Show this instead of results*
+checkbox), or from chat / a Stream Deck via the single-field commands.
+
+```json
+"message": { "enabled": true, "text": "Bracket starts at 8pm ET\n!discord for the lobby code" }
+```
+
+Rules:
+
+- One **non-blank line per ticker item**, trimmed, capped at 20 lines / 1000
+  characters. The marquee repeats them to fill the strip, exactly as it does for
+  a short results set.
+- Enabled with blank text is the same as off — the payload's `message` key is
+  omitted and results show. That's the fallback for any malformed line list too.
+- Results **keep polling underneath**: the same payload still carries `matches`
+  and `standings`, so switching the message off restores live results on the
+  spot with no re-poll.
+- It needs no tournament at all. Message edits push **immediately** rather than
+  riding the next poll (which, with polling off, would never come), and the
+  sidecar re-pushes a configured message when it connects to Streamer.bot, so a
+  message-only setup survives a restart. For the same reason end-cap changes now
+  push immediately when polling is off.
+- `ticker:announce` still interrupts it — announcements cover the strip for
+  their duration and the message resumes.
+- Persisted in `config.json` (`message`), so it survives a sidecar restart.
 
 ## ticker:status
 
@@ -79,6 +113,9 @@ which the sidecar consumes. Commands:
 | `setInterval` | milliseconds (min 15000)       | poll cadence |
 | `setCaps`     | JSON `{text,logo}`             | **batched** — sets both end caps in one command (the control page uses this) |
 | `setOptions`  | JSON `{intervalMs,maxItems,topN}` | **batched** — sets all three options in one command |
+| `setMessage`  | JSON `{text,enabled}`          | **batched** — persistent message text + on/off in one command (the control page uses this) |
+| `setMessageText` | string (≤1000 chars, `\n`-separated lines) | message text (single-field; for chat / Stream Deck) |
+| `setMessageEnabled` | `on`/`off` (also `true`/`false`, `1`/`0`, `yes`) | show the message instead of results |
 | `setCapsText` | string (≤120 chars)            | right-cap static text (single-field; for chat / Stream Deck) |
 | `setCapsLogo` | URL/path (≤500 chars)          | left-cap logo image (single-field) |
 | `setInterval` above, `setMaxItems`, `setTopN` | see below | single-field variants |

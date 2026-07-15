@@ -6,6 +6,7 @@
   "maxItems": 20,
   "topN": 0,
   "caps": { "text": "", "logo": "" },
+  "message": { "enabled": false, "text": "" },
   "streamElements": { "jwtToken": null, "pollSeconds": 60 },
   "milestones": { "followers": 0, "subs": 0, "tips": 0, "cheers": 0 },
   "autoStart": false

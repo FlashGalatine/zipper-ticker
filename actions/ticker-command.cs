@@ -11,7 +11,8 @@
 //     the first word becomes command, the rest value (e.g. "!ticker pollNow").
 //
 // Commands the sidecar understands (docs/PROTOCOL.md): setUrl, start, stop,
-// pollNow, setInterval, setCapsText, setCapsLogo, setMaxItems, status.
+// pollNow, setInterval, setCapsText, setCapsLogo, setMaxItems, setMessageText,
+// setMessageEnabled, status.
 //
 // Setup: add an action named EXACTLY "Ticker Command" with a single
 // Core -> C# -> Execute C# Code sub-action holding everything below (COMPILE must

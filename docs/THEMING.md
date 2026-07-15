@@ -16,6 +16,7 @@ custom properties in `overlay/ticker.css`. You never need to touch the JS.
   --ticker-accent: #ffd166; /* winner names, separators */
   --ticker-live: #ff4d5e;   /* LIVE pip + tag */
   --ticker-muted: #8b94a3;  /* round labels, "Up next" */
+  --ticker-message-fg: #e8ecf1; /* persistent message text */
   --ticker-cap-bg: #1b2330; /* end caps */
   --ticker-cap-fg: #ffffff;
   --ticker-edge: #2a3342;   /* top border + cap dividers */
@@ -54,6 +55,9 @@ custom properties in `overlay/ticker.css`. You never need to touch the JS.
 - Each `.item` is one match: `.round` label, two `.name`s (winner gets `.win`),
   `.score` or `.vs`, and for live matches `.live-pip` + `.live-tag`.
 - Standings items use `.place` + `.name`.
+- In persistent message mode each configured line is an `.item.message` holding
+  a single `.msg` span — style it via `--ticker-message-fg`, or reach for
+  `.item.message` directly for a fuller treatment (background, size, casing).
 - The marquee duplicates its content (`.seg` twice) and animates
   `translateX(0 → -50%)`; duration is computed as segment-width ÷
   `--ticker-speed`, so the apparent speed stays constant regardless of how many

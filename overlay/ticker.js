@@ -63,6 +63,10 @@
       `<span class="name">${esc(s.name)}</span></span>`;
   }
 
+  function messageHtml(line) {
+    return `<span class="item message"><span class="msg">${esc(line)}</span></span>`;
+  }
+
   function ordinal(n) {
     const v = Number(n) || 0;
     const suf = (v % 100 >= 11 && v % 100 <= 13) ? 'th' : ({ 1: 'st', 2: 'nd', 3: 'rd' }[v % 10] || 'th');
@@ -114,6 +118,13 @@
 
   function apply(payload) {
     applyCaps(payload.caps);
+    // Persistent message mode takes the strip over: while the payload carries a
+    // message block, its lines crawl instead of the results underneath, which
+    // keep updating so toggling it off restores them immediately.
+    const lines = Array.isArray(payload.message?.lines)
+      ? payload.message.lines.map((l) => String(l ?? '').trim()).filter(Boolean)
+      : [];
+    if (lines.length) { rebuild(lines.map(messageHtml)); return; }
     const items = [];
     for (const m of Array.isArray(payload.matches) ? payload.matches : []) items.push(itemHtml(m));
     if (!items.length) {

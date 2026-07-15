@@ -17,6 +17,11 @@ polled straight from the bracket site. Named after the Times Square news
   participants (e.g. Top 4) — uses the platform's standings (start.gg always;
   Challonge via `final_rank` on your own keyed tournaments, or derived from the
   elimination order once a scraped bracket finishes).
+- **Persistent message:** type a message in the control page and flip a
+  checkbox to hold it on the strip instead of results ("bracket starts at 8pm",
+  a Discord plug) — one line per ticker item. Results keep polling underneath
+  and return the moment you switch it off, and it works with no tournament set
+  at all.
 - **Announcements:** subs, raids, milestones, or anything you type interrupt
   the crawl — the strip pauses, shows the alert with a kind pill, and resumes.
   Wire SB's own Twitch triggers to the `Ticker Announce` action for sub/raid
@@ -100,11 +105,20 @@ http://127.0.0.1:7474/zipper-shared/control.html
 
 Paste the tournament URL (e.g. `https://challonge.com/blko42` or
 `https://www.start.gg/tournament/…/event/…`), **Set**, **Start polling**. Set
-the end-cap text/logo there too. Chat control also works — point a `!ticker`
+the end-cap text/logo and the persistent message there too. Chat control also works — point a `!ticker`
 command trigger at the `Ticker Command` action and type
 `!ticker setUrl https://…`, `!ticker setTopN 4`, `!ticker stop`, etc.
 
-### 6. Announcements (optional)
+### 6. Persistent message (optional)
+
+Type into the control page's **Persistent message** box — one line per ticker
+item — and tick *Show this instead of results*. It holds the strip until you
+untick it; results keep polling underneath and come straight back. No
+tournament needs to be set, so it doubles as a plain message ticker. From chat:
+`!ticker setMessageText Bracket starts at 8pm ET` then
+`!ticker setMessageEnabled on` / `off`.
+
+### 7. Announcements (optional)
 
 - **Sub/raid alerts:** in Streamer.bot, add the `Ticker Announce` action to
   your Subscription / Gift Sub / Raid triggers — it auto-composes the text from

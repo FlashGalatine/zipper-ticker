@@ -11,6 +11,7 @@
   --ticker-accent: #ffd166;     /* winner name + separators + LIVE pip ring */
   --ticker-live: #ff4d5e;       /* LIVE pip */
   --ticker-muted: #8b94a3;      /* round labels, "Up next" prefix */
+  --ticker-message-fg: #e8ecf1; /* persistent message text */
   --ticker-cap-bg: #1b2330;     /* end caps */
   --ticker-cap-fg: #ffffff;
   --ticker-edge: #2a3342;       /* top border + cap hairlines */
@@ -73,6 +74,8 @@ body.offline .zipper { opacity: .35; }
   font-size: calc(var(--ticker-font-size) * .72); }
 .item .place { color: var(--ticker-accent); font-weight: 800;
   font-size: calc(var(--ticker-font-size) * .82); }
+/* Persistent message mode (payload.message) — one item per configured line */
+.item .msg { color: var(--ticker-message-fg, var(--ticker-fg)); font-weight: 600; }
 
 /* Empty / waiting state — a single static line, no animation */
 .track.static { animation: none; }
