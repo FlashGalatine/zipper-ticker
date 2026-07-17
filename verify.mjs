@@ -323,6 +323,16 @@ async function testSidecar() {
   const upd2 = await client.next((d) => d.type === 'ticker:update' && d.caps?.text === '@FlashGalatine');
   check('sidecar: caps change forces re-push', upd2.caps.text === '@FlashGalatine');
 
+  // Chat "!ticker <cmd> …" exactly as a real SB Command trigger fires it: SB's
+  // OWN command arg ("!ticker") + commandId + rawInput — the action must parse
+  // rawInput instead of relaying "!ticker" verbatim.
+  client.ws.send(JSON.stringify({
+    request: 'DoAction', id: 'c', action: { name: 'Ticker Command' },
+    args: { command: '!ticker', commandId: 'trig-1', rawInput: 'setCapsText @ChatSet' },
+  }));
+  const updChat = await client.next((d) => d.type === 'ticker:update' && d.caps?.text === '@ChatSet');
+  check('sidecar: chat !ticker maps through the trigger shape', updChat.caps.text === '@ChatSet');
+
   // Batched setCaps (one command, JSON value — the control page's burst-safe
   // path). Sets both text and logo at once; '@'-leading text must survive.
   cmd('setCaps', JSON.stringify({ text: '@NewbieFightClub', logo: '/zipper-overlay/x.png' }));

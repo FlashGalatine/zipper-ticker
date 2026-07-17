@@ -228,8 +228,22 @@ wss.on('connection', (ws) => {
           console.log(`[mock] Ticker Announce (${kind}) — ${text}`);
         }
       } else if (name === 'Ticker Command') {
-        const command = String(m.args?.command ?? '');
-        const value = m.args?.value == null ? '' : String(m.args.value);
+        let command = String(m.args?.command ?? '');
+        let value = m.args?.value == null ? '' : String(m.args.value);
+        // Chat Command triggers set their own `command` ("!ticker") + commandId;
+        // mirror ticker-command.cs's mapping so verify covers the chat path.
+        if (m.args?.commandId) {
+          const raw = String(m.args?.rawInput ?? '').trim();
+          const chatCmd = command.trim().replace(/^!/, '').toLowerCase();
+          if (chatCmd === 'ticker') {
+            const sp = raw.indexOf(' ');
+            command = sp < 0 ? raw : raw.slice(0, sp);
+            value = sp < 0 ? '' : raw.slice(sp + 1).trim();
+          } else {
+            command = chatCmd;
+            value = raw;
+          }
+        }
         if (command) {
           stats.commandCount++;
           broadcast(customEvent(JSON.stringify({ type: 'ticker:command', command, value })));

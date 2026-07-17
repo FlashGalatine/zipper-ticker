@@ -7,8 +7,11 @@
 // Call styles:
 //   • control.html — DoAction args { command:"setUrl", value:"https://..." }
 //   • Stream Deck  — Set Argument sub-actions before this one, same two args
-//   • Chat trigger — "!ticker <cmd> [value...]" with the trigger's rawInput arg:
-//     the first word becomes command, the rest value (e.g. "!ticker pollNow").
+//   • Chat Command triggers — attach them directly, NO Set Argument needed.
+//     SB command triggers set their own `command` (the matched chat command,
+//     e.g. "!ticker") + `commandId`; this action detects that and maps:
+//       "!ticker <cmd> [value…]" → first word of rawInput = command, rest = value
+//     Any other chat command "!foo" relays as command "foo" with rawInput as value.
 //
 // Commands the sidecar understands (docs/PROTOCOL.md): setUrl, start, stop,
 // pollNow, setInterval, setCapsText, setCapsLogo, setMaxItems, setMessageText,
@@ -30,16 +33,42 @@ public class CPHInline
             string command = "";
             string value = "";
 
-            string c, v, raw;
-            if (CPH.TryGetArg("command", out c) && !string.IsNullOrWhiteSpace(c))
+            string c, v, raw, cid;
+            CPH.TryGetArg("rawInput", out raw);
+            raw = raw == null ? "" : raw.Trim();
+
+            // A chat Command trigger sets ITS OWN `command` argument (the matched
+            // chat command, e.g. "!ticker") plus a `commandId` — which a control-page
+            // DoAction never carries. Without this branch the trigger's command
+            // shadows ours and the sidecar sees unknown "!ticker".
+            if (CPH.TryGetArg("commandId", out cid) && !string.IsNullOrWhiteSpace(cid))
             {
+                CPH.TryGetArg("command", out c);
+                string chatCmd = (c ?? "").Trim().TrimStart('!').ToLowerInvariant();
+                if (chatCmd == "ticker")
+                {
+                    // "!ticker setUrl https://..." → command=setUrl, value=the rest
+                    int sp = raw.IndexOf(' ');
+                    command = sp < 0 ? raw : raw.Substring(0, sp);
+                    value = sp < 0 ? "" : raw.Substring(sp + 1).Trim();
+                }
+                else
+                {
+                    // A dedicated chat command (e.g. "!pollnow"): the chat command IS
+                    // the sidecar command; anything typed after it rides as value.
+                    command = chatCmd;
+                    value = raw;
+                }
+            }
+            else if (CPH.TryGetArg("command", out c) && !string.IsNullOrWhiteSpace(c))
+            {
+                // Control page / Stream Deck: explicit { command, value } args.
                 command = c.Trim();
                 if (CPH.TryGetArg("value", out v) && v != null) value = v;
             }
-            else if (CPH.TryGetArg("rawInput", out raw) && !string.IsNullOrWhiteSpace(raw))
+            else if (raw.Length > 0)
             {
-                // Chat style: "!ticker setUrl https://..." → rawInput = "setUrl https://..."
-                raw = raw.Trim();
+                // Bare rawInput fallback (manual Set Argument setups).
                 int sp = raw.IndexOf(' ');
                 command = sp < 0 ? raw : raw.Substring(0, sp);
                 value = sp < 0 ? "" : raw.Substring(sp + 1).Trim();
