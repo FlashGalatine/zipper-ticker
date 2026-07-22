@@ -40,6 +40,14 @@ bracket site ──poll── zipper-sidecar.mjs ──DoAction──▶ Streame
 Requires Node ≥ 18, Streamer.bot ≥ 1.0.4 with its **WebSocket Server** enabled
 on `:8080` (authentication OFF) and its **HTTP Server** on `:7474`.
 
+First, get the code onto the machine that runs Streamer.bot — either
+
+```
+git clone https://github.com/FlashGalatine/zipper-ticker.git
+```
+
+or click **<> Code → Download ZIP** on the repo page and extract it.
+
 ### 1. Streamer.bot actions
 
 Create these actions — names must match exactly:
