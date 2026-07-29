@@ -1,14 +1,14 @@
 # Changelog
 
 All notable changes to **Zipper** are recorded here. The format follows
-[Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project aims to
-follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the patch number
+tracks the repository's commit count at release time.
 
-Nothing has been tagged since the initial release, so every change that landed
-afterwards sits under **Unreleased**. Commit hashes and landing dates are noted
-for traceability.
+Nothing was tagged between the initial release and 1.0.11, so that release
+collects every change in between. Commit hashes and landing dates are noted for
+traceability.
 
-## [Unreleased]
+## [1.0.11] — 2026-07-29
 
 ### Added
 
@@ -124,4 +124,4 @@ Initial release — scrolling tournament-results ticker for Streamer.bot.
 Live-validated keyless against real start.gg and Challonge brackets across
 pre-start, mid-event and completed states.
 
-[Unreleased]: https://github.com/FlashGalatine/zipper-ticker/compare/d77a27f...main
+[1.0.11]: https://github.com/FlashGalatine/zipper-ticker/compare/d77a27f...main

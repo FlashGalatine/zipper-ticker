@@ -1,6 +1,6 @@
 {
   "name": "zipper-ticker",
-  "version": "0.1.0",
+  "version": "1.0.11",
   "description": "Zipper — a scrolling tournament-results ticker overlay for OBS, driven by Streamer.bot",
   "type": "module",
   "license": "MIT",
