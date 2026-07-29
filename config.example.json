@@ -9,5 +9,6 @@
   "message": { "enabled": false, "text": "" },
   "streamElements": { "jwtToken": null, "pollSeconds": 60 },
   "milestones": { "followers": 0, "subs": 0, "tips": 0, "cheers": 0 },
+  "autoSchedule": true,
   "autoStart": false
 }

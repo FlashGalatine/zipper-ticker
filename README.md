@@ -117,6 +117,14 @@ the end-cap text/logo and the persistent message there too. Chat control also wo
 command trigger at the `Ticker Command` action and type
 `!ticker setUrl https://…`, `!ticker setTopN 4`, `!ticker stop`, etc.
 
+**Auto start/stop** (the checkbox next to the polling buttons, on by default)
+keeps API calls to a minimum: start polling any time — before the event begins
+the sidecar just sleeps until the platform's advertised start time (re-checking
+every 5 minutes if there isn't one), and once the event completes it pushes the
+final results and stops polling by itself. The results stay on the strip.
+**Start polling** / **Poll now** always force a fresh poll regardless; from
+chat: `!ticker setAutoSchedule off`.
+
 ### 6. Persistent message (optional)
 
 Type into the control page's **Persistent message** box — one line per ticker

@@ -93,6 +93,23 @@ reserved command `__status` with the status JSON as `value`:
 The sidecar ignores its own `__status` echo; the control page unwraps `value`.
 Sent after every poll and after every command.
 
+The status carries an `auto` block describing the auto-scheduler (see
+`setAutoSchedule` below):
+
+```json
+"auto": { "enabled": true, "eventState": "upcoming",
+  "startAt": "2026-08-01T00:00:00.000Z", "waitingUntil": "2026-08-01T00:00:00.000Z",
+  "stopped": null }
+```
+
+- `eventState` / `startAt` — what the last successful poll said about the event
+  (`startAt` is `null` when the platform has no date; Matcherino never reports
+  either).
+- `waitingUntil` — set while polling is on but sleeping for the start time; the
+  next poll fires at that instant.
+- `stopped` — `"completed"` after the scheduler stopped polling itself, `null`
+  otherwise.
+
 ## ticker:command
 
 Control surfaces (control page, chat trigger, Stream Deck) call the **Ticker
@@ -121,6 +138,7 @@ which the sidecar consumes. Commands:
 | `setInterval` above, `setMaxItems`, `setTopN` | see below | single-field variants |
 | `setMaxItems` | 1–100                          | ticker item cap |
 | `setTopN`     | 0–100 (0 = off)                | only show matches involving the top-N placed participants (needs platform standings — start.gg always; Challonge via `final_rank` on the keyed API for your own tournaments, or derived from elimination order on finished brackets when scraping; also trims the standings crawl to N) |
+| `setAutoSchedule` | `on`/`off` (default on)    | auto start/stop: a poll that returns `completed` pushes the final payload then **stops polling**; one that returns `upcoming` **sleeps until the platform's start time** (re-checking every 5 min without one, and at most every 6 h for far-off dates) and resumes normal polling when the event goes live. `start`/`pollNow` always force a fresh poll regardless. |
 | `status`      | —                              | request a status re-broadcast |
 
 > **Why the batched `setCaps` / `setOptions` exist.** Streamer.bot bleeds

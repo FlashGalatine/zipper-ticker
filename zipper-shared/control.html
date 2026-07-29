@@ -69,11 +69,14 @@
     <div><input type="text" id="url" placeholder="https://challonge.com/blko42 · https://www.start.gg/tournament/…/event/…"></div>
     <button id="btn-seturl">Set</button>
   </div>
-  <div class="btns">
+  <div class="btns" style="align-items:center">
     <button class="primary" id="btn-start">Start polling</button>
     <button id="btn-poll">Poll now</button>
     <button class="danger" id="btn-stop">Stop</button>
+    <label class="chk"><input type="checkbox" id="autosched" checked> Auto start/stop</label>
   </div>
+  <div class="hint">Auto start/stop saves API calls: before the event it sleeps until the platform's
+    start time, and once the event completes it stops polling by itself (the final results stay up).</div>
 </fieldset>
 
 <fieldset>
@@ -186,6 +189,7 @@
   $('btn-start').onclick = () => send('start');
   $('btn-stop').onclick = () => send('stop');
   $('btn-poll').onclick = () => send('pollNow');
+  $('autosched').onchange = () => send('setAutoSchedule', $('autosched').checked);
   // One command per button — NOT several. Firing multiple DoActions to the same
   // Streamer.bot action in a burst makes SB bleed their arguments together (the
   // second command's value lands on the first), which silently blanked the caps
@@ -243,8 +247,17 @@
       // right after a reload, where the sidecar's value is the correct one.
       $('msgon').checked = !!s.message.enabled;
     }
+    if (s.auto) $('autosched').checked = !!s.auto.enabled;
+    // Auto-scheduling shows as a third polling state: WAITING while sleeping
+    // for the start time, and an explanation when it stopped itself.
+    const waiting = s.polling && s.auto?.waitingUntil;
+    const pollLabel = waiting
+      ? `WAITING <span class="dim">(next poll ${esc(new Date(s.auto.waitingUntil).toLocaleTimeString())}${s.auto?.startAt ? ', starts ' + esc(new Date(s.auto.startAt).toLocaleString()) : ''})</span>`
+      : s.polling ? 'ON'
+      : s.auto?.stopped === 'completed' ? 'off <span class="dim">(event complete)</span>'
+      : 'off';
     $('status').innerHTML =
-      `Polling: <b>${s.polling ? 'ON' : 'off'}</b>` +
+      `Polling: <b>${pollLabel}</b>` +
       ` · Message: <b>${s.message?.enabled ? 'ON' : 'off'}</b>` +
       ` · Platform: <b>${esc(s.platform || '—')}</b>` +
       ` · Last poll: <span class="dim">${esc(s.lastPollAt ? new Date(s.lastPollAt).toLocaleTimeString() : 'never')}</span>` +

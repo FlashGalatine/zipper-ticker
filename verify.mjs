@@ -5,7 +5,7 @@
 //      mock server — Subscribe (lowercase), sync-on-connect replay, live push.
 //   4. Sidecar E2E: the REAL zipper-sidecar.mjs runs against the mock with the
 //      stub: platform — command round-trips, payload shape, diff suppression,
-//      caps re-push.
+//      caps re-push, auto-scheduling (stop on completed / wait for start).
 //
 // Uses off-default ports (HTTP 7476 / WS 8082 / guard 7497) so it can run next
 // to a live Streamer.bot or sidecar. Run: npm run verify
@@ -92,6 +92,15 @@ async function testNormalizers() {
   const ggCreated = normalizeStartggEvent({ name: 'E', state: 'CREATED', tournament: { name: 'T' }, sets: { nodes: [] } });
   check('startgg: string CREATED state → upcoming', ggCreated.state === 'upcoming' && ggCreated.matches.length === 0, ggCreated.state);
   check('startgg: numeric state still maps', gg.state === 'in_progress', gg.state);
+  check('startgg: missing startAt → null', ggCreated.startAt === null, String(ggCreated.startAt));
+  const ggTimed = normalizeStartggEvent({ name: 'E', state: 'CREATED', startAt: 1754006400, tournament: { name: 'T' }, sets: { nodes: [] } });
+  check('startgg: startAt epoch-seconds → ISO', ggTimed.startAt === new Date(1754006400 * 1000).toISOString(), String(ggTimed.startAt));
+  check('challonge api: missing start_at → null startAt', api.startAt === null, String(api.startAt));
+  const timedApi = await loadFixture('challonge-api-tournament.json');
+  timedApi.tournament.start_at = '2026-08-01T20:00:00-04:00';
+  check('challonge api: start_at → ISO startAt',
+    normalizeChallongeApi(timedApi).startAt === new Date('2026-08-01T20:00:00-04:00').toISOString(),
+    String(normalizeChallongeApi(timedApi).startAt));
 
   const pendingStore = await loadFixture('challonge-module-store.json');
   for (const round of Object.values(pendingStore.matches_by_round)) {
@@ -418,8 +427,97 @@ async function testSidecar() {
   check('sidecar: config persisted (url + autoStart off)',
     persisted.tournamentUrl?.startsWith('stub:') && persisted.autoStart === false, JSON.stringify(persisted));
 
+  // ── Auto-scheduling ─────────────────────────────────────────────────────────
+  // A poll that returns `completed` pushes the final payload, then stops
+  // polling by itself.
+  const doneFix = resolve(tmpdir(), `zipper-verify-done-${process.pid}.json`);
+  await writeFile(doneFix, JSON.stringify({
+    tournamentName: 'Done Cup', state: 'completed',
+    matches: [{ id: 'd1', round: 'Grand Final', state: 'completed',
+      p1: { name: 'Flash', score: 3 }, p2: { name: 'Rival', score: 1 }, winner: 1, order: 1 }],
+    standings: [{ placement: 1, name: 'Flash' }, { placement: 2, name: 'Rival' }],
+  }), 'utf-8');
+  cmd('setUrl', `stub:${doneFix}`);
+  const atDone = mark();
+  cmd('start');
+  const evDone = await since(atDone, (d) => isStatus(d) && parseStatus(d).auto?.stopped === 'completed', 5000);
+  const sDone = evDone && parseStatus(evDone);
+  check('sidecar: completed event auto-stops polling',
+    sDone && sDone.polling === false && sDone.auto.eventState === 'completed',
+    JSON.stringify(sDone?.auto ?? 'no auto-stop status seen'));
+  const updDone = await since(atDone, (d) => isUpdate(d) && d.tournament?.state === 'completed');
+  check('sidecar: final payload still pushed before the auto-stop', !!updDone, 'no completed ticker:update seen');
+
+  // A poll that returns `upcoming` sleeps until the platform's start time.
+  const upFix = resolve(tmpdir(), `zipper-verify-upcoming-${process.pid}.json`);
+  const upStartAt = new Date(Date.now() + 90_000).toISOString();
+  await writeFile(upFix, JSON.stringify({
+    tournamentName: 'Tomorrow Cup', state: 'upcoming', startAt: upStartAt, matches: [], standings: [],
+  }), 'utf-8');
+  cmd('setUrl', `stub:${upFix}`);
+  const atUp = mark();
+  cmd('start');
+  const evWait = await since(atUp, (d) => isStatus(d) && !!parseStatus(d).auto?.waitingUntil, 5000);
+  const sWait = evWait && parseStatus(evWait);
+  check('sidecar: upcoming event waits for the start time',
+    sWait && sWait.polling === true && sWait.auto.eventState === 'upcoming' && sWait.auto.startAt === upStartAt,
+    JSON.stringify(sWait?.auto ?? 'no waiting status seen'));
+  check('sidecar: waitingUntil lands on the start time',
+    sWait && Math.abs(Date.parse(sWait.auto.waitingUntil) - Date.parse(upStartAt)) < 5000,
+    `waitingUntil ${sWait?.auto?.waitingUntil} vs startAt ${upStartAt}`);
+
+  // …and resumes by itself once the start time arrives and the event is live.
+  const soonFix = resolve(tmpdir(), `zipper-verify-soon-${process.pid}.json`);
+  await writeFile(soonFix, JSON.stringify({
+    tournamentName: 'Soon Cup', state: 'upcoming',
+    startAt: new Date(Date.now() + 1500).toISOString(), matches: [], standings: [],
+  }), 'utf-8');
+  cmd('setUrl', `stub:${soonFix}`);
+  const atSoon = mark();
+  cmd('start');
+  await since(atSoon, (d) => isStatus(d) && !!parseStatus(d).auto?.waitingUntil, 5000);
+  // The event "goes live" while the sidecar sleeps; the wake-up poll at the
+  // start time must pick it up and resume the normal cadence.
+  await writeFile(soonFix, JSON.stringify({
+    tournamentName: 'Soon Cup', state: 'in_progress',
+    matches: [{ id: 'l1', round: 'Round 1', state: 'in_progress',
+      p1: { name: 'Flash', score: 1 }, p2: { name: 'Rival', score: 0 }, winner: 0, order: 1 }],
+    standings: [],
+  }), 'utf-8');
+  const evLive = await since(atSoon, (d) => isStatus(d) && parseStatus(d).auto?.eventState === 'in_progress', 8000);
+  const sLive2 = evLive && parseStatus(evLive);
+  check('sidecar: polling resumes when the start time arrives',
+    sLive2 && sLive2.polling === true && !sLive2.auto.waitingUntil,
+    JSON.stringify(sLive2?.auto ?? 'no resumed status seen'));
+
+  // setAutoSchedule off → a completed event keeps polling (manual mode).
+  const atAutoOff = mark();
+  cmd('setAutoSchedule', 'off');
+  await since(atAutoOff, (d) => isStatus(d) && parseStatus(d).auto?.enabled === false, 4000);
+  cmd('setUrl', `stub:${doneFix}`);
+  const atManual = mark();
+  cmd('start');
+  const evManual = await since(atManual, (d) => {
+    if (!isStatus(d)) return false;
+    const s = parseStatus(d);
+    return s.auto?.eventState === 'completed' && !!s.lastPollAt;
+  }, 5000);
+  const sManual = evManual && parseStatus(evManual);
+  check('sidecar: setAutoSchedule off keeps polling a completed event',
+    sManual && sManual.polling === true && sManual.auto.stopped === null,
+    JSON.stringify(sManual?.auto ?? 'no manual-mode status seen'));
+  const atStop = mark();
+  cmd('stop');
+  await since(atStop, (d) => isStatus(d) && parseStatus(d).polling === false, 4000);
+  await sleep(200);
+  const persistedAuto = JSON.parse(await readFile(cfgPath, 'utf-8'));
+  check('sidecar: autoSchedule persisted', persistedAuto.autoSchedule === false, JSON.stringify(persistedAuto.autoSchedule));
+
   client.ws.close();
   await rm(cfgPath, { force: true });
+  await rm(doneFix, { force: true });
+  await rm(upFix, { force: true });
+  await rm(soonFix, { force: true });
 }
 
 // ── 6. Milestone announcements (SE mock + real sidecar) ──────────────────────
@@ -460,7 +558,8 @@ async function testMilestones() {
       ...process.env,
       SB_WS_URL: WS_URL,
       ZIPPER_CONFIG: cfgPath,
-      ZIPPER_GUARD_PORT: '7498',
+      // NOT 7498/7499 — those are the live Octet sidecar + Octet's verify.
+      ZIPPER_GUARD_PORT: '7492',
       ZIPPER_SE_BASE: `http://127.0.0.1:${SE_PORT}`,
     },
     stdio: ['ignore', 'pipe', 'pipe'],

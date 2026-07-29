@@ -38,6 +38,7 @@ query ZipperEventSets($slug: String!, $page: Int = 1, $perPage: Int = 50, $stand
     id
     name
     state
+    startAt
     tournament { name }
     standings(query: { perPage: $standingsPerPage, page: 1 }) {
       nodes { placement entrant { id name } }
@@ -155,9 +156,17 @@ export function normalizeStartggEvent(event) {
     : (evState === 'CREATED' || Number(event?.state) === 1) ? 'upcoming'
     : 'in_progress';
 
+  // event.startAt is epoch SECONDS (may be null on undated events) — feeds the
+  // sidecar's wait-for-start auto-scheduling.
+  const startEpoch = Number(event?.startAt);
+  const startAt = Number.isFinite(startEpoch) && startEpoch > 0
+    ? new Date(startEpoch * 1000).toISOString()
+    : null;
+
   return {
     tournamentName: tourneyName && eventName ? `${tourneyName} — ${eventName}` : (tourneyName || eventName),
     state,
+    startAt,
     matches,
     standings,
   };

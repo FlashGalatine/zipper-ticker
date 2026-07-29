@@ -17,7 +17,13 @@
 //
 // Commands: setUrl, start, stop, pollNow, setInterval, setCapsText,
 //           setCapsLogo, setMaxItems, setMessage, setMessageText,
-//           setMessageEnabled, status.
+//           setMessageEnabled, setAutoSchedule, status.
+//
+// Auto-scheduling (config.autoSchedule, default ON): API calls are only spent
+// while the event is actually running. A poll that comes back `completed`
+// pushes the final payload and then stops polling; one that comes back
+// `upcoming` sleeps until the platform's advertised start time (slow re-check
+// when it has none) and resumes normal polling once the event goes live.
 //
 // Config lives in ./config.json (gitignored; seeded from config.example.json on
 // first run). API keys may also come from env: CHALLONGE_API_KEY, STARTGG_API_KEY.
@@ -49,6 +55,8 @@ const MIN_INTERVAL_MS = 15000;
 const MAX_BACKOFF_MS = 300000; // 5 min cap when the platform keeps erroring
 const MESSAGE_MAX_CHARS = 1000;
 const MESSAGE_MAX_LINES = 20;
+const WAITING_POLL_MS = 300000; // 5 min re-check while upcoming with no usable start time
+const MAX_WAIT_MS = 6 * 3600000; // longest single sleep while waiting on a start time
 
 let config = {
   challongeApiKey: null,
@@ -72,6 +80,9 @@ let config = {
   streamElements: { jwtToken: null, pollSeconds: 60 },
   milestones: { followers: 0, subs: 0, tips: 0, cheers: 0 },
   milestoneState: {}, // last announced threshold per metric (persisted)
+  // Auto-scheduling: stop polling when the event completes; while it hasn't
+  // started, sleep until the platform's start time instead of burning API calls.
+  autoSchedule: true,
   autoStart: false,
 };
 
@@ -85,6 +96,10 @@ let lastHash = null;
 let lastPayload = null; // last payload built, so config-only changes (message,
                         // caps) can re-push without waiting for a poll
 let platformName = null;
+let eventState = null; // last fetched tournament state (upcoming/in_progress/completed)
+let eventStartAt = null; // platform's advertised start time (ISO), when it has one
+let waitingUntil = null; // set while auto-scheduling sleeps for the start time
+let autoStopped = null; // 'completed' after an automatic stop, for the status line
 
 let sbWs = null;
 let sbReconnectTimer = null;
@@ -140,6 +155,7 @@ function adoptConfig(parsed) {
       cheers: clampInt(parsed.milestones?.cheers, 0, 1000000, 0),
     },
     milestoneState: (parsed.milestoneState && typeof parsed.milestoneState === 'object') ? { ...parsed.milestoneState } : {},
+    autoSchedule: parsed.autoSchedule === undefined ? true : !!parsed.autoSchedule,
     autoStart: !!parsed.autoStart,
   };
 }
@@ -180,12 +196,15 @@ function truthy(v) {
 function startPolling() {
   if (!config.tournamentUrl) { lastError = 'No tournament URL set'; pushStatus(); return; }
   polling = true;
+  autoStopped = null; // manual (re)start always gets one fresh poll
   persist();
   schedulePoll(0);
 }
 
 function stopPolling() {
   polling = false;
+  waitingUntil = null;
+  autoStopped = null;
   if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
   persist();
   pushStatus();
@@ -203,6 +222,34 @@ function nextDelay() {
   return Math.min(config.pollIntervalMs * 2 ** Math.min(consecutiveErrors, 5), MAX_BACKOFF_MS);
 }
 
+// Auto-scheduling: spend API calls only while the event is actually running.
+// completed → stop polling outright (the final payload just pushed stays on
+// screen); upcoming → sleep until the platform's start time (slow re-check when
+// it has none), so polling resumes by itself once the event goes live. Errors
+// keep the normal backoff — a failed fetch says nothing about the event state.
+function nextDelayAuto() {
+  waitingUntil = null;
+  if (!config.autoSchedule || consecutiveErrors) return nextDelay();
+  if (eventState === 'completed') {
+    polling = false;
+    autoStopped = 'completed';
+    persist();
+    log('event completed — polling auto-stopped');
+    return 0; // unused: schedulePoll is a no-op once polling is false
+  }
+  if (eventState === 'upcoming') {
+    const untilStart = eventStartAt ? Date.parse(eventStartAt) - Date.now() : NaN;
+    const hasStart = Number.isFinite(untilStart) && untilStart > 0;
+    // MAX_WAIT_MS chunks a far-off start into cheap once-per-6h re-checks (also
+    // catches organisers moving the date). No/passed start time → slow re-check.
+    const wait = hasStart ? Math.min(untilStart, MAX_WAIT_MS) : Math.max(WAITING_POLL_MS, config.pollIntervalMs);
+    waitingUntil = new Date(Date.now() + wait).toISOString();
+    log(`event not started — ${hasStart ? `sleeping until ${waitingUntil} (start ${eventStartAt})` : `re-checking in ${Math.round(wait / 60000)} min (no start time from the platform)`}`);
+    return wait;
+  }
+  return nextDelay();
+}
+
 async function pollOnce() {
   // Emit a status snapshot the moment a poll is requested. The control page's
   // liveness heartbeat expects a reply per command, and a slow fetch would
@@ -216,6 +263,8 @@ async function pollOnce() {
     consecutiveErrors = 0;
     lastError = '';
     lastPollAt = new Date().toISOString();
+    eventState = result.state || 'in_progress';
+    eventStartAt = strOrNull(result.startAt);
     const payload = buildPayload(result);
     lastPayload = payload;
     const hash = hashPayload(payload);
@@ -231,8 +280,9 @@ async function pollOnce() {
     log(`poll failed (${consecutiveErrors}x): ${lastError}`);
   } finally {
     pollInFlight = false;
+    const delay = nextDelayAuto(); // may auto-stop; must run before pushStatus
     pushStatus();
-    schedulePoll(nextDelay());
+    schedulePoll(delay);
   }
 }
 
@@ -523,6 +573,15 @@ function pushStatus() {
     topN: config.topN,
     caps: { ...config.caps },
     message: { ...config.message },
+    // Auto-scheduling snapshot: what the last poll said about the event and
+    // what the scheduler is doing about it (docs/PROTOCOL.md).
+    auto: {
+      enabled: config.autoSchedule,
+      eventState,
+      startAt: eventStartAt,
+      waitingUntil,
+      stopped: autoStopped, // 'completed' | null
+    },
     // StreamElements milestone status — never the token itself.
     se: { configured: seConfigured(), lastPollAt: seLastPollAt, lastError: seLastError },
   };
@@ -549,6 +608,9 @@ function dispatch(command, value) {
       platformName = config.tournamentUrl ? (detectPlatform(config.tournamentUrl)?.name
         ?? (config.tournamentUrl.startsWith('stub:') ? 'stub' : null)) : null;
       lastError = '';
+      eventState = null; // new tournament — forget the old one's state/schedule
+      eventStartAt = null;
+      autoStopped = null;
       persist();
       if (polling && config.tournamentUrl) schedulePoll(0);
       pushStatus();
@@ -557,7 +619,7 @@ function dispatch(command, value) {
     case 'stop': stopPolling(); return;
     case 'pollNow':
       if (!config.tournamentUrl) { lastError = 'No tournament URL set'; pushStatus(); return; }
-      if (!polling) { polling = true; persist(); }
+      if (!polling) { polling = true; autoStopped = null; persist(); }
       schedulePoll(0);
       return;
     case 'setInterval':
@@ -626,6 +688,14 @@ function dispatch(command, value) {
     case 'setMessageEnabled':
       config.message.enabled = truthy(value);
       applyMessageChange();
+      return;
+    case 'setAutoSchedule':
+      config.autoSchedule = truthy(value);
+      persist();
+      // Turning it off cancels a pending wait-for-start sleep and resumes the
+      // normal cadence; turning it on takes effect at the next poll.
+      if (polling && !config.autoSchedule) { waitingUntil = null; schedulePoll(nextDelay()); }
+      pushStatus();
       return;
     case 'setOptions': {
       const o = parseJson(value);

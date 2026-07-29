@@ -143,9 +143,17 @@ export function normalizeChallongeApi(body) {
   return {
     tournamentName: String(t.name || '').trim(),
     state: t.state === 'complete' ? 'completed' : t.state === 'pending' ? 'upcoming' : 'in_progress',
+    startAt: isoOrNull(t.start_at),
     matches,
     standings,
   };
+}
+
+// Challonge timestamps are ISO8601 strings (or null when the organiser never
+// set a date) — feeds the sidecar's wait-for-start auto-scheduling.
+function isoOrNull(v) {
+  const t = Date.parse(String(v ?? ''));
+  return Number.isFinite(t) ? new Date(t).toISOString() : null;
 }
 
 // "3-1" → [3, 1]; multi-set "1-0,0-1,1-0" → set counts summed per side wins?
@@ -282,6 +290,9 @@ export function normalizeChallongeStore(store, pageTitle = '') {
     state: standings.length ? 'completed'
       : matches.every((m) => m.state === 'upcoming') ? 'upcoming'
       : 'in_progress',
+    // The embed store's tournament block carries start_at on newer brackets;
+    // defensive read — absent/garbage becomes null (no wait-for-start data).
+    startAt: isoOrNull(store?.tournament?.start_at),
     matches,
     standings,
   };
