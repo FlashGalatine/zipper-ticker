@@ -87,14 +87,25 @@ reserved command `__status` with the status JSON as `value`:
 
 ```json
 { "type": "ticker:command", "command": "__status",
-  "value": "{\"type\":\"ticker:status\",\"polling\":true,\"url\":\"…\",\"platform\":\"challonge\",\"lastPollAt\":\"…\",\"lastError\":\"\",\"commandNotice\":\"\",\"intervalMs\":30000,\"maxItems\":20,\"caps\":{…}}" }
+  "value": "{\"type\":\"ticker:status\",\"polling\":true,\"url\":\"…\",\"platform\":\"challonge\",\"lastPollAt\":\"…\",\"nextPollAt\":\"…\",\"lastError\":\"\",\"commandNotice\":\"\",\"intervalMs\":30000,\"maxItems\":20,\"caps\":{…}}" }
 ```
 
 The sidecar ignores its own `__status` echo, in any casing; the control page
 unwraps `value`. Sent after every poll and after every command.
 
 - `lastError` — why the last poll failed; `""` after a good poll and after an
-  accepted `setUrl`.
+  accepted `setUrl`. This includes the limits below: a site that took longer
+  than 10 s to answer, a poll that took longer than 45 s, or an answer over
+  16 MB. The message names the site's host and the limit, never the address.
+  A request that could not be made at all reads `<host>: the request failed`,
+  with the system's code when there is one (for example `ECONNREFUSED` or
+  `ENOTFOUND`), never the address or a header's value.
+  A poll of the previous URL that ends after a `setUrl` leaves it alone.
+- `nextPollAt` — when the next poll runs (ISO time), or `null` when none is
+  waiting (polling off, or a poll under way). It counts the interval, the error
+  backoff, a site's Retry-After and the minimum gap below, whichever is latest.
+  Unlike `auto.waitingUntil`, it does not mean the sidecar is waiting for the
+  event to start.
 - `commandNotice` — why the last command was not carried out, or not in full:
   an unknown command (by its name only, cut to 40 characters, never its value),
   a refused `setUrl`, a refused logo, or `start` / `pollNow` with no tournament
@@ -119,6 +130,30 @@ The status carries an `auto` block describing the auto-scheduler (see
 - `stopped` — `"completed"` after the scheduler stopped polling itself, `null`
   otherwise.
 
+### When the sidecar polls
+
+- **One poll at a time**, with 45 s in all. Each request in it has 10 s, until
+  its whole answer is in, and an answer may be at most 16 MB. A poll that runs
+  past a limit is stopped and fails (`lastError`).
+- **At least 15 s between polls**, counted from the end of one to the start of
+  the next, whatever asks for them. A command that asks for a poll inside that
+  gap (`pollNow`, `start`, `setUrl`, or an option change while polling) is
+  answered with a status at once and polled when the gap ends, so a burst of
+  commands costs one poll. A `pollNow` or `start` that arrives while a poll is
+  under way runs after it. A cap or option change made while polling reaches
+  the strip with that poll, so it too waits for the gap, and for a site's
+  Retry-After.
+- **After an error** the wait doubles with each failure in a row, up to 5
+  minutes, and is never shorter than the poll interval.
+- **A site's Retry-After** (on a 429 or 503) holds back every poll of that
+  platform until it ends, up to 5 minutes or the interval, whichever is longer.
+  No command cuts it short, `pollNow` and `setUrl` included. The wait belongs to
+  the platform: a URL on another platform is polled as usual, and a URL on the
+  waiting platform (set again, set back, or set after clearing the URL) still
+  waits for its end.
+- **A changed URL.** A poll still running for the old URL when `setUrl` arrives
+  is stopped, and whatever it brings back is thrown away.
+
 ## ticker:command
 
 Control surfaces (control page, chat trigger, Stream Deck) call the **Ticker
@@ -135,13 +170,13 @@ passed as they are. An unknown name is ignored and reported in the status's
 
 | command       | value                          | effect |
 |---------------|--------------------------------|--------|
-| `setUrl`      | tournament URL (empty = none)  | switch tournaments (forces a re-push on next poll). An empty value clears the URL and **stops polling**. A refused `stub:` URL (see [Test hook](#test-hook)) keeps the old URL, saves nothing and says why in `commandNotice` |
+| `setUrl`      | tournament URL (empty = none)  | switch tournaments (forces a re-push on next poll). A poll of the old URL still running is stopped and its result thrown away; while polling, the new URL is polled once the gap allows (see [When the sidecar polls](#when-the-sidecar-polls)). An empty value clears the URL and **stops polling**. A refused `stub:` URL (see [Test hook](#test-hook)) keeps the old URL, saves nothing and says why in `commandNotice` |
 | `start`       | —                              | start polling |
 | `stop`        | —                              | stop polling |
-| `pollNow`     | —                              | immediate poll (starts polling if stopped) |
+| `pollNow`     | —                              | a fresh poll as soon as the 15 s gap after the last poll and any Retry-After allow (starts polling if stopped); the status answers at once, with `nextPollAt` |
 | `setInterval` | milliseconds (min 15000)       | poll cadence |
 | `setCaps`     | JSON `{text,logo}`             | **batched** — sets both end caps in one command (the control page uses this). A logo `setCapsLogo` would refuse is refused here too: the old logo stays, the text still applies, and `commandNotice` says why |
-| `setOptions`  | JSON `{intervalMs,maxItems,topN}` | **batched** — sets all three options in one command |
+| `setOptions`  | JSON `{intervalMs,maxItems,topN}` | **batched** — sets all three options in one command. While polling, a changed `maxItems` or `topN` asks for a poll, as `setMaxItems` and `setTopN` do; a new interval alone (or no change) only re-times the next poll, so it never cuts an error backoff or a Retry-After short |
 | `setMessage`  | JSON `{text,enabled}`          | **batched** — persistent message text + on/off in one command (the control page uses this) |
 | `setMessageText` | string (≤1000 chars, `\n`-separated lines) | message text (single-field; for chat / Stream Deck) |
 | `setMessageEnabled` | `on`/`off` (also `true`/`false`, `1`/`0`, `yes`) | show the message instead of results |
@@ -150,7 +185,7 @@ passed as they are. An unknown name is ignored and reported in the status's
 | `setInterval` above, `setMaxItems`, `setTopN` | see below | single-field variants |
 | `setMaxItems` | 1–100                          | ticker item cap |
 | `setTopN`     | 0–100 (0 = off)                | only show matches involving the top-N placed participants (needs platform standings — start.gg always; Challonge via `final_rank` on the keyed API for your own tournaments, or derived from elimination order on finished brackets when scraping; also trims the standings crawl to N) |
-| `setAutoSchedule` | `on`/`off` (default on)    | auto start/stop: a poll that returns `completed` pushes the final payload then **stops polling**; one that returns `upcoming` **sleeps until the platform's start time** (re-checking every 5 min without one, and at most every 6 h for far-off dates) and resumes normal polling when the event goes live. `start`/`pollNow` always force a fresh poll regardless. |
+| `setAutoSchedule` | `on`/`off` (default on)    | auto start/stop: a poll that returns `completed` pushes the final payload then **stops polling**; one that returns `upcoming` **sleeps until the platform's start time** (re-checking every 5 min without one, and at most every 6 h for far-off dates) and resumes normal polling when the event goes live. `start`/`pollNow` get a poll even during that sleep or after that stop, but it still waits for the 15 s gap after the last poll and for a site's Retry-After (see [When the sidecar polls](#when-the-sidecar-polls)). |
 | `status`      | —                              | request a status re-broadcast |
 
 > **Why the batched `setCaps` / `setOptions` exist.** Streamer.bot can mix up
@@ -233,4 +268,20 @@ JSON object, fails the poll with a fixed message that quotes none of its content
 
 With `ZIPPER_ALLOW_STUB=1` a stub file may also name a hold file
 (`"stubHoldFile": "<path-relative-to-repo>"`): the poll then waits while that file
-exists, so a test can hold a poll open and release it by deleting the file.
+exists, so a test can hold a poll open and release it by deleting the file. The
+poll's 45 s deadline, or a `setUrl`, ends the wait as it would a request. With
+`"stubHoldIgnoresAbort": true` beside the hold file, the wait does not end when
+the poll is stopped: it goes on until the file is deleted, so the poll's result
+(or its `stubFail`) comes back after a `setUrl` has moved on, as an answer
+already on its way would. It is still bounded: the wait ends by itself 45 s
+after it began (the poll's deadline), and the poll then fails as a stopped one
+does. Without a hold file the key does nothing. A stub file may also make its
+poll fail as a rate-limited site would
+(`"stubFail": { "status": 429, "retryAfter": "120" }`, the Retry-After in seconds
+or as an HTTP date), with the fixed message `stub: the test file answered as
+HTTP <status>`.
+
+The tests shorten the poll loop's limits with `ZIPPER_REQUEST_TIMEOUT_MS` (10 s
+per request), `ZIPPER_POLL_DEADLINE_MS` (45 s per poll) and
+`ZIPPER_MIN_POLL_GAP_MS` (15 s between polls). Each is clamped, so it can only
+shorten its limit.

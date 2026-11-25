@@ -16,6 +16,8 @@
 //   /tournament/<t>/event/<e>       (event landing)
 //   /tournament/<t>/events/<e>/...  (any sub-page incl. brackets/standings)
 
+import { guardedFetch, statusError, USER_AGENT } from './guarded-fetch.js';
+
 const PUBLIC_ENDPOINT = 'https://www.start.gg/api/-/gql';
 const API_ENDPOINT = 'https://api.start.gg/gql/alpha';
 const DEFAULT_CLIENT_VERSION = '20';
@@ -91,7 +93,9 @@ export const startgg = {
     }
   },
 
-  async fetchTicker(displayId, config, originalUrl) {
+  // `signal` is the poll's deadline: it reaches every request below, so a poll that
+  // pages through sets stops as a whole rather than paging on in the background.
+  async fetchTicker(displayId, config, originalUrl, signal) {
     const apiKey = config?.startggApiKey ?? null;
     let eventSlug = deriveEventSlug(originalUrl, displayId);
     if (!eventSlug) {
@@ -99,9 +103,9 @@ export const startgg = {
       if (!tournamentSlug) {
         throw new Error('start.gg: paste a tournament or event URL (e.g. https://www.start.gg/tournament/<t> or .../tournament/<t>/event/<e>)');
       }
-      eventSlug = await resolveEventSlug(tournamentSlug, apiKey);
+      eventSlug = await resolveEventSlug(tournamentSlug, apiKey, signal);
     }
-    const event = await fetchAllSets(eventSlug, apiKey);
+    const event = await fetchAllSets(eventSlug, apiKey, signal);
     return normalizeStartggEvent(event);
   },
 };
@@ -211,12 +215,13 @@ function deriveTournamentSlug(originalUrl, displayId) {
 // Pick the event from a tournament-level URL. One event → use it; many → prefer
 // the single SF6 event; otherwise throw, naming the events so the operator can
 // paste a specific event URL.
-async function resolveEventSlug(tournamentSlug, apiKey) {
+async function resolveEventSlug(tournamentSlug, apiKey, signal) {
   const data = await gql({
     operationName: 'ZipperTournamentEvents',
     query: TOURNAMENT_EVENTS_QUERY,
     variables: { slug: tournamentSlug },
     apiKey,
+    signal,
   });
   const tournament = data?.tournament;
   if (!tournament) {
@@ -239,7 +244,7 @@ async function resolveEventSlug(tournamentSlug, apiKey) {
   return chosen.slug; // already "tournament/<t>/event/<e>"
 }
 
-async function fetchAllSets(slug, apiKey) {
+async function fetchAllSets(slug, apiKey, signal) {
   let event = null;
   let page = 1;
   let totalPages = 1;
@@ -251,6 +256,7 @@ async function fetchAllSets(slug, apiKey) {
       query: SETS_QUERY,
       variables: { slug, page, perPage: PAGE_SIZE },
       apiKey,
+      signal,
     });
     const ev = data?.event;
     if (!ev) throw new Error('start.gg: event not found (private, deleted, or wrong URL path)');
@@ -266,54 +272,56 @@ async function fetchAllSets(slug, apiKey) {
   return { ...event, sets: { nodes } };
 }
 
-async function gql({ operationName, query, variables, apiKey }) {
+async function gql({ operationName, query, variables, apiKey, signal }) {
   return apiKey
-    ? gqlOfficialApi({ operationName, query, variables, apiKey })
-    : gqlPublicProxy({ operationName, query, variables });
+    ? gqlOfficialApi({ operationName, query, variables, apiKey, signal })
+    : gqlPublicProxy({ operationName, query, variables, signal });
 }
 
-async function gqlOfficialApi({ operationName, query, variables, apiKey }) {
-  const res = await fetch(API_ENDPOINT, {
+async function gqlOfficialApi({ operationName, query, variables, apiKey, signal }) {
+  const res = await guardedFetch(API_ENDPOINT, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       'Accept': 'application/json',
       'Authorization': `Bearer ${apiKey}`,
-      'User-Agent': 'Zipper/0.1',
+      'User-Agent': USER_AGENT,
     },
     body: JSON.stringify({ operationName, variables, query }),
+    signal,
   });
   if (res.status === 401 || res.status === 403) {
-    throw new Error('start.gg API: token rejected (check "startggApiKey" in config.json — get one at start.gg → developer settings)');
+    throw statusError('start.gg API: token rejected (check "startggApiKey" in config.json — get one at start.gg → developer settings)', res);
   }
   if (res.status === 429) {
-    throw new Error('start.gg API: rate limit exceeded (default 80 requests / 60 seconds per token) — raise the poll interval');
+    throw statusError('start.gg API: rate limit exceeded (default 80 requests / 60 seconds per token) — raise the poll interval', res);
   }
-  if (!res.ok) throw new Error(`start.gg API ${res.status}: ${res.statusText}`);
-  const obj = await res.json();
+  if (!res.ok) throw statusError(`start.gg API ${res.status}: ${res.statusText}`, res);
+  const obj = res.json();
   if (obj.errors) throw new Error(`start.gg API GraphQL: ${obj.errors[0]?.message ?? 'unknown'}`);
   return obj.data ?? null;
 }
 
 let cachedClientVersion = DEFAULT_CLIENT_VERSION;
 
-async function gqlPublicProxy({ operationName, query, variables }) {
+async function gqlPublicProxy({ operationName, query, variables, signal }) {
   for (let attempt = 0; attempt < 2; attempt++) {
-    const res = await fetch(PUBLIC_ENDPOINT, {
+    const res = await guardedFetch(PUBLIC_ENDPOINT, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'Accept': 'application/json',
-        'User-Agent': 'Zipper/0.1',
+        'User-Agent': USER_AGENT,
         'client-version': cachedClientVersion,
         'x-web-source': 'gg-web-gql-client',
         'apollo-client-id': 'smashgg-legacy',
       },
       body: JSON.stringify([{ operationName, variables, query }]),
+      signal,
     });
 
     if (res.status === 400) {
-      const text = await res.text();
+      const text = res.text;
       // Self-heal when start.gg bumps the required client-version.
       try {
         const obj = JSON.parse(text);
@@ -323,10 +331,10 @@ async function gqlPublicProxy({ operationName, query, variables }) {
           continue;
         }
       } catch { /* fall through to throw below */ }
-      throw new Error(`start.gg 400: ${text.slice(0, 240)} — the public proxy may not allow the sets query; set "startggApiKey" in config.json`);
+      throw statusError(`start.gg 400: ${text.slice(0, 240)} — the public proxy may not allow the sets query; set "startggApiKey" in config.json`, res);
     }
-    if (!res.ok) throw new Error(`start.gg ${res.status}: ${res.statusText}`);
-    const arr = await res.json();
+    if (!res.ok) throw statusError(`start.gg ${res.status}: ${res.statusText}`, res);
+    const arr = res.json();
     const first = arr[0];
     if (first?.errors) throw new Error(`start.gg GraphQL: ${first.errors[0]?.message ?? 'unknown error'}`);
     return first?.data ?? null;

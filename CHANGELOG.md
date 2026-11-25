@@ -10,6 +10,65 @@ traceability.
 
 ## [Unreleased]
 
+## [1.0.20] — 2026-11-25
+
+Copy `zipper-sidecar.mjs` and the whole `platforms` folder, which has a new
+file (`guarded-fetch.js`), then stop the sidecar and start it again. Copy both
+together: an old sidecar with the new `platforms` files, or the other way
+round, will not start correctly. Nothing to re-paste.
+
+### Fixed
+
+- **Changing the tournament URL during a poll no longer shows the old bracket
+  under the new address.** Before, a poll already under way could finish after
+  the change and put the old tournament's results on the strip with the new
+  URL, and an old tournament that had ended could stop polling for the new one.
+  The change now stops the poll in flight, and a result that comes back late is
+  thrown away.
+- **A tournament site that hangs no longer freezes polling in silence.** A
+  single request gives up after 10 seconds and a whole poll after 45, with a
+  line on the control page such as "www.start.gg took longer than 10 s to
+  answer". An answer larger than 16 MB is refused. A **Poll now** sent while a
+  poll is stuck runs afterwards; before, it was dropped.
+- **A failing site is never polled more often than your interval.** With an
+  interval longer than five minutes, the old back-off polled a failing site
+  every five minutes.
+- **"Too many requests" is respected.** When a site answers that way and says
+  how long to wait, Zipper waits that long, up to five minutes or your interval
+  if that is longer. **Poll now** does not cut the wait short; it applies per
+  site, so a tournament on another site is polled as usual.
+
+### Changed
+
+- **A poll runs no sooner than 15 seconds after the last one ended.** Poll now,
+  Start, a new URL and, while polling, a caps or options change all still
+  answer at once, but the poll itself waits out those 15 seconds. A burst of
+  clicks or chat commands costs one poll. While polling, a caps or logo change
+  can therefore take up to 15 seconds to reach the strip, or as long as a
+  site's "too many requests" wait.
+- Error lines name the site and what went wrong (a timeout, the size limit, a
+  connection that could not be made), and never the full address, which can
+  carry an API key.
+- The sidecar's status has a new field, `nextPollAt`, the time of the next
+  poll. The control page does not show it yet.
+- Zipper identifies itself to tournament sites with its real version.
+- Poll timing no longer depends on the computer's clock, so a clock correction
+  cannot stall polling.
+
+### Development
+
+- Three test-only switches work through `stub:` URLs, and only with
+  `ZIPPER_ALLOW_STUB=1`: a poll that waits, a poll that fails with a chosen
+  answer, and a held poll that ignores being stopped. `docs/PROTOCOL.md`
+  describes them.
+
+### Not checked
+
+- No tournament site was contacted. The request limits are tested against a
+  local server that never answers, and each adapter's wiring is checked
+  in-process.
+- The 16 MB limit is not checked against a real full-size bracket page.
+
 ## [1.0.18] — 2026-11-25
 
 Copy `zipper-sidecar.mjs` and the `zipper-shared` folder. Stop the sidecar and
@@ -242,7 +301,8 @@ Initial release — scrolling tournament-results ticker for Streamer.bot.
 Live-validated keyless against real start.gg and Challonge brackets across
 pre-start, mid-event and completed states.
 
-[Unreleased]: https://github.com/FlashGalatine/zipper-ticker/compare/v1.0.18...main
+[Unreleased]: https://github.com/FlashGalatine/zipper-ticker/compare/v1.0.20...main
+[1.0.20]: https://github.com/FlashGalatine/zipper-ticker/compare/v1.0.18...v1.0.20
 [1.0.18]: https://github.com/FlashGalatine/zipper-ticker/compare/v1.0.16...v1.0.18
 [1.0.16]: https://github.com/FlashGalatine/zipper-ticker/compare/v1.0.14...v1.0.16
 [1.0.14]: https://github.com/FlashGalatine/zipper-ticker/compare/dbdb789...v1.0.14
