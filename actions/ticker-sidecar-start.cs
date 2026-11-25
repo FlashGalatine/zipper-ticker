@@ -25,7 +25,7 @@
 // and SB cannot restart its servers until the child is killed.
 //
 // Running it twice is harmless: the sidecar binds a single-instance guard port
-// (:7496) — a second instance logs and exits. Requires node.exe on PATH (Node >= 18).
+// (:7496) — a second instance logs and exits. Requires node.exe on PATH (Node >= 20).
 
 using System;
 using System.Diagnostics;

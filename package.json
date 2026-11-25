@@ -6,16 +6,20 @@
   "license": "MIT",
   "author": "Ashe \"Flash\" Galatine <AsheJunius@gmail.com>",
   "engines": {
-    "node": ">=18"
+    "node": ">=20"
   },
   "scripts": {
     "start": "node mock-sb-server.mjs",
     "sidecar": "node zipper-sidecar.mjs",
     "verify": "node verify.mjs",
     "verify:render": "node verify-render.mjs",
+    "verify:cs": "node verify-cs.mjs",
     "shots": "node tools/shots.mjs"
   },
   "dependencies": {
     "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "playwright-core": "1.65.0"
   }
 }

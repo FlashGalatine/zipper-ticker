@@ -5,3 +5,7 @@ node_modules/
 test-render*.png
 test-live*.png
 control-render*.png
+# Made and removed by the verify suite while it runs (stub fixtures, hold files)
+.verify-tmp/
+# The C# harness's build output (npm run verify:cs)
+tools/cs/build/

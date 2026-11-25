@@ -38,7 +38,7 @@ bracket site ──poll── zipper-sidecar.mjs ──DoAction──▶ Streame
 
 ## Setup
 
-Requires Node ≥ 18, Streamer.bot ≥ 1.0.4 (tested on 1.0.4 and 1.0.7) with its
+Requires Node ≥ 20, Streamer.bot ≥ 1.0.4 (tested on 1.0.4 and 1.0.7) with its
 **WebSocket Server** enabled
 on `:8080` (authentication OFF) and its **HTTP Server** on `:7474`.
 
@@ -187,7 +187,8 @@ key (start.gg → developer settings).
 ```
 npm start               # mock Streamer.bot (:7474/:8080) + sample data at /mock/fixture
 npm run verify          # normalizer fixtures, panel-core, sidecar E2E — no network
-npm run verify:render   # real-pixel screenshots at 1920/640 (npm i --no-save playwright-core)
+npm run verify:render   # real-pixel screenshots at 1920/640 (after npm install)
+npm run verify:cs       # compiles the C# actions and runs them (Windows, .NET Framework)
 npm run shots           # regenerate docs/ screenshots
 ```
 
