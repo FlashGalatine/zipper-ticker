@@ -30,15 +30,18 @@
 //
 // Test hook: a tournament URL of the form "stub:<path-to-json>" loads a
 // normalized platform result from that file instead of the network — used by
-// verify.mjs and handy for offline overlay styling.
+// verify.mjs and handy for offline overlay styling. With ZIPPER_ALLOW_STUB=1 (the
+// verify suite sets it) such a file can also hold its poll open: see stubHold.
 //
 // Run:  start-zipper.bat  ·  npm run sidecar
 // Env:  SB_WS_URL (default ws://127.0.0.1:8080/) · ZIPPER_GUARD_PORT (7496)
 //       ZIPPER_CONFIG (config file path override)
+//       ZIPPER_ALLOW_STUB=1 (tests only: turns on the stub hold below)
 
 import { readFile, writeFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import { createServer } from 'node:net';
-import { resolve, dirname } from 'node:path';
+import { resolve, dirname, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import WebSocket from 'ws';
 import { detectPlatform } from './platforms/index.js';
@@ -50,6 +53,8 @@ const SB_WS_URL = process.env.SB_WS_URL || `ws://127.0.0.1:${process.env.SB_WS_P
 // Single-instance guard: a second launch (double-click + SB action) exits
 // cleanly instead of double-polling. Greenroom holds 7495; Zipper takes 7496.
 const GUARD_PORT = Number(process.env.ZIPPER_GUARD_PORT) || 7496;
+// Set by the verify suite. Without it the sidecar behaves exactly as before.
+const STUB_ALLOWED = process.env.ZIPPER_ALLOW_STUB === '1';
 
 const MIN_INTERVAL_MS = 15000;
 const MAX_BACKOFF_MS = 300000; // 5 min cap when the platform keeps erroring
@@ -292,7 +297,9 @@ async function fetchCurrent() {
   if (url.startsWith('stub:')) {
     platformName = 'stub';
     const raw = await readFile(resolve(__dirname, url.slice(5)), 'utf-8');
-    return JSON.parse(raw);
+    const result = JSON.parse(raw);
+    await stubHold(result); // no abort signal yet; the poll's deadline is passed here later
+    return result;
   }
   const platform = detectPlatform(url);
   if (!platform) throw new Error(`Unrecognized tournament URL: ${url}`);
@@ -301,6 +308,43 @@ async function fetchCurrent() {
   if (!id) throw new Error(`${platform.displayName}: could not parse a tournament id from that URL`);
   return platform.fetchTicker(id, config, url);
 }
+
+// ── stub hold: BEGIN (verify.mjs runs this block on its own, in-process) ──
+// A slow source for the tests. A stub fixture may name a hold file ("stubHoldFile",
+// relative to the repo folder). With ZIPPER_ALLOW_STUB=1 the poll then waits while
+// that file exists, and goes on as soon as the test deletes it: the wait comes from
+// the fixture file only, never from the URL, and has no fixed length. Without the
+// variable this does nothing. An AbortSignal, when one is given, ends the wait at
+// once with the signal's reason, and the timer is cleared.
+const STUB_HOLD_CHECK_MS = 50;
+function stubHold(result, signal) {
+  const name = result && typeof result.stubHoldFile === 'string' ? result.stubHoldFile : '';
+  if (!STUB_ALLOWED || !name) return Promise.resolve();
+  const file = resolve(__dirname, name);
+  if (!file.startsWith(__dirname + sep)) return Promise.resolve(); // only a hold file inside the repo folder counts
+  return new Promise((done, fail) => {
+    let timer = null;
+    let logged = false;
+    const finish = (err) => {
+      if (timer !== null) { clearTimeout(timer); timer = null; }
+      if (signal) signal.removeEventListener('abort', onAbort);
+      if (err) fail(err); else done();
+    };
+    const onAbort = () => finish(signal.reason ?? new Error('stub hold aborted'));
+    if (signal) {
+      if (signal.aborted) { onAbort(); return; }
+      signal.addEventListener('abort', onAbort, { once: true });
+    }
+    const look = () => {
+      timer = null;
+      if (!existsSync(file)) { finish(); return; }
+      if (!logged) { logged = true; log(`stub: holding the poll while ${name} exists`); }
+      timer = setTimeout(look, STUB_HOLD_CHECK_MS);
+    };
+    look();
+  });
+}
+// ── stub hold: END ──
 
 // Normalize + sort + cap into the ticker:update wire payload (docs/PROTOCOL.md).
 function buildPayload(result) {

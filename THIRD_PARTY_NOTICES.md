@@ -5,10 +5,12 @@ Zipper's runtime dependency:
 - **ws** (https://github.com/websockets/ws) — MIT License. Used by the sidecar
   and the verify suites to speak Streamer.bot's WebSocket protocol from Node.
 
-Dev-only (installed with `--no-save`, never shipped):
+Dev dependency (a fixed version in `package.json`; `npm install` fetches it, but
+nothing a streamer runs uses it, and it downloads no browser):
 
 - **playwright-core** (https://github.com/microsoft/playwright) — Apache-2.0.
-  Drives a system Chromium for `npm run verify:render` and `npm run shots`.
+  Drives a system Chromium for `npm run verify:render` and `npm run shots`, and
+  is used by nothing else.
 
 Zipper talks to third-party tournament services (Challonge, start.gg,
 Matcherino, Round.one, TourneyBot) over their public endpoints; no code from

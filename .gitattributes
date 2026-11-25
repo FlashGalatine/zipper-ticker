@@ -1,0 +1,4 @@
+# Windows batch files must keep CRLF line endings everywhere, a ZIP download included:
+# cmd.exe can miss a label (goto, call) in a batch file whose lines end in LF only.
+*.bat text eol=crlf
+*.cmd text eol=crlf

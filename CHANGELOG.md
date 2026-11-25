@@ -10,6 +10,50 @@ traceability.
 
 ## [Unreleased]
 
+## [1.0.16] — 2026-11-25
+
+**Node.js 20 or later is now required** (it was 18). Check with `node --version`
+before updating. Then copy the new `start-zipper.bat`. Restarting the sidecar is
+optional: `zipper-sidecar.mjs` changed only for the tests and behaves the same in
+normal use. Nothing to re-paste.
+
+### Changed
+
+- **The minimum Node.js version is 20**, up from 18, everywhere it is stated:
+  `package.json`, the README, the launcher and the header of
+  `Ticker Sidecar Start`.
+- **`start-zipper.bat` checks the Node version.** When Node is missing or older
+  than 20 it stops with one line saying so and where to get it, before
+  installing anything or starting the sidecar.
+- **A fresh `npm install` also fetches `playwright-core` 1.65.0**, including the
+  launcher's first run. It is a development dependency used only by the render
+  tests; nothing a streamer runs uses it. It is the reason for the Node 20
+  minimum.
+- Batch files keep Windows line endings in every checkout and ZIP download.
+
+### Added (development only)
+
+- **`npm run verify:cs`** compiles the three bus actions with the .NET Framework
+  compiler against a stand-in for Streamer.bot and runs one table of cases
+  through them. The same table runs through the mock, so the two cannot drift
+  apart. Windows only.
+- **The mock answers as Streamer.bot 1.0.7 does**: a reply when the action is
+  queued, naming its queue, and an error reply for an action that does not
+  exist. Switches, off by default, make an action missing, silent or failing,
+  close every connection, or reproduce mixed-up arguments
+  (`/mock/bleed?on=1|0`).
+- **Each suite refuses to run when something already answers on its ports**,
+  where before it could quietly use a leftover process. A test sidecar that
+  stops early fails the run, and every child process is stopped at the end.
+- Checks for every command, every page (no page or console errors) and every
+  numeric range. The handful of older checks that could not fail are replaced.
+
+### Not checked
+
+- The launcher's version check was tested with a stand-in for Node, not by
+  double-clicking it on a machine with Node 18.
+- The suites ran on Node 22, not on Node 20 itself.
+
 ## [1.0.14] — 2026-11-25
 
 Docs only: nothing to copy, restart or re-paste. One setting to make in
@@ -152,6 +196,7 @@ Initial release — scrolling tournament-results ticker for Streamer.bot.
 Live-validated keyless against real start.gg and Challonge brackets across
 pre-start, mid-event and completed states.
 
-[Unreleased]: https://github.com/FlashGalatine/zipper-ticker/compare/v1.0.14...main
+[Unreleased]: https://github.com/FlashGalatine/zipper-ticker/compare/v1.0.16...main
+[1.0.16]: https://github.com/FlashGalatine/zipper-ticker/compare/v1.0.14...v1.0.16
 [1.0.14]: https://github.com/FlashGalatine/zipper-ticker/compare/dbdb789...v1.0.14
 [1.0.11]: https://github.com/FlashGalatine/zipper-ticker/compare/d77a27f...dbdb789
