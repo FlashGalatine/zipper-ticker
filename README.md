@@ -26,7 +26,8 @@ polled straight from the bracket site. Named after the Times Square news
   the crawl — the strip pauses, shows the alert with a kind pill, and resumes.
   Wire SB's own Twitch triggers to the `Ticker Announce` action for sub/raid
   alerts; milestone announcements poll StreamElements (JWT in `config.json`).
-- **Streamer.bot-native:** three SB actions + a small Node sidecar. Overlays
+- **Streamer.bot-native:** three SB actions, plus an optional fourth, and a
+  small Node sidecar. Overlays
   reconnect and repaint by themselves; last results survive an SB restart.
 
 ```
@@ -37,7 +38,8 @@ bracket site ──poll── zipper-sidecar.mjs ──DoAction──▶ Streame
 
 ## Setup
 
-Requires Node ≥ 18, Streamer.bot ≥ 1.0.4 with its **WebSocket Server** enabled
+Requires Node ≥ 18, Streamer.bot ≥ 1.0.4 (tested on 1.0.4 and 1.0.7) with its
+**WebSocket Server** enabled
 on `:8080` (authentication OFF) and its **HTTP Server** on `:7474`.
 
 First, get the code onto the machine that runs Streamer.bot — either
@@ -63,6 +65,26 @@ Click **Compile** on each — all must report success. `Ticker Sidecar Start`
 also needs `System.dll` added on its References tab (see the file's header);
 edit its `BUNDLE` path and add SB's application-started trigger to auto-launch
 the sidecar with Streamer.bot.
+
+**Put the three bus actions in one blocking queue.** In Streamer.bot's
+**Action Queues** tab, add a queue with **Blocking** ticked, then set
+`Ticker Command`, `Ticker Push` and `Ticker Announce` to use it
+(`Ticker Sidecar Start` stays in the default queue). Streamer.bot can mix up
+the arguments of two runs of the same action when they overlap; a blocking
+queue runs them one at a time. Measured on Streamer.bot 1.0.7 with a test
+action: back-to-back requests mixed their arguments in 25 of 25 tries in the
+default queue, 0 of 25 in a blocking queue. The queue covers every sender: the
+control page, chat, a Stream Deck, Twitch triggers and the sidecar.
+
+**Restrict who can use the chat command.** If you add a `!ticker` chat command
+(see [step 5](#5-drive-it) below), `Ticker Command` does whatever the command passes it
+and does not check who typed it. In the command's own settings (Commands tab),
+set its permissions so only **moderators** and the **broadcaster** can use it.
+Anyone the command allows can change the tournament URL (so someone else's
+bracket crawls on your stream), replace the results with any message, change
+the end-cap text or show an image from any web address there, and stop
+polling. The same applies to every other chat command you point at
+`Ticker Command`.
 
 ### 2. HTTP maps
 
@@ -164,7 +186,7 @@ key (start.gg → developer settings).
 
 ```
 npm start               # mock Streamer.bot (:7474/:8080) + sample data at /mock/fixture
-npm run verify          # 65 checks: normalizer fixtures, panel-core, sidecar E2E — no network
+npm run verify          # normalizer fixtures, panel-core, sidecar E2E — no network
 npm run verify:render   # real-pixel screenshots at 1920/640 (npm i --no-save playwright-core)
 npm run shots           # regenerate docs/ screenshots
 ```

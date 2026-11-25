@@ -141,16 +141,21 @@ which the sidecar consumes. Commands:
 | `setAutoSchedule` | `on`/`off` (default on)    | auto start/stop: a poll that returns `completed` pushes the final payload then **stops polling**; one that returns `upcoming` **sleeps until the platform's start time** (re-checking every 5 min without one, and at most every 6 h for far-off dates) and resumes normal polling when the event goes live. `start`/`pollNow` always force a fresh poll regardless. |
 | `status`      | —                              | request a status re-broadcast |
 
-> **Why the batched `setCaps` / `setOptions` exist.** Streamer.bot bleeds
-> arguments between action invocations that arrive in a burst — firing two
-> `DoAction`s to the same action within a few milliseconds shuffles their args
-> together (verified on SB 1.0.4). A control page that set caps text and logo
-> as two back-to-back `setCapsText` + `setCapsLogo` commands would have the
-> second's value land on the first, silently blanking the text. So each control
-> button sends exactly **one** command carrying a JSON value, and `panel-core`
-> additionally serializes outbound `DoAction`s (one in flight at a time). The
-> single-field commands remain for chat / Stream Deck, where one action fires at
-> a time.
+> **Why the batched `setCaps` / `setOptions` exist.** Streamer.bot can mix up
+> the arguments of two runs of the same action when the runs overlap: two
+> `DoAction`s to one action within a few milliseconds can both run with the
+> later one's arguments (seen on SB 1.0.4; measured on 1.0.7, 25 of 25 tries in
+> the default queue). A control page that set caps text and logo as two
+> back-to-back `setCapsText` + `setCapsLogo` commands would have the second's
+> value land on the first, silently blanking the text.
+>
+> Putting `Ticker Command`, `Ticker Push` and `Ticker Announce` in one
+> **blocking** action queue removes this for every sender (0 of 25 tries), and
+> the README's setup asks for it. The batching stays as a second guard for an
+> install without that queue: each control button sends exactly **one** command
+> carrying a JSON value, and `panel-core` additionally serializes outbound
+> `DoAction`s (one in flight at a time). The single-field commands remain for
+> chat / Stream Deck.
 
 ## ticker:announce
 
