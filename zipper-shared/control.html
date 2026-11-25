@@ -231,6 +231,7 @@
   const setIfClean = (id, v) => { if (!dirty.has(id)) $(id).value = v; };
 
   // ticker:status rides the command relay as command "__status" (docs/PROTOCOL.md).
+  // Its lastError is a failed poll; its commandNotice an unknown or refused command.
   window.addEventListener('ticker:command', (e) => {
     const d = e.detail || {};
     if (d.command !== '__status') return;
@@ -263,6 +264,7 @@
       ` · Last poll: <span class="dim">${esc(s.lastPollAt ? new Date(s.lastPollAt).toLocaleTimeString() : 'never')}</span>` +
       ` · Milestones: <b>${s.se?.configured ? 'ON' : 'off'}</b>` +
       (s.lastError ? `<br><span class="err">${esc(s.lastError)}</span>` : '') +
+      (s.commandNotice ? `<br><span class="err">${esc(s.commandNotice)}</span>` : '') +
       (s.se?.lastError ? `<br><span class="err">SE: ${esc(s.se.lastError)}</span>` : '');
   });
 

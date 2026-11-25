@@ -15,9 +15,11 @@
 //             { type:'ticker:command', command, value } broadcasts emitted by
 //             the control page via the "Ticker Command" action.
 //
-// Commands: setUrl, start, stop, pollNow, setInterval, setCapsText,
-//           setCapsLogo, setMaxItems, setMessage, setMessageText,
-//           setMessageEnabled, setAutoSchedule, status.
+// Commands: setUrl, start, stop, pollNow, setInterval, setCaps, setCapsText,
+//           setCapsLogo, setOptions, setMaxItems, setTopN, setMessage,
+//           setMessageText, setMessageEnabled, setAutoSchedule, status.
+//           Names match without regard to case. An unknown or refused command is
+//           reported in the status's commandNotice (docs/PROTOCOL.md).
 //
 // Auto-scheduling (config.autoSchedule, default ON): API calls are only spent
 // while the event is actually running. A poll that comes back `completed`
@@ -30,18 +32,22 @@
 //
 // Test hook: a tournament URL of the form "stub:<path-to-json>" loads a
 // normalized platform result from that file instead of the network — used by
-// verify.mjs and handy for offline overlay styling. With ZIPPER_ALLOW_STUB=1 (the
-// verify suite sets it) such a file can also hold its poll open: see stubHold.
+// verify.mjs and handy for offline overlay styling. It works only when the
+// sidecar is started with ZIPPER_ALLOW_STUB=1 (the verify suite sets it), and only
+// for a file inside this folder: the path is checked as text before any file is
+// opened (see stubRefusal). Otherwise setUrl refuses it and a poll of one saved in
+// config.json fails, each with a fixed message that quotes no file. With the
+// variable, such a file can also hold its poll open: see stubHold.
 //
 // Run:  start-zipper.bat  ·  npm run sidecar
 // Env:  SB_WS_URL (default ws://127.0.0.1:8080/) · ZIPPER_GUARD_PORT (7496)
 //       ZIPPER_CONFIG (config file path override)
-//       ZIPPER_ALLOW_STUB=1 (tests only: turns on the stub hold below)
+//       ZIPPER_ALLOW_STUB=1 (tests only: turns on stub: URLs and the stub hold)
 
 import { readFile, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { createServer } from 'node:net';
-import { resolve, dirname, sep } from 'node:path';
+import { resolve, relative, isAbsolute, dirname, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import WebSocket from 'ws';
 import { detectPlatform } from './platforms/index.js';
@@ -53,8 +59,25 @@ const SB_WS_URL = process.env.SB_WS_URL || `ws://127.0.0.1:${process.env.SB_WS_P
 // Single-instance guard: a second launch (double-click + SB action) exits
 // cleanly instead of double-polling. Greenroom holds 7495; Zipper takes 7496.
 const GUARD_PORT = Number(process.env.ZIPPER_GUARD_PORT) || 7496;
-// Set by the verify suite. Without it the sidecar behaves exactly as before.
+// Set by the verify suite. Without it a stub: URL is refused and nothing is read.
 const STUB_ALLOWED = process.env.ZIPPER_ALLOW_STUB === '1';
+
+// Fixed messages: none quotes a file's content, a path or a value sent, because the
+// status that carries them reaches every page.
+const NO_URL_MESSAGE = 'No tournament URL set';
+const STUB_OFF_MESSAGE = 'stub: URLs are for the tests and work only with ZIPPER_ALLOW_STUB=1';
+const STUB_OUTSIDE_MESSAGE = 'stub: URLs may name only a file inside the Zipper folder';
+const STUB_UNREADABLE_MESSAGE = 'stub: the test file could not be read';
+const STUB_NOT_OBJECT_MESSAGE = 'stub: the test file is not a JSON object';
+const LOGO_REFUSED_MESSAGE = 'Logo not changed: use an http(s) URL or a path on the overlay\'s server, such as /zipper-overlay/assets/logo.png';
+// An unknown command is reported by its name only, cut to this many characters (the
+// longest real name, setMessageEnabled, has 17). The name can come from chat or any
+// local program, so nothing else limits its length.
+const COMMAND_NAME_MAX = 40;
+const LOGO_MAX = 500;
+// What a relative logo is resolved against to check it: the overlay's address on
+// Streamer.bot's HTTP server. Only its host matters (a relative logo must stay on it).
+const OVERLAY_BASE = 'http://127.0.0.1:7474/zipper-overlay/';
 
 const MIN_INTERVAL_MS = 15000;
 const MAX_BACKOFF_MS = 300000; // 5 min cap when the platform keeps erroring
@@ -95,7 +118,10 @@ let polling = false;
 let pollTimer = null;
 let pollInFlight = false;
 let consecutiveErrors = 0;
-let lastError = '';
+let lastError = ''; // poll failures only
+// An unknown or refused command (docs/PROTOCOL.md). The next accepted command clears
+// it; `status`, which the control page sends every 10 seconds, does not.
+let commandNotice = '';
 let lastPollAt = null;
 let lastHash = null;
 let lastPayload = null; // last payload built, so config-only changes (message,
@@ -134,6 +160,12 @@ async function loadConfig() {
 
 function adoptConfig(parsed) {
   if (!parsed || typeof parsed !== 'object') return;
+  // A saved logo that fails the rule is dropped here, and written out on the next save.
+  let logo = checkLogo(parsed.caps?.logo);
+  if (logo === null) {
+    logo = '';
+    log('config.json: the saved logo was dropped (it must be an http(s) URL or a path on the overlay\'s server)');
+  }
   config = {
     challongeApiKey: strOrNull(parsed.challongeApiKey) || strOrNull(process.env.CHALLONGE_API_KEY),
     startggApiKey: strOrNull(parsed.startggApiKey) || strOrNull(process.env.STARTGG_API_KEY),
@@ -143,7 +175,7 @@ function adoptConfig(parsed) {
     topN: clampInt(parsed.topN, 0, 100, 0),
     caps: {
       text: String(parsed.caps?.text ?? '').slice(0, 120),
-      logo: String(parsed.caps?.logo ?? '').slice(0, 500),
+      logo,
     },
     message: {
       enabled: !!parsed.message?.enabled,
@@ -183,6 +215,29 @@ function clampInt(v, min, max, fallback) {
   return Math.max(min, Math.min(max, n));
 }
 
+// The logo (ZIP-01), on every way in: setCapsLogo, setCaps and config.json. Returns the
+// trimmed value to keep ('' clears the cap), or null when it is refused. Accepted: an
+// explicit http: or https: URL (any host), or a value that, resolved against the
+// overlay's address, stays http: on the overlay's own host: a path on its server.
+// Everything else is refused: data:, file:, javascript:, blob:, and //host, \\host or
+// /\host, which are not paths on that server (under a file:// overlay they would name
+// a network share). The URL parser drops tabs and newlines, so their variants resolve
+// the same way and are refused too.
+function checkLogo(v) {
+  const s = String(v ?? '').trim().slice(0, LOGO_MAX);
+  if (!s) return '';
+  try {
+    if (/^https?:/i.test(s)) {
+      const u = new URL(s);
+      return u.protocol === 'http:' || u.protocol === 'https:' ? s : null;
+    }
+    const u = new URL(s, OVERLAY_BASE);
+    return u.protocol === 'http:' && u.host === new URL(OVERLAY_BASE).host ? s : null;
+  } catch {
+    return null;
+  }
+}
+
 // Parse a JSON-string command value (batched setCaps / setOptions); null on junk.
 function parseJson(v) {
   try { return JSON.parse(String(v ?? '')); } catch { return null; }
@@ -199,7 +254,7 @@ function truthy(v) {
 // ── Poll loop ─────────────────────────────────────────────────────────────────
 
 function startPolling() {
-  if (!config.tournamentUrl) { lastError = 'No tournament URL set'; pushStatus(); return; }
+  if (!config.tournamentUrl) { refuse(NO_URL_MESSAGE); return; }
   polling = true;
   autoStopped = null; // manual (re)start always gets one fresh poll
   persist();
@@ -293,11 +348,20 @@ async function pollOnce() {
 
 async function fetchCurrent() {
   const url = config.tournamentUrl;
-  // Test hook / offline styling: stub:<path> loads a normalized result file.
+  if (!url) throw new Error(NO_URL_MESSAGE); // ZIP-12: a plain message, never a TypeError
+  // Test hook / offline styling: stub:<path> loads a normalized result file. The gate
+  // runs first, so a URL from config.json that fails it reads nothing.
   if (url.startsWith('stub:')) {
+    const refusal = stubRefusal(url);
+    if (refusal) throw new Error(refusal);
     platformName = 'stub';
-    const raw = await readFile(resolve(__dirname, url.slice(5)), 'utf-8');
-    const result = JSON.parse(raw);
+    let raw;
+    try { raw = await readFile(resolve(__dirname, url.slice(5)), 'utf-8'); }
+    catch { throw new Error(STUB_UNREADABLE_MESSAGE); }
+    // The parse error's own text quotes the file, so it is never passed on.
+    let result = null;
+    try { result = JSON.parse(raw); } catch {}
+    if (!result || typeof result !== 'object' || Array.isArray(result)) throw new Error(STUB_NOT_OBJECT_MESSAGE);
     await stubHold(result); // no abort signal yet; the poll's deadline is passed here later
     return result;
   }
@@ -307,6 +371,29 @@ async function fetchCurrent() {
   const id = platform.parseId(url);
   if (!id) throw new Error(`${platform.displayName}: could not parse a tournament id from that URL`);
   return platform.fetchTicker(id, config, url);
+}
+
+// The stub: gate (decision 2). Returns null when the URL may be read, or the fixed
+// message that refuses it. Without ZIPPER_ALLOW_STUB=1 nothing is allowed. With it,
+// only a path inside this folder, and that is checked as TEXT: path.resolve and
+// path.relative touch no file, so nothing is opened, stat'ed or looked up first. (An
+// open, stat or realpath of \\host\share would itself be the outbound file-sharing
+// connection.)
+// The resolved path must begin with this folder's path exactly, letter case included,
+// followed by a separator. path.relative alone is not enough on Windows: it drops the
+// leading \\ of a network path and folds case with JavaScript's toLowerCase, so it
+// calls \\C:\<this folder>\x.json (a share on a server named "C:"), its // form, or a
+// sibling folder spelled with a Kelvin sign (U+212A, which NTFS keeps apart from "k")
+// a path inside this folder. The separator keeps out a sibling folder whose name
+// starts with this one's. An absolute path inside this folder typed in another letter
+// case is refused too; for a test hook that costs nothing.
+function stubRefusal(url) {
+  if (!STUB_ALLOWED) return STUB_OFF_MESSAGE;
+  const full = resolve(__dirname, url.slice(5));
+  if (!full.startsWith(__dirname + sep)) return STUB_OUTSIDE_MESSAGE;
+  const rel = relative(__dirname, full);
+  if (!rel || rel === '..' || rel.startsWith('..' + sep) || isAbsolute(rel)) return STUB_OUTSIDE_MESSAGE;
+  return null;
 }
 
 // ── stub hold: BEGIN (verify.mjs runs this block on its own, in-process) ──
@@ -612,6 +699,7 @@ function pushStatus() {
     platform: platformName,
     lastPollAt,
     lastError,
+    commandNotice,
     intervalMs: config.pollIntervalMs,
     maxItems: config.maxItems,
     topN: config.topN,
@@ -642,12 +730,51 @@ function applyMessageChange() {
   pushStatus();
 }
 
+// The commands dispatch() runs, keyed by their names in lower case. A name matches
+// without regard to case (ZIP-08): chat lower-cases a dedicated command, so "!pollnow"
+// arrives as "pollnow". The cases below keep the camelCase names docs/PROTOCOL.md uses.
+const COMMANDS = new Map([
+  'setUrl', 'start', 'stop', 'pollNow', 'setInterval', 'setCapsText', 'setCapsLogo',
+  'setTopN', 'setMaxItems', 'setCaps', 'setMessage', 'setMessageText',
+  'setMessageEnabled', 'setAutoSchedule', 'setOptions', 'status',
+].map((name) => [name.toLowerCase(), name]));
+
+// A command name as the log and commandNotice show it: cut to COMMAND_NAME_MAX
+// characters (whole characters, so an emoji is never split), never its value.
+function shownName(name) {
+  const chars = Array.from(name);
+  return chars.length > COMMAND_NAME_MAX ? chars.slice(0, COMMAND_NAME_MAX).join('') + '…' : name;
+}
+
+// Records why a command was not (fully) carried out. The caller pushes the status.
+function notice(text) {
+  commandNotice = text;
+  log(text);
+}
+// A command refused outright: nothing changes but the notice, which the status carries.
+function refuse(text) {
+  notice(text);
+  pushStatus();
+}
+
 function dispatch(command, value) {
-  if (command === '__status') return; // our own status relay echoing back
-  log(`command: ${command}${value ? ' ' + value.slice(0, 120) : ''}`);
-  switch (command) {
-    case 'setUrl':
-      config.tournamentUrl = strOrNull(value);
+  // Folded first, so our own status relay echoing back is ignored in any casing. Were
+  // "__STATUS" reported as unknown, that report would push a status, which echoes.
+  const folded = command.toLowerCase();
+  if (folded === '__status') return;
+  const shown = shownName(command);
+  log(`command: ${shown}${value ? ' ' + value.slice(0, 120) : ''}`);
+  const name = COMMANDS.get(folded);
+  if (!name) { refuse(`unknown command "${shown}" — ignored`); return; }
+  if (name !== 'status') commandNotice = ''; // an accepted command clears the last notice
+  switch (name) {
+    case 'setUrl': {
+      const url = strOrNull(value);
+      // A refused URL is no URL change: the old one, its platform and its state stay,
+      // nothing is saved, and no poll follows.
+      const refusal = url && url.startsWith('stub:') ? stubRefusal(url) : null;
+      if (refusal) { refuse(refusal); return; }
+      config.tournamentUrl = url;
       lastHash = null;
       platformName = config.tournamentUrl ? (detectPlatform(config.tournamentUrl)?.name
         ?? (config.tournamentUrl.startsWith('stub:') ? 'stub' : null)) : null;
@@ -655,14 +782,21 @@ function dispatch(command, value) {
       eventState = null; // new tournament — forget the old one's state/schedule
       eventStartAt = null;
       autoStopped = null;
+      if (!config.tournamentUrl) {
+        // ZIP-12: with no URL there is nothing to poll, so clearing it stops polling.
+        polling = false;
+        waitingUntil = null;
+        if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+      }
       persist();
-      if (polling && config.tournamentUrl) schedulePoll(0);
+      if (polling) schedulePoll(0);
       pushStatus();
       return;
+    }
     case 'start': startPolling(); return;
     case 'stop': stopPolling(); return;
     case 'pollNow':
-      if (!config.tournamentUrl) { lastError = 'No tournament URL set'; pushStatus(); return; }
+      if (!config.tournamentUrl) { refuse(NO_URL_MESSAGE); return; }
       if (!polling) { polling = true; autoStopped = null; persist(); }
       schedulePoll(0);
       return;
@@ -680,12 +814,15 @@ function dispatch(command, value) {
       // on screen, so push rather than wait for a poll that may never come.
       if (polling) schedulePoll(0); else { pushCurrent(); pushStatus(); }
       return;
-    case 'setCapsLogo':
-      config.caps.logo = String(value ?? '').slice(0, 500);
+    case 'setCapsLogo': {
+      const logo = checkLogo(value);
+      if (logo === null) { refuse(LOGO_REFUSED_MESSAGE); return; } // the logo is kept
+      config.caps.logo = logo;
       lastHash = null;
       persist();
       if (polling) schedulePoll(0); else { pushCurrent(); pushStatus(); }
       return;
+    }
     case 'setTopN':
       config.topN = clampInt(value, 0, 100, config.topN);
       lastHash = null;
@@ -707,7 +844,11 @@ function dispatch(command, value) {
       const o = parseJson(value);
       if (o && typeof o === 'object') {
         if (typeof o.text === 'string') config.caps.text = o.text.slice(0, 120);
-        if (typeof o.logo === 'string') config.caps.logo = o.logo.slice(0, 500);
+        if (typeof o.logo === 'string') {
+          // A refused logo keeps the previous one; a valid text still applies.
+          const logo = checkLogo(o.logo);
+          if (logo === null) notice(LOGO_REFUSED_MESSAGE); else config.caps.logo = logo;
+        }
       }
       lastHash = null; // caps travel in the update payload — force a re-push
       persist();
@@ -754,8 +895,6 @@ function dispatch(command, value) {
       return;
     }
     case 'status': pushStatus(); return;
-    default:
-      log(`unknown command "${command}" — ignored`);
   }
 }
 

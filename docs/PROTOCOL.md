@@ -87,11 +87,20 @@ reserved command `__status` with the status JSON as `value`:
 
 ```json
 { "type": "ticker:command", "command": "__status",
-  "value": "{\"type\":\"ticker:status\",\"polling\":true,\"url\":\"…\",\"platform\":\"challonge\",\"lastPollAt\":\"…\",\"lastError\":\"\",\"intervalMs\":30000,\"maxItems\":20,\"caps\":{…}}" }
+  "value": "{\"type\":\"ticker:status\",\"polling\":true,\"url\":\"…\",\"platform\":\"challonge\",\"lastPollAt\":\"…\",\"lastError\":\"\",\"commandNotice\":\"\",\"intervalMs\":30000,\"maxItems\":20,\"caps\":{…}}" }
 ```
 
-The sidecar ignores its own `__status` echo; the control page unwraps `value`.
-Sent after every poll and after every command.
+The sidecar ignores its own `__status` echo, in any casing; the control page
+unwraps `value`. Sent after every poll and after every command.
+
+- `lastError` — why the last poll failed; `""` after a good poll and after an
+  accepted `setUrl`.
+- `commandNotice` — why the last command was not carried out, or not in full:
+  an unknown command (by its name only, cut to 40 characters, never its value),
+  a refused `setUrl`, a refused logo, or `start` / `pollNow` with no tournament
+  URL ("No tournament URL set"). `""` otherwise. The next accepted command clears
+  it; `status`, which the control page sends every 10 seconds, does not. The
+  control page shows it in its status line.
 
 The status carries an `auto` block describing the auto-scheduler (see
 `setAutoSchedule` below):
@@ -119,22 +128,25 @@ Command** action with `command`/`value` arguments; the C# side re-broadcasts
 { "type": "ticker:command", "command": "setUrl", "value": "https://challonge.com/blko42" }
 ```
 
-which the sidecar consumes. Commands:
+which the sidecar consumes. Command names match without regard to case
+(`pollnow` is `pollNow`, as a dedicated chat command relays it); values are
+passed as they are. An unknown name is ignored and reported in the status's
+`commandNotice`. Commands:
 
 | command       | value                          | effect |
 |---------------|--------------------------------|--------|
-| `setUrl`      | tournament URL                 | switch tournaments (forces a re-push on next poll) |
+| `setUrl`      | tournament URL (empty = none)  | switch tournaments (forces a re-push on next poll). An empty value clears the URL and **stops polling**. A refused `stub:` URL (see [Test hook](#test-hook)) keeps the old URL, saves nothing and says why in `commandNotice` |
 | `start`       | —                              | start polling |
 | `stop`        | —                              | stop polling |
 | `pollNow`     | —                              | immediate poll (starts polling if stopped) |
 | `setInterval` | milliseconds (min 15000)       | poll cadence |
-| `setCaps`     | JSON `{text,logo}`             | **batched** — sets both end caps in one command (the control page uses this) |
+| `setCaps`     | JSON `{text,logo}`             | **batched** — sets both end caps in one command (the control page uses this). A logo `setCapsLogo` would refuse is refused here too: the old logo stays, the text still applies, and `commandNotice` says why |
 | `setOptions`  | JSON `{intervalMs,maxItems,topN}` | **batched** — sets all three options in one command |
 | `setMessage`  | JSON `{text,enabled}`          | **batched** — persistent message text + on/off in one command (the control page uses this) |
 | `setMessageText` | string (≤1000 chars, `\n`-separated lines) | message text (single-field; for chat / Stream Deck) |
 | `setMessageEnabled` | `on`/`off` (also `true`/`false`, `1`/`0`, `yes`) | show the message instead of results |
 | `setCapsText` | string (≤120 chars)            | right-cap static text (single-field; for chat / Stream Deck) |
-| `setCapsLogo` | URL/path (≤500 chars)          | left-cap logo image (single-field) |
+| `setCapsLogo` | an http(s) URL, or a path on the overlay's server (≤500 chars; empty = no logo) | left-cap logo image (single-field). Anything else — `data:`, `file:`, `javascript:`, `//host`, `\\host` — is refused: the old logo stays and `commandNotice` says why. A saved logo that breaks this rule is dropped when `config.json` loads |
 | `setInterval` above, `setMaxItems`, `setTopN` | see below | single-field variants |
 | `setMaxItems` | 1–100                          | ticker item cap |
 | `setTopN`     | 0–100 (0 = off)                | only show matches involving the top-N placed participants (needs platform standings — start.gg always; Challonge via `final_rank` on the keyed API for your own tournaments, or derived from elimination order on finished brackets when scraping; also trims the standings crawl to N) |
@@ -208,3 +220,17 @@ A tournament URL of the form `stub:<path-relative-to-repo>` makes the sidecar
 load a normalized platform result (`{tournamentName, state, matches, standings}`)
 from that JSON file instead of the network — used by `verify.mjs`
 (`stub:platforms/fixtures/stub-result.json`) and handy for offline styling.
+
+It works only when the sidecar is started with `ZIPPER_ALLOW_STUB=1` (the verify
+suite sets it; a normal install never does), and only for a file inside the repo
+folder. The path is checked as text before any file is opened, so a path outside
+the folder — an absolute path elsewhere, `..`, a network share — is never opened
+or looked up. An absolute path counts as inside only when it begins with the
+folder's own path exactly, letter case included. Otherwise `setUrl` refuses the URL, keeps the old one and says why
+in `commandNotice`, and a poll of a `stub:` URL saved in `config.json` fails with
+the same message in `lastError`. A file that cannot be read, or that is not a
+JSON object, fails the poll with a fixed message that quotes none of its content.
+
+With `ZIPPER_ALLOW_STUB=1` a stub file may also name a hold file
+(`"stubHoldFile": "<path-relative-to-repo>"`): the poll then waits while that file
+exists, so a test can hold a poll open and release it by deleting the file.
