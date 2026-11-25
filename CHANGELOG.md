@@ -8,6 +8,34 @@ Nothing was tagged between the initial release and 1.0.11, so that release
 collects every change in between. Commit hashes and landing dates are noted for
 traceability.
 
+## [Unreleased]
+
+## [1.0.14] — 2026-11-25
+
+Docs only: nothing to copy, restart or re-paste. One setting to make in
+Streamer.bot, described below.
+
+### Changed
+
+- **Setup now asks for a blocking action queue.** Put `Ticker Command`,
+  `Ticker Push` and `Ticker Announce` in one queue with **Blocking** ticked.
+  Streamer.bot can mix up the arguments of two runs of the same action when
+  they overlap, and a blocking queue runs them one at a time. Measured on
+  Streamer.bot 1.0.7 with a test action: back-to-back requests mixed their
+  arguments in 25 of 25 tries in the default queue, 0 of 25 in a blocking
+  queue. This covers every sender: the control page, chat, a Stream Deck,
+  Twitch triggers and the sidecar. `docs/PROTOCOL.md` is corrected to match:
+  the fault is overlapping runs of one action, and it is present on 1.0.7 as
+  well as 1.0.4.
+- **Setup now says to restrict the `!ticker` chat command** to moderators and
+  the broadcaster, and what an open command allows: changing the tournament
+  URL, replacing the results with any message, changing the end-cap text or
+  image, and stopping polling. `Ticker Command` does not check who typed a
+  command.
+- The README says Zipper is tested on Streamer.bot 1.0.4 and 1.0.7, counts the
+  optional fourth action, and no longer quotes a number of checks.
+- The README's X handle was updated in `c8cede2`, after 1.0.11.
+
 ## [1.0.11] — 2026-07-29
 
 ### Added
@@ -124,4 +152,6 @@ Initial release — scrolling tournament-results ticker for Streamer.bot.
 Live-validated keyless against real start.gg and Challonge brackets across
 pre-start, mid-event and completed states.
 
-[1.0.11]: https://github.com/FlashGalatine/zipper-ticker/compare/d77a27f...main
+[Unreleased]: https://github.com/FlashGalatine/zipper-ticker/compare/v1.0.14...main
+[1.0.14]: https://github.com/FlashGalatine/zipper-ticker/compare/dbdb789...v1.0.14
+[1.0.11]: https://github.com/FlashGalatine/zipper-ticker/compare/d77a27f...dbdb789
