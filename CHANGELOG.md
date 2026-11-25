@@ -10,6 +10,52 @@ traceability.
 
 ## [Unreleased]
 
+## [1.0.18] — 2026-11-25
+
+Copy `zipper-sidecar.mjs` and the `zipper-shared` folder. Stop the sidecar and
+start it again, and reload the dock or control page at the same time: an older
+control page shows no reason for a refused command. Nothing to re-paste, and the
+OBS overlay needs nothing.
+
+### Security
+
+- **A `stub:` tournament URL could make the sidecar read any file on the
+  machine**, or connect to a file share on another computer, and a file that was
+  not JSON was quoted in the error shown on the control page. Anyone who could
+  send `setUrl` could do it, including chat when the `!ticker` command was left
+  open. `stub:` URLs are a test hook; they now work only when the sidecar is
+  started with `ZIPPER_ALLOW_STUB=1`, and only for a file inside the Zipper
+  folder. Refusals and read failures give fixed messages that quote no path and
+  no file content. **If you used a `stub:` URL for offline styling, it no longer
+  works in a normal install**: start the sidecar with that variable set, with
+  the file inside the Zipper folder.
+- **The end-cap logo accepts only a web address or a path on the overlay's own
+  server**, such as `https://…/logo.png` or `assets/logo.png`. Anything else
+  (`data:`, `file:`, `javascript:`, another computer's share) is refused and the
+  old logo stays. A logo saved in `config.json` that fails the rule is removed
+  when the sidecar starts. If yours was removed, set it again from the control
+  page; until the next update reaches the overlay, Streamer.bot may still replay
+  the old one, so click **Apply** on the caps or **Poll now** once after
+  restarting.
+
+### Fixed
+
+- **Command names work whatever their capitalisation.** A dedicated chat command
+  such as `!pollnow`, and `!ticker seturl …` typed in lower case, were silently
+  ignored before.
+- **An unknown command is reported.** The control page's status shows
+  `unknown command "…" — ignored` until the next accepted command. Only the
+  name is shown, cut to 40 characters, never what followed it.
+- **Clearing the tournament URL stops polling.** Before, polling stayed on and
+  failed on every round with an unhelpful error. Start and Poll now with no URL
+  set say "No tournament URL set".
+
+### Changed
+
+- The sidecar's status has a new field, `commandNotice`, for a refused command.
+  Poll failures stay in `lastError`. `docs/PROTOCOL.md` describes both, and the
+  test hook.
+
 ## [1.0.16] — 2026-11-25
 
 **Node.js 20 or later is now required** (it was 18). Check with `node --version`
@@ -196,7 +242,8 @@ Initial release — scrolling tournament-results ticker for Streamer.bot.
 Live-validated keyless against real start.gg and Challonge brackets across
 pre-start, mid-event and completed states.
 
-[Unreleased]: https://github.com/FlashGalatine/zipper-ticker/compare/v1.0.16...main
+[Unreleased]: https://github.com/FlashGalatine/zipper-ticker/compare/v1.0.18...main
+[1.0.18]: https://github.com/FlashGalatine/zipper-ticker/compare/v1.0.16...v1.0.18
 [1.0.16]: https://github.com/FlashGalatine/zipper-ticker/compare/v1.0.14...v1.0.16
 [1.0.14]: https://github.com/FlashGalatine/zipper-ticker/compare/dbdb789...v1.0.14
 [1.0.11]: https://github.com/FlashGalatine/zipper-ticker/compare/d77a27f...dbdb789
