@@ -14,11 +14,26 @@ import { readFile } from 'node:fs/promises';
 import { connect } from 'node:net';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import WebSocket from 'ws';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const HTTP_PORT = 7476;
 const WS_PORT = 8082;
 const HTTP = `http://127.0.0.1:${HTTP_PORT}`;
+
+// Sends a ticker:status through the mock's Ticker Command, the way the sidecar does
+// (the reserved command __status), and resolves once the mock has answered.
+async function sendStatus(status) {
+  const ws = new WebSocket(`ws://127.0.0.1:${WS_PORT}/`);
+  try {
+    await new Promise((res, rej) => { ws.once('open', res); ws.once('error', rej); });
+    const answered = new Promise((res) => ws.on('message', (raw) => { try { if (JSON.parse(String(raw)).id === 'status') res(true); } catch {} }));
+    ws.send(JSON.stringify({ request: 'DoAction', id: 'status', action: { name: 'Ticker Command' }, args: { command: '__status', value: JSON.stringify(status) } }));
+    await Promise.race([answered, sleep(3000)]);
+  } finally {
+    try { ws.close(); } catch {}
+  }
+}
 
 let pass = 0, fail = 0;
 function check(name, ok, detail) {
@@ -222,6 +237,23 @@ try {
   const warnShown = await page.locator('#sidecar-note').isVisible();
   check('control: warns when sidecar is absent', warnShown, String(warnShown));
   await page.screenshot({ path: resolve(__dirname, 'control-render.png') });
+
+  // The status line shows the sidecar's commandNotice (an unknown or refused command),
+  // as text: the name in it comes from whoever sent the command.
+  {
+    const notice = 'unknown command "<i>x</i>" — ignored';
+    await sendStatus({
+      type: 'ticker:status', polling: false, url: null, platform: null, lastPollAt: null, lastError: '',
+      commandNotice: notice, intervalMs: 30000, maxItems: 20, topN: 0,
+      caps: { text: '', logo: '' }, message: { enabled: false, text: '' },
+      auto: { enabled: true, eventState: null, startAt: null, waitingUntil: null, stopped: null },
+      se: { configured: false, lastPollAt: null, lastError: '' },
+    });
+    await page.waitForFunction((t) => document.getElementById('status').textContent.includes(t), notice, { timeout: 5000 }).catch(() => {});
+    const text = await page.locator('#status').textContent();
+    const tags = await page.locator('#status i').count();
+    check('control: the status line shows the sidecar\'s commandNotice, as text', text.includes(notice) && tags === 0, text);
+  }
   await closePage(p);
 } catch (err) {
   fail++;

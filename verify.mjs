@@ -12,12 +12,15 @@
 //   6. Sidecar E2E: the REAL zipper-sidecar.mjs runs against the mock with the
 //      stub: platform — command round-trips, payload shape, diff suppression,
 //      caps re-push, auto-scheduling (stop on completed / wait for start), a stub
-//      poll held open and released, every command in docs/PROTOCOL.md, and every
-//      range on the command path and the config path.
+//      poll held open and released, every command in docs/PROTOCOL.md (as named
+//      there, and lower-cased), every range on the command path and the config path,
+//      and which commands it accepts: stub: URLs only with ZIPPER_ALLOW_STUB=1 and
+//      only inside the repo, the logo rule, the __status guard in any casing, and
+//      refusals reported in commandNotice.
 //   7. Milestone announcements: a real sidecar against a mock StreamElements.
 //   8. start-zipper.bat's Node version check (Windows only), with a stand-in node.
 //
-// Uses off-default ports (HTTP 7476 / WS 8082 / sidecar guards 7497 and 7492 /
+// Uses off-default ports (HTTP 7476 / WS 8082 / sidecar guards 7497, 7492 and 7487 /
 // StreamElements mock 7477) so it can run next to a live Streamer.bot or sidecar,
 // and stops with one line, testing nothing, when anything already answers on them.
 // The stub fixtures and the test sidecars' config files are written to .verify-tmp/
@@ -28,7 +31,7 @@
 import { spawn, spawnSync } from 'node:child_process';
 import { readFile, writeFile, rm, mkdir } from 'node:fs/promises';
 import { existsSync, rmSync, mkdirSync, writeFileSync, readFileSync } from 'node:fs';
-import { resolve, dirname, join, sep } from 'node:path';
+import { resolve, dirname, join, sep, basename, win32 } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { connect } from 'node:net';
 import WebSocket from 'ws';
@@ -46,6 +49,10 @@ const WS_PORT = 8082;
 const GUARD_PORT = 7497;
 // NOT 7498/7499 — those are the live Octet sidecar + Octet's verify.
 const SE_GUARD_PORT = 7492;
+// The guard port of the sidecar started WITHOUT ZIPPER_ALLOW_STUB (section 6g). Outside
+// 7490-7499, which the plugin family's sidecars and suites hold, and named by no other
+// plugin.
+const NOSTUB_GUARD_PORT = 7487;
 const SE_PORT = 7477;
 const HTTP = `http://127.0.0.1:${HTTP_PORT}`;
 const WS_URL = `ws://127.0.0.1:${WS_PORT}/`;
@@ -88,7 +95,7 @@ function portAnswers(port) {
 }
 {
   const busy = [];
-  for (const port of [HTTP_PORT, WS_PORT, GUARD_PORT, SE_GUARD_PORT, SE_PORT]) if (await portAnswers(port)) busy.push(port);
+  for (const port of [HTTP_PORT, WS_PORT, GUARD_PORT, SE_GUARD_PORT, NOSTUB_GUARD_PORT, SE_PORT]) if (await portAnswers(port)) busy.push(port);
   if (busy.length) {
     console.error(`verify: something already answers on 127.0.0.1 port ${busy.join(', ')} (most likely a mock or a test sidecar left by an earlier run); stop it and run again. Nothing was tested.`);
     process.exit(1);
@@ -623,12 +630,18 @@ async function testCaseTable() {
 // ── Sidecar helpers ───────────────────────────────────────────────────────────
 
 const sidecars = [];
-// Starts a test sidecar with ZIPPER_ALLOW_STUB=1. If it exits before the suite stops
-// it, the run fails at once with a line, and its stdout and stderr are printed.
-function startSidecar(label, env) {
+// Starts a test sidecar with ZIPPER_ALLOW_STUB=1, or with no ZIPPER_ALLOW_STUB at all
+// when allowStub is false (removed in any casing, since Windows matches environment
+// names without regard to case, so a value in the developer's shell cannot turn it on).
+// If it exits before the suite stops it, the run fails at once with a line, and its
+// stdout and stderr are printed.
+function startSidecar(label, env, { allowStub = true } = {}) {
   const sc = { label, out: '', err: '', stopping: false, exited: false, code: null };
+  const base = { ...process.env };
+  for (const k of Object.keys(base)) if (k.toUpperCase() === 'ZIPPER_ALLOW_STUB') delete base[k];
+  if (allowStub) base.ZIPPER_ALLOW_STUB = '1';
   sc.proc = track(spawn(process.execPath, [resolve(__dirname, 'zipper-sidecar.mjs')], {
-    env: { ...process.env, SB_WS_URL: WS_URL, ZIPPER_ALLOW_STUB: '1', ...env },
+    env: { ...base, SB_WS_URL: WS_URL, ...env },
     stdio: ['ignore', 'pipe', 'pipe'],
   }));
   sc.proc.stdout.on('data', (d) => { sc.out += d; });
@@ -934,11 +947,14 @@ async function testSidecar() {
   await testStubHold(client, sc, since, mark, cmd);
   await testEveryCommand(client, sc, since, mark, cmd);
   await testCommandRanges(since, mark, cmd);
+  await testEveryCommand(client, sc, since, mark, cmd, { lower: true });
+  await testAccepts(client, sc, since, mark, cmd, cfgPath);
 
   // This sidecar is stopped here, so only the milestone sidecar of section 7 can
   // answer there.
   await sc.stop();
   await testConfigRanges(client);
+  await testStubAtTheRead(client);
 
   client.ws.close();
   await rm(cfgPath, { force: true });
@@ -1049,19 +1065,25 @@ async function testStubHold(client, sc, since, mark, cmd) {
 }
 
 // ── 6b. Every command, on the control page's path ────────────────────────────
+// ── 6e. The same pass with every name lower-cased (ZIP-08) ──────────────────
 
-async function testEveryCommand(client, sc, since, mark, cmd) {
-  console.log('\n[6b] every command in docs/PROTOCOL.md, sent as the control page sends it');
+async function testEveryCommand(client, sc, since, mark, cmd, { lower = false } = {}) {
+  const tag = lower ? 'every command, lower-cased' : 'every command';
+  console.log(lower
+    ? '\n[6e] every command again, each name lower-cased (as chat relays a dedicated command), on the control page\'s path'
+    : '\n[6b] every command in docs/PROTOCOL.md, sent as the control page sends it');
   const protocol = (await readFile(resolve(__dirname, 'docs', 'PROTOCOL.md'), 'utf-8')).replace(/\r\n/g, '\n');
   const section = protocol.slice(protocol.indexOf('## ticker:command'), protocol.indexOf('\n## ', protocol.indexOf('## ticker:command') + 5));
   const tableNames = [...section.matchAll(/^\| `([A-Za-z_]+)`\s*\|/gm)].map((m) => m[1]);
-  const src = await readFile(resolve(__dirname, 'zipper-sidecar.mjs'), 'utf-8');
-  const body = src.slice(src.indexOf('function dispatch('), src.indexOf('// ── Entry point'));
-  const caseNames = [...body.matchAll(/case '([A-Za-z_]+)':/g)].map((m) => m[1]);
-  const sameSet = tableNames.length === new Set(tableNames).size && tableNames.length === caseNames.length
-    && tableNames.every((n) => caseNames.includes(n));
-  check(`every command: docs/PROTOCOL.md's table and dispatch's case labels name the same ${tableNames.length} commands`,
-    sameSet && tableNames.length === 16, `table: ${tableNames.join(', ')} | dispatch: ${caseNames.join(', ')}`);
+  if (!lower) {
+    const src = await readFile(resolve(__dirname, 'zipper-sidecar.mjs'), 'utf-8');
+    const body = src.slice(src.indexOf('function dispatch('), src.indexOf('// ── Entry point'));
+    const caseNames = [...body.matchAll(/case '([A-Za-z_]+)':/g)].map((m) => m[1]);
+    const sameSet = tableNames.length === new Set(tableNames).size && tableNames.length === caseNames.length
+      && tableNames.every((n) => caseNames.includes(n));
+    check(`every command: docs/PROTOCOL.md's table and dispatch's case labels name the same ${tableNames.length} commands`,
+      sameSet && tableNames.length === 16, `table: ${tableNames.join(', ')} | dispatch: ${caseNames.join(', ')}`);
+  }
 
   let lastPollAt = null;
   const statusOf = (d) => (isStatus(d) ? parseStatus(d) : null);
@@ -1089,19 +1111,24 @@ async function testEveryCommand(client, sc, since, mark, cmd) {
   const sent = new Set();
   for (const [name, value, pred] of plan) {
     sent.add(name);
+    const as = lower ? name.toLowerCase() : name;
     const at = mark(), outAt = sc.out.length;
-    cmd(name, value);
-    const hit = await since(at, pred);
-    const logged = await waitFor(() => sc.out.slice(outAt).includes(`command: ${name}`), 2000);
-    const unknown = sc.out.slice(outAt).includes(`unknown command "${name}"`);
+    cmd(as, value);
+    // A status counts only when it carries no commandNotice. An unknown or refused
+    // command always leaves one, and its status can repeat a value already in place (in
+    // the lower-cased pass the URL and autoSchedule on are), so without this a refused
+    // name could pass as taken.
+    const hit = await since(at, (d) => pred(d) && (!isStatus(d) || parseStatus(d).commandNotice === ''));
+    const logged = await waitFor(() => sc.out.slice(outAt).includes(`command: ${as}`), 2000);
+    const unknown = sc.out.slice(outAt).includes(`unknown command "${as}"`);
     if (statusOf(hit)?.lastPollAt) lastPollAt = statusOf(hit).lastPollAt;
     else { const last = client.events.filter(isStatus).pop(); if (last) lastPollAt = parseStatus(last).lastPollAt; }
-    check(`every command: ${name} is followed by its status or update, and the sidecar does not call it unknown`,
+    check(`${tag}: ${as} is followed by its status or update, and the sidecar does not call it unknown`,
       !!hit && !!logged && !unknown,
       [!hit && 'no status or update showing it took effect', unknown && 'the sidecar logged it as an unknown command', !logged && 'the sidecar did not log it']
         .filter(Boolean).join('; '));
   }
-  check('every command: each name in the table was sent', tableNames.every((n) => sent.has(n)), tableNames.filter((n) => !sent.has(n)).join(', '));
+  check(`${tag}: each name in the table was sent`, tableNames.every((n) => sent.has(n)), tableNames.filter((n) => !sent.has(n)).join(', '));
   // Polling off for the ranges below.
   const atOff = mark();
   cmd('stop');
@@ -1192,6 +1219,509 @@ async function testConfigRanges(client) {
   }
   for (const [k, [, lo, hi]] of Object.entries(fields)) {
     check(`range: config.json ${k} is clamped to ${lo}–${hi} at and past both ends`, wrong[k].length === 0, wrong[k].join('; '));
+  }
+}
+
+// ── 6f. Which commands the sidecar accepts (ZIP-01, ZIP-08, ZIP-12) ─────────
+
+// The sidecar's fixed messages. None quotes a file's content, a path or a value sent.
+const MSG = {
+  stubOff: 'stub: URLs are for the tests and work only with ZIPPER_ALLOW_STUB=1',
+  stubOutside: 'stub: URLs may name only a file inside the Zipper folder',
+  stubUnreadable: 'stub: the test file could not be read',
+  stubNotObject: 'stub: the test file is not a JSON object',
+  logo: 'Logo not changed: use an http(s) URL or a path on the overlay\'s server, such as /zipper-overlay/assets/logo.png',
+  noUrl: 'No tournament URL set',
+};
+// An in-progress fixture inside the repo, which every sidecar here may read.
+const SAFE_STUB = 'stub:platforms/fixtures/stub-result.json';
+
+async function testAccepts(client, sc, since, mark, cmd, cfgPath) {
+  console.log('\n[6f] which commands the sidecar accepts: names in any case, __status, stub: URLs, the logo, an empty URL; refusals in commandNotice');
+  const statusOf = (d) => (isStatus(d) ? parseStatus(d) : null);
+  // A chat Command trigger, as the mock's copy of Ticker Command takes it.
+  const chat = (command, rawInput) => client.ws.send(JSON.stringify({
+    request: 'DoAction', id: 'chat', action: { name: 'Ticker Command' },
+    args: { command, commandId: 'verify-chat', rawInput },
+  }));
+  const firstAfter = (at, pred) => { const i = client.events.findIndex((d, j) => j >= at && pred(d)); return i < 0 ? null : i; };
+  // Polling off and the URL a fixture inside the repo, sent with the exact names every
+  // sidecar knows. Nothing below polls a URL the sidecar should refuse, so even a
+  // sidecar that accepted one would open no file outside the repo.
+  const ready = async () => {
+    let at = mark();
+    cmd('stop');
+    await since(at, (d) => statusOf(d)?.polling === false);
+    at = mark();
+    cmd('setUrl', SAFE_STUB);
+    return statusOf(await since(at, (d) => statusOf(d)?.url === SAFE_STUB));
+  };
+
+  // __status in any casing: our own status relay echoing back, ignored the same way.
+  {
+    const base = await ready();
+    const outAt = sc.out.length;
+    const at = mark();
+    const forged = JSON.stringify({ type: 'ticker:status', url: 'stub:C:\\Windows\\win.ini', topN: 77, polling: true });
+    cmd('__status', forged);
+    cmd('__STATUS', forged);
+    cmd('__Status', forged);
+    // A marker: the first status any of the three could be followed by is this one's.
+    const topN = (base?.topN ?? 0) === 3 ? 4 : 3;
+    cmd('setTopN', String(topN));
+    await since(at, (d) => statusOf(d)?.topN === topN);
+    const markerAt = firstAfter(at, (d) => statusOf(d)?.topN === topN);
+    // The mock relays this test's own __status send as well; only a status the sidecar
+    // sent counts as drawn.
+    const drawn = markerAt === null ? null : client.events.slice(at, markerAt).filter((d) => isStatus(d) && d.value !== forged).length;
+    const m = markerAt === null ? null : statusOf(client.events[markerAt]);
+    const keys = ['polling', 'url', 'platform', 'lastError', 'intervalMs', 'maxItems', 'caps', 'message'];
+    const changed = m && base ? keys.filter((k) => JSON.stringify(m[k]) !== JSON.stringify(base[k])) : ['(no status)'];
+    const savedNow = await savedConfig(cfgPath, (c) => c.topN === topN);
+    const out = sc.out.slice(outAt);
+    const logged = /command: __status|unknown command/i.test(out);
+    check('__status, __STATUS and __Status are all ignored as the sidecar\'s own echo: no status in reply, no status field or saved setting changed, nothing logged',
+      drawn === 0 && changed.length === 0 && savedNow?.tournamentUrl === SAFE_STUB && savedNow?.topN === topN && !logged,
+      JSON.stringify({ statusesDrawn: drawn, changed, savedUrl: savedNow?.tournamentUrl, logged: logged ? out.split('\n').filter((l) => /__status/i.test(l)) : false }));
+  }
+
+  // An unknown command: reported by name only, cut to 40 characters, in commandNotice.
+  {
+    const name = 'Zq' + 'x'.repeat(38) + 'TAIL' + 'y'.repeat(456); // 500 characters
+    const value = 'VALUE-CANARY';
+    const outAt = sc.out.length;
+    let at = mark();
+    cmd(name, value);
+    const hit = await since(at, (d) => !!statusOf(d)?.commandNotice);
+    const notice = statusOf(hit)?.commandNotice || '';
+    const out = sc.out.slice(outAt);
+    check('an unknown 500-character command is reported in commandNotice by name only, cut to 40 characters, never with its value; the console lines cut it too',
+      notice === `unknown command "${name.slice(0, 40)}…" — ignored` && !notice.includes(value)
+        && out.includes(`unknown command "${name.slice(0, 40)}…"`) && out.includes(`command: ${name.slice(0, 40)}…`) && !out.includes('TAIL'),
+      JSON.stringify({ notice, out: out.slice(0, 400) }));
+    at = mark();
+    cmd('status');
+    const kept = statusOf(await since(at, isStatus));
+    at = mark();
+    cmd('setTopN', '0');
+    const cleared = statusOf(await since(at, (d) => statusOf(d)?.topN === 0));
+    check('commandNotice outlasts a status request, and the next accepted command clears it',
+      notice !== '' && kept?.commandNotice === notice && cleared?.commandNotice === '',
+      JSON.stringify({ afterStatus: kept?.commandNotice, afterSetTopN: cleared?.commandNotice }));
+
+    // The cut is by whole characters: an emoji as the 40th character is kept whole, never
+    // split into half a surrogate pair.
+    const emoji = '\u{1F600}';
+    const emojiName = 'e'.repeat(39) + emoji + 'tail';
+    at = mark();
+    cmd(emojiName, '');
+    const eh = statusOf(await since(at, (d) => !!statusOf(d)?.commandNotice));
+    check('an unknown name is cut by whole characters: an emoji as the 40th character is kept whole, then "…"',
+      eh?.commandNotice === `unknown command "${'e'.repeat(39)}${emoji}…" — ignored`,
+      JSON.stringify({ commandNotice: eh?.commandNotice }));
+  }
+
+  // The chat path: names arrive lower-cased (the C# lower-cases a dedicated command).
+  {
+    let at = mark();
+    cmd('status');
+    const before = statusOf(await since(at, isStatus));
+    at = mark();
+    chat('!pollnow', '');
+    const polled = await since(at, (d) => !!statusOf(d)?.lastPollAt && statusOf(d).lastPollAt !== before?.lastPollAt);
+    check('chat: !pollnow (relayed as "pollnow") polls', !!polled && statusOf(polled).lastError === '',
+      polled ? JSON.stringify({ lastError: statusOf(polled).lastError }) : 'no poll after !pollnow');
+    at = mark();
+    cmd('stop');
+    await since(at, (d) => statusOf(d)?.polling === false);
+
+    const inRepo = 'stub:./platforms/fixtures/stub-result.json';
+    at = mark();
+    chat('!ticker', `seturl ${inRepo}`);
+    const set = statusOf(await since(at, (d) => statusOf(d)?.url === inRepo));
+    check('chat: !ticker seturl (relayed as "seturl") sets a stub: URL inside the repo', set?.url === inRepo && set?.commandNotice === '',
+      JSON.stringify({ url: set?.url, commandNotice: set?.commandNotice }));
+    at = mark();
+    chat('!ticker', 'seturl stub:C:\\Windows\\win.ini');
+    const refused = statusOf(await since(at, (d) => !!statusOf(d)?.commandNotice));
+    check('chat: !ticker seturl stub:C:\\Windows\\win.ini is refused by the sidecar with the confinement message; the URL is kept',
+      refused?.commandNotice === MSG.stubOutside && refused?.url === inRepo && refused?.lastError === '',
+      JSON.stringify({ commandNotice: refused?.commandNotice, url: refused?.url, lastError: refused?.lastError }));
+
+    // setCapsLogo javascript:… through chat too, lower-cased as a chatter may type it.
+    at = mark();
+    chat('!ticker', 'setcapslogo javascript:alert(1)');
+    const jsChat = statusOf(await since(at, (d) => statusOf(d)?.commandNotice === MSG.logo));
+    const jsChatPushed = client.events.slice(at).some((d) => isUpdate(d) && /javascript/i.test(d.caps?.logo || ''));
+    check('chat: !ticker setcapslogo javascript:… is refused by the sidecar; the logo is kept, nothing is pushed with it, and commandNotice says why',
+      !!jsChat && jsChat.caps?.logo === set?.caps?.logo && !jsChatPushed,
+      JSON.stringify({ logo: jsChat?.caps?.logo, before: set?.caps?.logo, commandNotice: jsChat?.commandNotice, jsChatPushed }));
+
+    // An empty seturl through chat while polling. The poll that start begins is waited
+    // out first (its closing status carries a new lastPollAt), so none is in flight.
+    at = mark();
+    cmd('start');
+    const chatRunning = statusOf(await since(at, (d) => statusOf(d)?.polling === true && !!statusOf(d).lastPollAt && statusOf(d).lastPollAt !== set?.lastPollAt));
+    at = mark();
+    chat('!ticker', 'seturl');
+    const emptied = statusOf(await since(at, (d) => isStatus(d) && statusOf(d).url === null));
+    check('chat: !ticker seturl with no value while polling clears the URL and stops polling',
+      !!chatRunning && emptied?.url === null && emptied?.polling === false && emptied?.commandNotice === '',
+      JSON.stringify({ running: !!chatRunning, url: emptied?.url, polling: emptied?.polling, commandNotice: emptied?.commandNotice }));
+  }
+
+  // Confinement (ZIPPER_ALLOW_STUB=1 here), checked as text before any file call.
+  {
+    // The check itself, in-process, against a stand-in folder path with a "k" in its
+    // name, as the published folder has: a sibling spelled with a Kelvin sign (U+212A,
+    // which JavaScript's toLowerCase folds to "k" and NTFS keeps apart), and the network
+    // forms of the folder's own path. Windows path arithmetic only: nothing is opened.
+    const src = await readFile(resolve(__dirname, 'zipper-sidecar.mjs'), 'utf-8');
+    const fn = (/\nfunction stubRefusal\(url\) \{\r?\n[\s\S]*?\r?\n\}\r?\n/.exec(src) || [])[0];
+    let inproc = 'zipper-sidecar.mjs has no stubRefusal(url) function';
+    if (fn) {
+      const root = 'C:\\dev\\StreamerBot\\zipper-ticker';
+      const refusal = new Function('resolve', 'relative', 'isAbsolute', 'sep', '__dirname', 'STUB_ALLOWED', 'STUB_OFF_MESSAGE', 'STUB_OUTSIDE_MESSAGE',
+        `${fn}\nreturn stubRefusal;`)(win32.resolve, win32.relative, win32.isAbsolute, win32.sep, root, true, MSG.stubOff, MSG.stubOutside);
+      const cases = [
+        ['a sibling spelled with a Kelvin sign', 'stub:..\\zipper-tic\u212Aer\\x.json', MSG.stubOutside],
+        ['UNC naming the folder\'s own path', `stub:\\\\${root}\\x.json`, MSG.stubOutside],
+        ['its forward-slash form', `stub://${root.replace(/\\/g, '/')}/x.json`, MSG.stubOutside],
+        ['the same in lower case', `stub:\\\\${root.toLowerCase()}\\x.json`, MSG.stubOutside],
+        ['a sibling whose name starts with the folder\'s', 'stub:..\\zipper-ticker-x\\x.json', MSG.stubOutside],
+        ['.. traversal', 'stub:platforms\\..\\..\\x.json', MSG.stubOutside],
+        ['a relative path inside', 'stub:platforms\\fixtures\\stub-result.json', null],
+        ['an absolute path inside', `stub:${root}\\platforms\\x.json`, null],
+      ];
+      inproc = cases.filter(([, url, want]) => refusal(url) !== want).map(([what, url]) => `${what} (${url}): ${JSON.stringify(refusal(url))}`).join(' || ');
+    }
+    check('confinement, in-process: a sibling spelled with a Kelvin sign and \\\\ or // forms of the folder\'s own path are refused; paths inside are accepted',
+      !!fn && inproc === '', inproc);
+
+    // The state a refused setUrl must leave alone is made non-default first: a fixture
+    // inside the repo is polled (event state, start time, platform), then made unreadable
+    // and polled again (lastError), then polling stops.
+    await ready();
+    const flip = `stub:${TMP_REL}/flip.json`;
+    const flipStart = '2026-01-02T03:04:05.000Z';
+    await writeFile(join(TMP_DIR, 'flip.json'), JSON.stringify({ tournamentName: 'Flip Cup', state: 'in_progress', startAt: flipStart, matches: [], standings: [] }), 'utf-8');
+    let at = mark();
+    cmd('setUrl', flip);
+    const flipSet = statusOf(await since(at, (d) => statusOf(d)?.url === flip));
+    at = mark();
+    cmd('pollNow');
+    const live = statusOf(await since(at, (d) => statusOf(d)?.auto?.eventState === 'in_progress' && !!statusOf(d).lastPollAt && statusOf(d).lastPollAt !== flipSet?.lastPollAt));
+    await writeFile(join(TMP_DIR, 'flip.json'), 'not JSON', 'utf-8');
+    at = mark();
+    cmd('pollNow');
+    const failed = statusOf(await since(at, (d) => statusOf(d)?.lastError === MSG.stubNotObject));
+    at = mark();
+    cmd('stop');
+    await since(at, (d) => statusOf(d)?.polling === false);
+    const want = { url: flip, platform: 'stub', lastError: MSG.stubNotObject, eventState: 'in_progress', startAt: flipStart, polling: false };
+    const stateOf = (s) => s && { url: s.url, platform: s.platform, lastError: s.lastError, eventState: s.auto?.eventState, startAt: s.auto?.startAt, polling: s.polling };
+    check('confinement, set-up: the URL is an in-repo fixture with an event state and a start time, and its last poll failed',
+      !!live && JSON.stringify(stateOf(failed)) === JSON.stringify({ ...want, polling: true }), JSON.stringify(stateOf(failed)));
+    // The baseline is taken once stop's save has landed, and two reads 100 ms apart
+    // agree, so a save still on its way cannot land after it.
+    await savedConfig(cfgPath, (c) => c.tournamentUrl === flip && c.autoStart === false);
+    let bytesBefore = null;
+    for (let i = 0; i < 30; i++) {
+      let cur = null;
+      try { cur = await readFile(cfgPath); } catch {}
+      if (cur && bytesBefore && cur.equals(bytesBefore)) break;
+      bytesBefore = cur;
+      await sleep(100);
+    }
+
+    const at0 = mark();
+    const outside = [
+      ['drive-absolute, outside the repo', 'stub:C:\\Windows\\win.ini'],
+      ['.. traversal', 'stub:..\\x.json'],
+      ['a sibling folder whose name starts with this folder\'s name', `stub:..\\${basename(__dirname)}-x\\x.json`],
+      ['a sibling folder whose name starts with the published folder\'s name', 'stub:..\\zipper-ticker-x\\x.json'],
+      ['a UNC path on a host that cannot resolve', 'stub:\\\\zipper-verify.invalid\\share\\x.json'],
+      ['its forward-slash form', 'stub://zipper-verify.invalid/share/x.json'],
+      // Polling is off, so even a sidecar that took these would open nothing.
+      ['a UNC path whose text is this folder\'s own path', `stub:\\\\${__dirname}\\x.json`],
+      ['its forward-slash form', `stub://${__dirname.replace(/\\/g, '/')}/x.json`],
+      ['nothing after stub:', 'stub:'],
+    ];
+    const wrong = [];
+    for (const [what, url] of outside) {
+      at = mark();
+      cmd('setUrl', url);
+      const s = statusOf(await since(at, isStatus));
+      if (s?.commandNotice !== MSG.stubOutside || JSON.stringify(stateOf(s)) !== JSON.stringify(want)) {
+        wrong.push(`${what} (${url}): ${s ? JSON.stringify({ commandNotice: s.commandNotice, ...stateOf(s) }) : 'no status'}`);
+      }
+    }
+    check('confinement: setUrl refuses a stub: path outside the repo (drive-absolute, .., a sibling folder named like the repo, UNC both ways, UNC spelling this folder\'s path, empty) with the confinement message, never ENOENT or a network error; the URL, platform, event state, start time and last poll error are kept',
+      wrong.length === 0, wrong.join(' || '));
+    // A save starts before the status that follows it is sent: watch the file for a
+    // change for a while after the last refusal's status. Polling is off here, so an
+    // accepted setUrl pushes nothing either: the update count can fail only from row 4.6
+    // on (an accepted URL blanks the strip). The check while polling, below, covers it now.
+    const changed = await waitFor(async () => { try { return !(await readFile(cfgPath)).equals(bytesBefore); } catch { return false; } }, 1000, 50);
+    const pushed = client.events.slice(at0).filter(isUpdate).length;
+    check('confinement: the refused setUrls leave config.json byte-identical and push no ticker:update (the update count is live from row 4.6)',
+      !!bytesBefore && !changed && pushed === 0, JSON.stringify({ configChanged: !!changed, updatesPushed: pushed }));
+
+    // While polling, a refused setUrl starts no poll and pushes nothing (an accepted one
+    // polls at once), and the URL and polling stay as they were.
+    at = mark();
+    cmd('setUrl', SAFE_STUB);
+    const safeSet = statusOf(await since(at, (d) => statusOf(d)?.url === SAFE_STUB));
+    at = mark();
+    cmd('start');
+    const running = statusOf(await since(at, (d) => statusOf(d)?.polling === true && !!statusOf(d).lastPollAt && statusOf(d).lastPollAt !== safeSet?.lastPollAt));
+    at = mark();
+    cmd('setUrl', 'stub:..\\zipper-verify-outside.json');
+    const whileOn = statusOf(await since(at, (d) => statusOf(d)?.commandNotice === MSG.stubOutside));
+    await sleep(500);
+    const polledAfter = client.events.slice(at).filter(isStatus).map(parseStatus).some((s) => s.lastPollAt !== running?.lastPollAt);
+    const pushedAfter = client.events.slice(at).filter(isUpdate).length;
+    check('confinement: while polling, a refused setUrl starts no poll and pushes no ticker:update; the URL is kept and polling stays on',
+      !!running && whileOn?.url === SAFE_STUB && whileOn?.polling === true && !polledAfter && pushedAfter === 0,
+      JSON.stringify({ running: !!running, url: whileOn?.url, polling: whileOn?.polling, polledAfter, pushedAfter }));
+    at = mark();
+    cmd('stop');
+    await since(at, (d) => statusOf(d)?.polling === false);
+
+    const abs = `stub:${resolve(__dirname, 'platforms', 'fixtures', 'stub-result.json')}`;
+    at = mark();
+    cmd('setUrl', abs);
+    const acc = statusOf(await since(at, (d) => statusOf(d)?.url === abs));
+    at = mark();
+    cmd('pollNow');
+    const upd = await since(at, (d) => isUpdate(d) && d.tournament?.url === abs);
+    check('confinement: an absolute stub: path inside the repo is accepted and read',
+      acc?.url === abs && !acc.commandNotice && acc.platform === 'stub' && upd?.tournament?.name === 'Stub Invitational',
+      JSON.stringify({ url: acc?.url, commandNotice: acc?.commandNotice, pushed: upd?.tournament?.name }));
+  }
+
+  // Read and parse failures: fixed messages that quote no file content and no path.
+  {
+    await ready();
+    await writeFile(join(TMP_DIR, 'canary.txt'), 'sk_live_CANARY is not JSON', 'utf-8');
+    await writeFile(join(TMP_DIR, 'null.json'), 'null', 'utf-8');
+    const tries = [
+      ['a file that is not JSON', `stub:${TMP_REL}/canary.txt`, MSG.stubNotObject],
+      ['a file that holds JSON null', `stub:${TMP_REL}/null.json`, MSG.stubNotObject],
+      ['a file that is not there', `stub:${TMP_REL}/missing.json`, MSG.stubUnreadable],
+    ];
+    const wrong = [];
+    const outAt = sc.out.length;
+    for (const [what, url, want] of tries) {
+      let at = mark();
+      cmd('setUrl', url);
+      await since(at, (d) => statusOf(d)?.url === url);
+      at = mark();
+      cmd('pollNow');
+      const s = statusOf(await since(at, (d) => statusOf(d)?.url === url && !!statusOf(d)?.lastError));
+      if (s?.lastError !== want) wrong.push(`${what}: ${JSON.stringify(s?.lastError ?? 'no failed poll seen')}`);
+      at = mark();
+      cmd('stop');
+      await since(at, (d) => statusOf(d)?.polling === false);
+    }
+    const out = sc.out.slice(outAt);
+    // The log line of each failed poll carries the same fixed message, and nothing else.
+    const logged = out.split(/\r?\n/).filter((l) => l.includes('poll failed')).map((l) => l.replace(/^.*poll failed \(\d+x\): /, ''));
+    check('stub: read and parse failures put a fixed message in lastError and in the log line, quoting no file content and no path',
+      wrong.length === 0 && JSON.stringify(logged) === JSON.stringify(tries.map(([, , want]) => want)) && !out.includes('sk_live'),
+      wrong.join(' || ') || JSON.stringify({ logged, leaked: out.includes('sk_live') }));
+  }
+
+  // The logo: an http(s) URL or a path on the overlay's own server, on every way in.
+  {
+    await ready(); // polling off: each caps command pushes its update at once
+    const keep = '/zipper-overlay/x.png';
+    let at = mark();
+    cmd('setCaps', JSON.stringify({ text: '@LogoBase', logo: keep }));
+    await since(at, (d) => isUpdate(d) && d.caps?.text === '@LogoBase' && d.caps?.logo === keep);
+    at = mark();
+    cmd('setCapsLogo', 'javascript:alert(1)');
+    const js = statusOf(await since(at, isStatus));
+    const jsPushed = client.events.slice(at).some((d) => isUpdate(d) && /javascript/i.test(d.caps?.logo || ''));
+    check('logo: setCapsLogo javascript:… is refused; the logo is kept, nothing is pushed with it, and commandNotice says why',
+      js?.caps?.logo === keep && js?.commandNotice === MSG.logo && !jsPushed, JSON.stringify({ logo: js?.caps?.logo, commandNotice: js?.commandNotice, jsPushed }));
+
+    const refused = [
+      ['//host', '//zipper-verify.invalid/x.png'],
+      ['\\\\host', '\\\\zipper-verify.invalid\\x.png'],
+      ['/\\host', '/\\zipper-verify.invalid/x.png'],
+      ['data:', 'data:image/png;base64,iVBORw0KGgo='],
+      ['file:', 'file:///C:/Windows/win.ini'],
+      ['javascript:', 'javascript:alert(1)'],
+      ['blob:', 'blob:http://127.0.0.1:7474/x'],
+      ['a tab inside //host', '/\t/zipper-verify.invalid/x.png'],
+      ['a newline inside \\\\host', '\\\n\\zipper-verify.invalid\\x.png'],
+      ['a newline inside javascript:', 'java\nscript:alert(1)'],
+    ];
+    const wrong = [];
+    for (const [i, [what, logo]] of refused.entries()) {
+      const text = `@Refused${i}`;
+      at = mark();
+      cmd('setCaps', JSON.stringify({ text, logo }));
+      const upd = await since(at, (d) => isUpdate(d) && d.caps?.text === text);
+      const s = statusOf(await since(at, (d) => statusOf(d)?.caps?.text === text));
+      if (upd?.caps?.logo !== keep || s?.caps?.logo !== keep || s?.commandNotice !== MSG.logo) {
+        wrong.push(`${what}: ${JSON.stringify({ pushedLogo: upd?.caps?.logo, statusLogo: s?.caps?.logo, commandNotice: s?.commandNotice })}`);
+      }
+    }
+    check('logo: setCaps with a valid text and a refused logo (//host, \\\\host, /\\host, data:, file:, javascript:, blob:, tab and newline variants): the text applies, the logo is kept, commandNotice says why',
+      wrong.length === 0, wrong.join(' || '));
+
+    const accepted = ['https://zipper-verify.invalid/logo.png', 'HTTP://zipper-verify.invalid/logo.png', 'assets/logo.png', ' /zipper-overlay/x.png ', ''];
+    const bad = [];
+    for (const [i, logo] of accepted.entries()) {
+      const text = `@Accepted${i}`;
+      at = mark();
+      cmd('setCaps', JSON.stringify({ text, logo }));
+      const upd = await since(at, (d) => isUpdate(d) && d.caps?.text === text);
+      const s = statusOf(await since(at, (d) => statusOf(d)?.caps?.text === text));
+      if (upd?.caps?.logo !== logo.trim() || s?.commandNotice !== '') bad.push(`${JSON.stringify(logo)}: ${JSON.stringify({ pushedLogo: upd?.caps?.logo, commandNotice: s?.commandNotice })}`);
+    }
+    check('logo: an http(s) URL (remote hosts allowed), a relative path, a path on the overlay\'s server (trimmed) and an empty value (clears the cap) are accepted',
+      bad.length === 0, bad.join(' || '));
+
+    // The notice outlasts the next poll, which row 6.1 relies on: with polling on, a
+    // refused logo in setCaps sets it, setCaps starts a poll, and the status that closes
+    // that poll still carries it.
+    at = mark();
+    cmd('setCaps', JSON.stringify({ text: '@PollBase', logo: keep }));
+    const pollBase = statusOf(await since(at, (d) => statusOf(d)?.caps?.text === '@PollBase'));
+    at = mark();
+    cmd('start');
+    const on = statusOf(await since(at, (d) => statusOf(d)?.polling === true && !!statusOf(d).lastPollAt && statusOf(d).lastPollAt !== pollBase?.lastPollAt));
+    at = mark();
+    cmd('setCaps', JSON.stringify({ text: '@DuringPoll', logo: 'javascript:alert(1)' }));
+    const afterPoll = statusOf(await since(at, (d) => statusOf(d)?.caps?.text === '@DuringPoll' && !!statusOf(d).lastPollAt && statusOf(d).lastPollAt !== on?.lastPollAt));
+    check('logo: commandNotice outlasts the next poll: with polling on, the status that closes the poll setCaps starts still says why the logo was refused',
+      !!on && afterPoll?.commandNotice === MSG.logo && afterPoll?.caps?.logo === keep && afterPoll?.lastError === '',
+      JSON.stringify({ polled: !!afterPoll, commandNotice: afterPoll?.commandNotice, logo: afterPoll?.caps?.logo, lastError: afterPoll?.lastError }));
+    at = mark();
+    cmd('stop');
+    await since(at, (d) => statusOf(d)?.polling === false);
+  }
+
+  // ZIP-12: clearing the URL while polling stops polling; start and pollNow with no URL
+  // are refused in commandNotice, not lastError.
+  {
+    const base = await ready();
+    let at = mark();
+    cmd('start');
+    // The status pollOnce sends before its fetch also shows polling on, with the last
+    // poll's time: wait for the one that closes this poll (a new lastPollAt), so no poll
+    // is in flight when the URL is cleared and none of its statuses can arrive later.
+    await since(at, (d) => statusOf(d)?.polling === true && !!statusOf(d)?.lastPollAt && statusOf(d).lastPollAt !== base?.lastPollAt);
+    at = mark();
+    cmd('setUrl', '');
+    const cleared = statusOf(await since(at, (d) => isStatus(d) && statusOf(d).url === null));
+    const savedCleared = await savedConfig(cfgPath, (c) => c.tournamentUrl === null && c.autoStart === false);
+    check('setUrl with an empty value while polling clears the URL and stops polling (saved: no URL, autoStart off)',
+      cleared?.url === null && cleared?.polling === false && cleared?.lastError === '' && savedCleared?.tournamentUrl === null && savedCleared?.autoStart === false,
+      JSON.stringify({ url: cleared?.url, polling: cleared?.polling, lastError: cleared?.lastError, saved: savedCleared && { tournamentUrl: savedCleared.tournamentUrl, autoStart: savedCleared.autoStart } }));
+    // Each refusal is read from the status that carries its notice, not the first status
+    // after the command.
+    at = mark();
+    cmd('start');
+    const s1 = statusOf(await since(at, (d) => statusOf(d)?.commandNotice === MSG.noUrl));
+    at = mark();
+    cmd('pollNow');
+    const s2 = statusOf(await since(at, (d) => statusOf(d)?.commandNotice === MSG.noUrl));
+    check('start and pollNow with no URL are refused in commandNotice ("No tournament URL set"), not in lastError; polling stays off',
+      [s1, s2].every((s) => s?.commandNotice === MSG.noUrl && s.lastError === '' && s.polling === false),
+      JSON.stringify([s1, s2].map((s) => s && { commandNotice: s.commandNotice, lastError: s.lastError, polling: s.polling })));
+  }
+
+  // ZIP-12 while waiting for an event's start time: an empty setUrl also clears
+  // waitingUntil and the pending wake-up poll, which would otherwise still run.
+  {
+    await ready();
+    const later = `stub:${TMP_REL}/later.json`;
+    const startAt = new Date(Date.now() + 2500).toISOString();
+    await writeFile(join(TMP_DIR, 'later.json'), JSON.stringify({ tournamentName: 'Later Cup', state: 'upcoming', startAt, matches: [], standings: [] }), 'utf-8');
+    let at = mark();
+    cmd('setUrl', later);
+    await since(at, (d) => statusOf(d)?.url === later);
+    at = mark();
+    cmd('start');
+    const waiting = statusOf(await since(at, (d) => !!statusOf(d)?.auto?.waitingUntil));
+    at = mark();
+    cmd('setUrl', '');
+    const cleared = statusOf(await since(at, (d) => isStatus(d) && statusOf(d).url === null));
+    // Wait past the start time: by then a wake-up poll left pending would have run, and
+    // with no URL it would show as a new lastPollAt and a lastError.
+    await sleep(Math.max(0, Date.parse(startAt) - Date.now()) + 1000);
+    const woke = client.events.slice(at).filter(isStatus).map(parseStatus).filter((s) => s.lastPollAt !== cleared?.lastPollAt || s.lastError);
+    check('setUrl with an empty value while waiting for the start time clears waitingUntil, and the pending wake-up poll never runs',
+      !!waiting && cleared?.polling === false && cleared?.auto?.waitingUntil === null && woke.length === 0,
+      JSON.stringify({ waited: waiting?.auto?.waitingUntil ?? null, polling: cleared?.polling, waitingUntil: cleared?.auto?.waitingUntil, woke: woke.map((s) => ({ lastPollAt: s.lastPollAt, lastError: s.lastError })) }));
+  }
+  await ready();
+}
+
+// ── 6g. stub: without ZIPPER_ALLOW_STUB, and outside the repo, at the read ──
+
+async function testStubAtTheRead(client) {
+  console.log('\n[6g] a stub: URL from config.json: without ZIPPER_ALLOW_STUB, and outside the repo, refused at the poll; a saved logo that fails the rule');
+  let stubOffSeen = null; // lastError of the sidecar without the variable, as it reported it
+
+  // Without the variable: its own spawn, config file and guard port.
+  {
+    const cfgPath = join(TMP_DIR, 'config-nostub.json');
+    await writeFile(cfgPath, JSON.stringify({ tournamentUrl: SAFE_STUB, autoStart: true, pollIntervalMs: 15000, caps: { text: '', logo: '' } }), 'utf-8');
+    const at = client.events.length;
+    const sc = startSidecar('no-stub sidecar [6g]', { ZIPPER_CONFIG: cfgPath, ZIPPER_GUARD_PORT: String(NOSTUB_GUARD_PORT) }, { allowStub: false });
+    const since = sinceOn(client, sc);
+    const polled = await since(at, (d) => isStatus(d) && !!parseStatus(d).lastPollAt, 6000);
+    const p = polled && parseStatus(polled);
+    // Read, the fixture would set the event state and push its results.
+    const read = p?.auto?.eventState != null || client.events.slice(at).some((d) => isUpdate(d) && d.tournament?.name === 'Stub Invitational');
+    // The platform label follows the gate: a refused URL is never labelled "stub".
+    check('without ZIPPER_ALLOW_STUB: a stub: URL inside the repo from config.json (autoStart) is refused at the poll with the variable\'s own message, nothing is read, and no platform is shown',
+      p?.lastError === MSG.stubOff && p?.url === SAFE_STUB && p?.platform === null && !read,
+      JSON.stringify({ lastError: p?.lastError, url: p?.url, platform: p?.platform, eventState: p?.auto?.eventState, read }));
+    stubOffSeen = p?.lastError ?? null;
+    const at2 = client.events.length;
+    const other = 'stub:./platforms/fixtures/stub-result.json';
+    client.ws.send(JSON.stringify({ request: 'DoAction', id: 'n', action: { name: 'Ticker Command' }, args: { command: 'setUrl', value: other } }));
+    const r = await since(at2, (d) => isStatus(d) && (!!parseStatus(d).commandNotice || parseStatus(d).url === other), 4000);
+    const rs = r && parseStatus(r);
+    check('without ZIPPER_ALLOW_STUB: setUrl with a stub: URL inside the repo is refused with the same message in commandNotice; the URL is kept and no platform is shown',
+      rs?.commandNotice === MSG.stubOff && rs?.url === SAFE_STUB && rs?.platform === null,
+      JSON.stringify({ commandNotice: rs?.commandNotice, url: rs?.url, platform: rs?.platform }));
+    await sc.stop();
+    await rm(cfgPath, { force: true });
+  }
+
+  // With the variable: a saved stub: URL outside the repo, and a saved logo that fails
+  // the rule. The path names a file that does not exist, in the folder above the repo.
+  {
+    const cfgPath = join(TMP_DIR, 'config-outside.json');
+    await writeFile(cfgPath, JSON.stringify({
+      tournamentUrl: 'stub:..\\zipper-verify-outside.json', autoStart: true, autoSchedule: true, pollIntervalMs: 15000,
+      caps: { text: '@Saved', logo: 'javascript:alert(1)' },
+    }), 'utf-8');
+    const at = client.events.length;
+    const sc = startSidecar('outside-stub sidecar [6g]', { ZIPPER_CONFIG: cfgPath, ZIPPER_GUARD_PORT: String(GUARD_PORT) });
+    const since = sinceOn(client, sc);
+    const polled = await since(at, (d) => isStatus(d) && !!parseStatus(d).lastPollAt, 6000);
+    const p = polled && parseStatus(polled);
+    check('a stub: URL outside the repo from config.json (autoStart) is refused at the poll with the confinement message, never ENOENT',
+      p?.lastError === MSG.stubOutside, JSON.stringify({ lastError: p?.lastError }));
+    // As the sidecar reports them, not as this file spells them: the two refusals differ.
+    check('the two stub: refusals at the poll read differently (without the variable; outside the repo)',
+      !!stubOffSeen && !!p?.lastError && stubOffSeen !== p.lastError, JSON.stringify({ withoutVariable: stubOffSeen, outside: p?.lastError }));
+    const dropped = (sc.out.match(/the saved logo was dropped/g) || []).length;
+    client.ws.send(JSON.stringify({ request: 'DoAction', id: 'o', action: { name: 'Ticker Command' }, args: { command: 'setAutoSchedule', value: 'off' } }));
+    const saved = await savedConfig(cfgPath, (c) => c.autoSchedule === false);
+    check('a saved logo that fails the rule is dropped to "" in memory with one log line, and written out on the next save; the text stays',
+      p?.caps?.logo === '' && p?.caps?.text === '@Saved' && dropped === 1 && saved?.autoSchedule === false && saved?.caps?.logo === '' && saved?.caps?.text === '@Saved',
+      JSON.stringify({ statusCaps: p?.caps, logLines: dropped, savedCaps: saved?.caps }));
+    await sc.stop();
+    await rm(cfgPath, { force: true });
   }
 }
 
