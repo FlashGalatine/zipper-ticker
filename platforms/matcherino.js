@@ -6,6 +6,8 @@
 // placement yet are omitted; if nobody is placed the fetch throws so the
 // sidecar surfaces a useful status instead of an empty strip.
 
+import { guardedFetch, statusError, USER_AGENT } from './guarded-fetch.js';
+
 const API_BASE = 'https://api.matcherino.com/__api';
 
 export const matcherino = {
@@ -35,17 +37,18 @@ export const matcherino = {
     }
   },
 
-  async fetchTicker(tournamentId, _config) {
+  async fetchTicker(tournamentId, _config, _originalUrl, signal) {
     if (!/^\d+$/.test(String(tournamentId))) {
       throw new Error('Missing or invalid Matcherino tournament id');
     }
-    const res = await fetch(`${API_BASE}/bounties/findById?id=${encodeURIComponent(tournamentId)}`, {
-      headers: { Accept: 'application/json', 'User-Agent': 'Zipper/0.1' },
+    const res = await guardedFetch(`${API_BASE}/bounties/findById?id=${encodeURIComponent(tournamentId)}`, {
+      headers: { Accept: 'application/json', 'User-Agent': USER_AGENT },
+      signal,
     });
-    if (!res.ok) throw new Error(`Matcherino ${res.status}: ${res.statusText}`);
+    if (!res.ok) throw statusError(`Matcherino ${res.status}: ${res.statusText}`, res);
 
     let env;
-    try { env = await res.json(); } catch (err) {
+    try { env = res.json(); } catch (err) {
       throw new Error(`Matcherino: failed to parse response (${err.message})`);
     }
     return normalizeMatcherino(env);

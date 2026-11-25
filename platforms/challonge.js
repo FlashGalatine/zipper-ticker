@@ -17,6 +17,8 @@
 //     *_score, or per-player score) and matches without readable scores are
 //     surfaced as in-progress/upcoming rather than dropped.
 
+import { guardedFetch, statusError, BROWSER_USER_AGENT } from './guarded-fetch.js';
+
 const API_BASE = 'https://api.challonge.com/v1';
 const TOURNAMENT_STORE_RE = /window\._initialStoreState\['TournamentStore'\]\s*=\s*/;
 
@@ -52,10 +54,10 @@ export const challonge = {
     }
   },
 
-  async fetchTicker(tournamentId, config, originalUrl) {
+  async fetchTicker(tournamentId, config, originalUrl, signal) {
     if (config?.challongeApiKey) {
       try {
-        return await fetchViaApi(tournamentId, config.challongeApiKey);
+        return await fetchViaApi(tournamentId, config.challongeApiKey, signal);
       } catch (err) {
         // The v1 API 404s any tournament the key's account doesn't own —
         // public brackets run by someone else included. Fall back to the
@@ -63,23 +65,21 @@ export const challonge = {
         if (!/\b404\b/.test(err?.message || '')) throw err;
       }
     }
-    return fetchViaScrape(originalUrl, tournamentId);
+    return fetchViaScrape(originalUrl, tournamentId, signal);
   },
 };
 
 // ── API path ──────────────────────────────────────────────────────────────────
 
-async function fetchViaApi(tournamentId, apiKey) {
+async function fetchViaApi(tournamentId, apiKey, signal) {
   if (!tournamentId) throw new Error('Missing tournament id');
   const url = `${API_BASE}/tournaments/${encodeURIComponent(tournamentId)}.json`
     + `?include_participants=1&include_matches=1&api_key=${encodeURIComponent(apiKey)}`;
-  const res = await fetch(url, { headers: { Accept: 'application/json' } });
+  const res = await guardedFetch(url, { headers: { Accept: 'application/json' }, signal });
   if (!res.ok) {
-    let detail = '';
-    try { detail = await res.text(); } catch {}
-    throw new Error(`Challonge API ${res.status}: ${detail.slice(0, 200) || res.statusText}`);
+    throw statusError(`Challonge API ${res.status}: ${res.text.slice(0, 200) || res.statusText}`, res);
   }
-  const body = await res.json();
+  const body = res.json();
   return normalizeChallongeApi(body);
 }
 
@@ -195,20 +195,21 @@ function roundLabel(round, maxWin, minLose, isDouble) {
 
 // ── Scrape path (no API key) ──────────────────────────────────────────────────
 
-async function fetchViaScrape(originalUrl, tournamentId) {
+async function fetchViaScrape(originalUrl, tournamentId, signal) {
   const moduleUrl = deriveModuleUrl(originalUrl, tournamentId);
   if (!moduleUrl) throw new Error('Could not derive Challonge embed URL');
 
-  const res = await fetch(moduleUrl, {
+  const res = await guardedFetch(moduleUrl, {
     headers: {
       Accept: 'text/html',
-      'User-Agent': 'Mozilla/5.0 (compatible; Zipper/0.1)',
+      'User-Agent': BROWSER_USER_AGENT,
     },
+    signal,
   });
   if (!res.ok) {
-    throw new Error(`Challonge ${res.status}: ${res.statusText} (no api key configured; fell back to public scrape)`);
+    throw statusError(`Challonge ${res.status}: ${res.statusText} (no api key configured; fell back to public scrape)`, res);
   }
-  const html = await res.text();
+  const html = res.text;
   const store = extractTournamentStore(html);
   if (!store) {
     throw new Error('Challonge: could not extract TournamentStore from embed page (set "challongeApiKey" in config.json for the authoritative API path)');

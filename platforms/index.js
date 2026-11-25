@@ -5,18 +5,25 @@
 //   displayName      — human label
 //   matches(input)   — returns true if this platform should handle the input
 //   parseId(input)   — returns a tournament identifier string, or null
-//   fetchTicker(id, config, originalUrl)
+//   fetchTicker(id, config, originalUrl, signal)
 //                    — returns Promise<{ tournamentName, state, matches[], standings[] }>
 //                      where matches[] entries are the normalized shape in
 //                      docs/PROTOCOL.md: { id, round, state, p1:{name,score},
 //                      p2:{name,score}, winner, order }.
+//                      `signal` is the poll's AbortSignal (its 45-second deadline,
+//                      or a setUrl that replaced the URL). Pass it to every request,
+//                      and make every request through guardedFetch
+//                      (./guarded-fetch.js), which also gives it a 10-second timeout,
+//                      a size cap and Retry-After; throw a refused answer with its
+//                      statusError, so the sidecar sees the status and Retry-After.
 //
 // Order matters for `detectPlatform` — first match wins. Put URL-host-specific
 // platforms before any platform that accepts loose bare-string input
 // (Challonge accepts bare slugs, so it goes last).
 //
 // Adding a new service: drop a module into this folder, import it here, add it
-// to PLATFORMS. No other code changes required.
+// to PLATFORMS. No other code changes required. (guarded-fetch.js in this folder is
+// the request wrapper the platforms share, not a platform.)
 
 import { tourneybot } from './tourneybot.js';
 import { matcherino } from './matcherino.js';

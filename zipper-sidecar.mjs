@@ -27,6 +27,13 @@
 // `upcoming` sleeps until the platform's advertised start time (slow re-check
 // when it has none) and resumes normal polling once the event goes live.
 //
+// The poll loop (see "Poll loop" below): one poll at a time, 45 s at most for a
+// poll and 10 s for each request in it (platforms/guarded-fetch.js), at least
+// 15 s between the end of one poll and the start of the next whatever asks for
+// it, an error backoff that never goes below the interval, and a site's
+// Retry-After kept. A result that comes back after setUrl changed the URL is
+// thrown away. The status's nextPollAt says when the next poll runs.
+//
 // Config lives in ./config.json (gitignored; seeded from config.example.json on
 // first run). API keys may also come from env: CHALLONGE_API_KEY, STARTGG_API_KEY.
 //
@@ -37,12 +44,18 @@
 // for a file inside this folder: the path is checked as text before any file is
 // opened (see stubRefusal). Otherwise setUrl refuses it and a poll of one saved in
 // config.json fails, each with a fixed message that quotes no file. With the
-// variable, such a file can also hold its poll open: see stubHold.
+// variable, such a file can also hold its poll open (see stubHold), keep it held after
+// the poll is aborted so its result comes back late (also stubHold), and make its
+// poll fail as a rate-limited site would (see stubFailure).
 //
 // Run:  start-zipper.bat  ·  npm run sidecar
 // Env:  SB_WS_URL (default ws://127.0.0.1:8080/) · ZIPPER_GUARD_PORT (7496)
 //       ZIPPER_CONFIG (config file path override)
-//       ZIPPER_ALLOW_STUB=1 (tests only: turns on stub: URLs and the stub hold)
+//       ZIPPER_ALLOW_STUB=1 (tests only: turns on stub: URLs and, in a stub file, the
+//       test keys stubHoldFile, stubHoldIgnoresAbort and stubFail)
+//       ZIPPER_REQUEST_TIMEOUT_MS, ZIPPER_POLL_DEADLINE_MS, ZIPPER_MIN_POLL_GAP_MS
+//       (tests only: shorten the 10 s per request, the 45 s per poll and the 15 s
+//       between polls; each is clamped, so it can only shorten its limit)
 
 import { readFile, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
@@ -51,6 +64,7 @@ import { resolve, relative, isAbsolute, dirname, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import WebSocket from 'ws';
 import { detectPlatform } from './platforms/index.js';
+import { guardedFetch, statusError, parseRetryAfter, envLimit, seconds } from './platforms/guarded-fetch.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const CONFIG_PATH = process.env.ZIPPER_CONFIG || resolve(__dirname, 'config.json');
@@ -80,7 +94,23 @@ const LOGO_MAX = 500;
 const OVERLAY_BASE = 'http://127.0.0.1:7474/zipper-overlay/';
 
 const MIN_INTERVAL_MS = 15000;
-const MAX_BACKOFF_MS = 300000; // 5 min cap when the platform keeps erroring
+// 5 min cap on the error backoff, unless the interval is longer: the backoff never goes
+// below the interval (ZIP-13). It also caps a Retry-After, on the same terms.
+const MAX_BACKOFF_MS = 300000;
+// The whole of one poll: every request in it shares this deadline (a start.gg poll can
+// make up to eleven, each with its own 10 s in platforms/guarded-fetch.js). Past it the
+// poll is stopped and fails, with a fixed message in lastError.
+const POLL_DEADLINE_MS = 45000;
+// The least time from the END of one poll to the start of the next, whatever asks for
+// it (ZIP-13): a command inside it replies at once and gets its poll when it ends, so a
+// burst of commands costs one fetch. 15 s is MIN_INTERVAL_MS, the fastest cadence a
+// streamer can set, so no command can make the sidecar poll faster than that either. It
+// also keeps a start.gg poll (up to eleven requests) inside start.gg's 80 requests a
+// minute. Counted from the end, so a slow poll is never followed straight by another.
+const MIN_POLL_GAP_MS = 15000;
+// The tests shorten these two (and the 10 s per request) through ZIPPER_* settings.
+const pollDeadlineMs = envLimit('ZIPPER_POLL_DEADLINE_MS', POLL_DEADLINE_MS, 50);
+const minPollGapMs = envLimit('ZIPPER_MIN_POLL_GAP_MS', MIN_POLL_GAP_MS, 0);
 const MESSAGE_MAX_CHARS = 1000;
 const MESSAGE_MAX_LINES = 20;
 const WAITING_POLL_MS = 300000; // 5 min re-check while upcoming with no usable start time
@@ -131,6 +161,16 @@ let eventState = null; // last fetched tournament state (upcoming/in_progress/co
 let eventStartAt = null; // platform's advertised start time (ISO), when it has one
 let waitingUntil = null; // set while auto-scheduling sleeps for the start time
 let autoStopped = null; // 'completed' after an automatic stop, for the status line
+let urlGeneration = 0; // ZIP-02: bumped by every accepted setUrl; a poll keeps the one it began under
+let pollAgain = false; // a pollNow or start that arrived while a poll was in flight
+let pollAbort = null; // the AbortController of the poll in flight
+// The three times below are on the monotonic clock (monoNow), never the wall clock.
+let lastPollEndedAt = null; // when the last poll ended; the minimum gap runs from here
+let pollDueAt = null; // when the armed poll runs (the status's nextPollAt)
+let pollDueFor = null; // 'request' (a command asked for it) or 'regular'
+// Retry-After holds, by platform: no poll of that platform before the time kept for it.
+// A hold is the platform's, not the URL's, so a setUrl neither ends nor moves it.
+const retryHolds = new Map();
 
 let sbWs = null;
 let sbReconnectTimer = null;
@@ -252,109 +292,254 @@ function truthy(v) {
 }
 
 // ── Poll loop ─────────────────────────────────────────────────────────────────
+//
+// How polls are timed (ZIP-02, ZIP-06, ZIP-13):
+//   • One poll at a time, with pollDeadlineMs (45 s) in all. Its AbortSignal reaches
+//     every request, through the adapters to platforms/guarded-fetch.js, and the stub
+//     hold, so a poll that overruns stops as a whole and fails with a fixed message.
+//   • A poll's result belongs to the URL it began under. setUrl bumps urlGeneration and
+//     aborts the poll in flight; whatever that poll then brings back, result or failure,
+//     is thrown away (lastError, the error count and lastPollAt are left alone), and the
+//     new URL is polled instead.
+//   • No poll starts within minPollGapMs (15 s) of the end of the last one, whatever
+//     asks for it. A command inside the gap gets its status at once and its poll when
+//     the gap ends, so a burst of commands costs one fetch. A pollNow or start that
+//     arrives while a poll is in flight is kept, and runs after it.
+//   • The regular next poll comes from one function, nextRegularPoll: the interval, the
+//     error backoff (never below the interval), or auto-scheduling's wait for a start.
+//   • A Retry-After from the site (a 429 or 503) holds back every poll of that platform
+//     until it ends: capped at MAX_BACKOFF_MS, or at the interval when that is longer.
+//     No command cuts it short, pollNow and setUrl included: the hold is the platform's,
+//     so a URL on another platform is polled as usual, and a URL on the held platform
+//     (set again, set back, or set after the URL was cleared) still waits.
+//   • The status's nextPollAt is when the armed poll runs; null when none is armed.
+//   • All of this is timed on the monotonic clock, so a system clock set back (by hand,
+//     by a time sync, after sleep) cannot hold polls back by the size of the step. The
+//     wall clock is read only to show a time in the status and to read an event's start.
+
+const monoNow = () => performance.now();
+let wallOffset = Date.now() - performance.now();
+// A monotonic time as an ISO wall time, for the status. The offset between the two
+// clocks is taken again only when it has moved by more than a second (the wall clock
+// was set), so the same moment reads the same in every status.
+function wallTime(mono) {
+  const fresh = Date.now() - performance.now();
+  if (Math.abs(fresh - wallOffset) > 1000) wallOffset = fresh;
+  return new Date(Math.round(mono + wallOffset)).toISOString();
+}
+
+// The platform a URL polls on, as the status shows it: a stub: URL only when the gate
+// lets it through, so a refused one is never labelled "stub".
+function platformFor(url) {
+  if (!url) return null;
+  if (url.startsWith('stub:')) return stubRefusal(url) ? null : 'stub';
+  return detectPlatform(url)?.name ?? null;
+}
 
 function startPolling() {
   if (!config.tournamentUrl) { refuse(NO_URL_MESSAGE); return; }
   polling = true;
   autoStopped = null; // manual (re)start always gets one fresh poll
   persist();
-  schedulePoll(0);
+  requestPoll(true);
+  pushStatus();
 }
 
 function stopPolling() {
   polling = false;
   waitingUntil = null;
   autoStopped = null;
-  if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+  pollAgain = false;
+  disarmPoll();
   persist();
   pushStatus();
 }
 
-function schedulePoll(delayMs) {
+function disarmPoll() {
   if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+  pollDueAt = null;
+  pollDueFor = null;
+}
+
+// The end of a Retry-After hold on the platform of the URL now set, or 0.
+function holdUntil() {
+  const platform = platformFor(config.tournamentUrl);
+  const until = platform ? retryHolds.get(platform) : undefined;
+  if (until === undefined) return 0;
+  if (until <= monoNow()) { retryHolds.delete(platform); return 0; }
+  return until;
+}
+
+// The end of the minimum gap after the last poll, or 0 before the first.
+function gapEnd() {
+  return lastPollEndedAt === null ? 0 : lastPollEndedAt + minPollGapMs;
+}
+
+// Arms the poll timer for `at` (monotonic ms), moved past the minimum gap and any
+// Retry-After hold. Nothing is armed while polling is off or a poll is in flight: the
+// end of that poll arms the next one.
+function armPoll(at, why) {
+  if (!polling || pollInFlight) return;
+  const now = monoNow();
+  const when = Math.max(at, gapEnd(), holdUntil(), now);
+  if (pollTimer) clearTimeout(pollTimer);
+  pollDueAt = when;
+  pollDueFor = why;
+  pollTimer = setTimeout(() => { pollTimer = null; pollDueAt = null; pollDueFor = null; pollOnce(); }, when - now);
+}
+
+// A command asks for a poll: pollNow, start and setUrl (deliberate), and the option
+// commands, which re-poll to rebuild the payload. It runs as soon as the gap and any
+// Retry-After hold allow, skipping the interval and the error backoff; a poll already
+// armed for sooner stands. A deliberate request that arrives while a poll is in flight
+// is kept for after it. An option command's is not: the poll in flight builds its
+// payload with the new options. (Row 4.3 replaces the option re-poll with a rebuild from
+// the last result.) The caller sends the status.
+function requestPoll(deliberate) {
   if (!polling) return;
-  pollTimer = setTimeout(() => { pollTimer = null; pollOnce(); }, delayMs);
+  if (pollInFlight) { if (deliberate) pollAgain = true; return; }
+  waitingUntil = null; // a poll is coming before any start-time wait would end
+  const hold = holdUntil();
+  const when = Math.max(monoNow(), gapEnd(), hold);
+  // A poll already armed for no later stands, so a burst costs one poll. One armed before
+  // the hold of the URL now set was armed for another platform's URL (setUrl): it moves.
+  if (pollTimer && pollDueAt <= when && pollDueAt >= hold) { pollDueFor = 'request'; return; }
+  armPoll(when, 'request');
 }
 
 function nextDelay() {
   if (!consecutiveErrors) return config.pollIntervalMs;
-  // Exponential backoff on consecutive failures, capped at 5 minutes.
-  return Math.min(config.pollIntervalMs * 2 ** Math.min(consecutiveErrors, 5), MAX_BACKOFF_MS);
+  // Exponential backoff on consecutive failures, capped at 5 minutes, and never below
+  // the interval (ZIP-13): with a 10-minute or one-hour interval the cap alone would
+  // make a failing site be polled MORE often.
+  return Math.max(config.pollIntervalMs,
+    Math.min(config.pollIntervalMs * 2 ** Math.min(consecutiveErrors, 5), MAX_BACKOFF_MS));
 }
 
-// Auto-scheduling: spend API calls only while the event is actually running.
-// completed → stop polling outright (the final payload just pushed stays on
-// screen); upcoming → sleep until the platform's start time (slow re-check when
-// it has none), so polling resumes by itself once the event goes live. Errors
-// keep the normal backoff — a failed fetch says nothing about the event state.
-function nextDelayAuto() {
-  waitingUntil = null;
-  if (!config.autoSchedule || consecutiveErrors) return nextDelay();
-  if (eventState === 'completed') {
-    polling = false;
-    autoStopped = 'completed';
-    persist();
-    log('event completed — polling auto-stopped');
-    return 0; // unused: schedulePoll is a no-op once polling is false
-  }
-  if (eventState === 'upcoming') {
-    const untilStart = eventStartAt ? Date.parse(eventStartAt) - Date.now() : NaN;
+// The one next-delay function: when the next regular poll is due, counted from the end
+// of the last poll, and whether that is auto-scheduling's wait for the event's start.
+// Auto-scheduling spends API calls only while the event is running: upcoming → sleep
+// until the platform's start time (a slow re-check when it has none), so polling
+// resumes by itself once the event goes live. Errors keep the normal backoff, since a
+// failed fetch says nothing about the event state. (A completed event stops polling
+// outright: see afterPoll.)
+function nextRegularPoll() {
+  const now = monoNow();
+  const from = lastPollEndedAt ?? now;
+  if (config.autoSchedule && !consecutiveErrors && eventState === 'upcoming') {
+    // The advertised start (a wall time), moved onto the monotonic clock.
+    const startsAt = eventStartAt ? now + (Date.parse(eventStartAt) - Date.now()) : NaN;
+    const untilStart = startsAt - from;
     const hasStart = Number.isFinite(untilStart) && untilStart > 0;
     // MAX_WAIT_MS chunks a far-off start into cheap once-per-6h re-checks (also
     // catches organisers moving the date). No/passed start time → slow re-check.
     const wait = hasStart ? Math.min(untilStart, MAX_WAIT_MS) : Math.max(WAITING_POLL_MS, config.pollIntervalMs);
-    waitingUntil = new Date(Date.now() + wait).toISOString();
-    log(`event not started — ${hasStart ? `sleeping until ${waitingUntil} (start ${eventStartAt})` : `re-checking in ${Math.round(wait / 60000)} min (no start time from the platform)`}`);
-    return wait;
+    return { at: from + wait, waiting: true, hasStart };
   }
-  return nextDelay();
+  return { at: from + nextDelay(), waiting: false, hasStart: false };
+}
+
+// Arms the next regular poll: after a poll, and when setInterval, setOptions or
+// setAutoSchedule changes what it would be. A poll a command asked for stands.
+function scheduleRegular() {
+  if (!polling || pollInFlight || pollDueFor === 'request') return null;
+  const next = nextRegularPoll();
+  armPoll(next.at, 'regular');
+  waitingUntil = next.waiting && pollDueAt !== null ? wallTime(pollDueAt) : null;
+  return next;
+}
+
+// After a poll that was not thrown away: a completed event stops polling outright (the
+// final payload just pushed stays on screen); otherwise the next regular poll is armed.
+function afterPoll() {
+  waitingUntil = null;
+  if (config.autoSchedule && !consecutiveErrors && eventState === 'completed') {
+    polling = false;
+    autoStopped = 'completed';
+    persist();
+    log('event completed — polling auto-stopped');
+    return;
+  }
+  const next = scheduleRegular();
+  if (next?.waiting) {
+    log(`event not started — ${next.hasStart ? `sleeping until ${waitingUntil} (start ${eventStartAt})` : `re-checking in ${Math.round((pollDueAt - monoNow()) / 60000)} min (no start time from the platform)`}`);
+  }
 }
 
 async function pollOnce() {
-  // Emit a status snapshot the moment a poll is requested. The control page's
-  // liveness heartbeat expects a reply per command, and a slow fetch would
-  // otherwise delay it past the window; this also reflects "polling on" the
-  // instant Start is clicked instead of only after the first fetch returns.
-  pushStatus();
-  if (pollInFlight) return;
+  if (pollInFlight || !polling) return;
   pollInFlight = true;
+  // What this poll is for, taken before the fetch: a setUrl during it changes these.
+  const gen = urlGeneration;
+  const url = config.tournamentUrl;
+  const platform = platformFor(url);
+  const ac = new AbortController();
+  pollAbort = ac;
+  const deadline = setTimeout(() => ac.abort(new Error(`the poll took longer than ${seconds(pollDeadlineMs)} and was stopped`)), pollDeadlineMs);
+  let stale = false;
   try {
-    const result = await fetchCurrent();
-    consecutiveErrors = 0;
-    lastError = '';
-    lastPollAt = new Date().toISOString();
-    eventState = result.state || 'in_progress';
-    eventStartAt = strOrNull(result.startAt);
-    const payload = buildPayload(result);
-    lastPayload = payload;
-    const hash = hashPayload(payload);
-    if (hash !== lastHash) {
-      lastHash = hash;
-      pushUpdate(payload);
-      log(`pushed update (${payload.matches.length} matches, ${payload.standings.length} standings)`);
+    const result = await fetchCurrent(url, ac.signal);
+    stale = gen !== urlGeneration;
+    if (stale) {
+      log('a poll of the previous tournament URL came back after setUrl; its result is thrown away');
+    } else {
+      platformName = platform;
+      consecutiveErrors = 0;
+      lastError = '';
+      lastPollAt = new Date().toISOString();
+      if (platform) retryHolds.delete(platform);
+      eventState = result.state || 'in_progress';
+      eventStartAt = strOrNull(result.startAt);
+      const payload = buildPayload(result, url, platform);
+      lastPayload = payload;
+      const hash = hashPayload(payload);
+      if (hash !== lastHash) {
+        lastHash = hash;
+        pushUpdate(payload);
+        log(`pushed update (${payload.matches.length} matches, ${payload.standings.length} standings)`);
+      }
     }
   } catch (err) {
-    consecutiveErrors++;
-    lastError = err?.message || String(err);
-    lastPollAt = new Date().toISOString();
-    log(`poll failed (${consecutiveErrors}x): ${lastError}`);
+    stale = gen !== urlGeneration;
+    // A Retry-After is kept even from a poll that is thrown away: the site's limit is the
+    // platform's, not the URL's, and it applies whenever a URL on that platform is set.
+    if (Number.isFinite(err?.retryAfterMs) && platform) {
+      retryHolds.set(platform, monoNow() + Math.min(err.retryAfterMs, Math.max(MAX_BACKOFF_MS, config.pollIntervalMs)));
+    }
+    if (stale) {
+      log('a poll of the previous tournament URL failed after setUrl; its error is thrown away');
+    } else {
+      platformName = platform;
+      consecutiveErrors++;
+      lastError = err?.message || String(err);
+      lastPollAt = new Date().toISOString();
+      log(`poll failed (${consecutiveErrors}x): ${lastError}`);
+    }
   } finally {
+    clearTimeout(deadline);
+    pollAbort = null;
     pollInFlight = false;
-    const delay = nextDelayAuto(); // may auto-stop; must run before pushStatus
+    lastPollEndedAt = monoNow();
+    if (stale || pollAgain) {
+      // The new URL, or the poll a command asked for while this one ran: next, once the
+      // gap allows. Auto-scheduling decides after that poll.
+      pollAgain = false;
+      requestPoll(true);
+    } else {
+      afterPoll(); // may auto-stop; runs before the status so the status shows it
+    }
     pushStatus();
-    schedulePoll(delay);
   }
 }
 
-async function fetchCurrent() {
-  const url = config.tournamentUrl;
+// Fetches the normalized result for `url`, with the poll's AbortSignal.
+async function fetchCurrent(url, signal) {
   if (!url) throw new Error(NO_URL_MESSAGE); // ZIP-12: a plain message, never a TypeError
   // Test hook / offline styling: stub:<path> loads a normalized result file. The gate
   // runs first, so a URL from config.json that fails it reads nothing.
   if (url.startsWith('stub:')) {
     const refusal = stubRefusal(url);
     if (refusal) throw new Error(refusal);
-    platformName = 'stub';
     let raw;
     try { raw = await readFile(resolve(__dirname, url.slice(5)), 'utf-8'); }
     catch { throw new Error(STUB_UNREADABLE_MESSAGE); }
@@ -362,15 +547,30 @@ async function fetchCurrent() {
     let result = null;
     try { result = JSON.parse(raw); } catch {}
     if (!result || typeof result !== 'object' || Array.isArray(result)) throw new Error(STUB_NOT_OBJECT_MESSAGE);
-    await stubHold(result); // no abort signal yet; the poll's deadline is passed here later
+    await stubHold(result, signal); // the poll's deadline, or a setUrl, ends the wait (unless stubHoldIgnoresAbort)
+    stubFailure(result);
     return result;
   }
   const platform = detectPlatform(url);
   if (!platform) throw new Error(`Unrecognized tournament URL: ${url}`);
-  platformName = platform.name;
   const id = platform.parseId(url);
   if (!id) throw new Error(`${platform.displayName}: could not parse a tournament id from that URL`);
-  return platform.fetchTicker(id, config, url);
+  return platform.fetchTicker(id, config, url, signal);
+}
+
+// The other half of the slow source: a stub fixture may make its poll fail as a site
+// would, with an HTTP status and a Retry-After ("stubFail": { "status": 429,
+// "retryAfter": "120" }), so the tests reach the Retry-After hold through the real poll
+// loop. Only a stub: URL reaches this, so only with ZIPPER_ALLOW_STUB=1. The message is
+// fixed but for the status number, and quotes nothing else from the file.
+function stubFailure(result) {
+  const f = result.stubFail;
+  if (!f || typeof f !== 'object') return;
+  const status = clampInt(f.status, 400, 599, 500);
+  throw statusError(`stub: the test file answered as HTTP ${status}`, {
+    status,
+    retryAfterMs: status === 429 || status === 503 ? parseRetryAfter(f.retryAfter) : null,
+  });
 }
 
 // The stub: gate (decision 2). Returns null when the URL may be read, or the fixed
@@ -403,22 +603,38 @@ function stubRefusal(url) {
 // the fixture file only, never from the URL, and has no fixed length. Without the
 // variable this does nothing. An AbortSignal, when one is given, ends the wait at
 // once with the signal's reason, and the timer is cleared.
+// A fixture may also set "stubHoldIgnoresAbort": true. The wait then does not end when
+// the poll is aborted (by setUrl, or by the deadline), so the poll's result, or its
+// stubFail, comes back after setUrl has moved on, as an answer already on its way
+// would; that is how the tests reach pollOnce's check for a late result. It is bounded
+// all the same: a timer of pollDeadlineMs, started with the hold, ends the wait, failing
+// with the signal's reason. The poll's own deadline timer started earlier, so a held
+// poll still ends at its deadline, give or take the time the fixture took to read.
+// The key does nothing without a hold file, and so nothing without the variable.
 const STUB_HOLD_CHECK_MS = 50;
 function stubHold(result, signal) {
   const name = result && typeof result.stubHoldFile === 'string' ? result.stubHoldFile : '';
   if (!STUB_ALLOWED || !name) return Promise.resolve();
   const file = resolve(__dirname, name);
   if (!file.startsWith(__dirname + sep)) return Promise.resolve(); // only a hold file inside the repo folder counts
+  const ignoreAbort = result.stubHoldIgnoresAbort === true;
   return new Promise((done, fail) => {
     let timer = null;
+    let bound = null;
     let logged = false;
     const finish = (err) => {
       if (timer !== null) { clearTimeout(timer); timer = null; }
+      if (bound !== null) { clearTimeout(bound); bound = null; }
       if (signal) signal.removeEventListener('abort', onAbort);
       if (err) fail(err); else done();
     };
     const onAbort = () => finish(signal.reason ?? new Error('stub hold aborted'));
-    if (signal) {
+    if (ignoreAbort) {
+      bound = setTimeout(() => {
+        bound = null;
+        finish(signal?.reason ?? new Error('stub hold: the poll\'s deadline passed'));
+      }, pollDeadlineMs);
+    } else if (signal) {
       if (signal.aborted) { onAbort(); return; }
       signal.addEventListener('abort', onAbort, { once: true });
     }
@@ -433,8 +649,9 @@ function stubHold(result, signal) {
 }
 // ── stub hold: END ──
 
-// Normalize + sort + cap into the ticker:update wire payload (docs/PROTOCOL.md).
-function buildPayload(result) {
+// Normalize + sort + cap into the ticker:update wire payload (docs/PROTOCOL.md). The URL
+// and platform are the ones the poll was made for, never the ones set since (ZIP-02).
+function buildPayload(result, url, platform) {
   const rank = { completed: 0, in_progress: 1, upcoming: 2 };
   const standings = (Array.isArray(result.standings) ? result.standings : [])
     .slice()
@@ -468,8 +685,8 @@ function buildPayload(result) {
     type: 'ticker:update',
     tournament: {
       name: result.tournamentName || '',
-      platform: platformName,
-      url: config.tournamentUrl,
+      platform,
+      url,
       state: result.state || 'in_progress',
     },
     generatedAt: new Date().toISOString(),
@@ -589,14 +806,17 @@ function seCounterValue(entry) {
   return v != null && Number.isFinite(Number(v)) ? Number(v) : null;
 }
 
+// Through the fetch wrapper (ZIP-06), so a StreamElements that stops answering fails
+// this poll after 10 s, naming the host, instead of holding it for minutes. (The poller
+// still runs on setInterval; row 4.5 chains its polls with an in-flight guard.)
 async function pollSe(channel) {
-  const res = await fetch(`${SE_BASE}/kappa/v2/sessions/${channel}`, {
+  const res = await guardedFetch(`${SE_BASE}/kappa/v2/sessions/${channel}`, {
     headers: { Authorization: `Bearer ${config.streamElements.jwtToken}`, Accept: 'application/json' },
   });
   if (!res.ok) {
     throw new Error(`StreamElements ${res.status}${res.status === 401 ? ' — JWT invalid or expired' : ''}`);
   }
-  const j = await res.json();
+  const j = res.json();
   const data = j?.data || j || {};
   seLastPollAt = new Date().toISOString();
   seLastError = '';
@@ -698,6 +918,10 @@ function pushStatus() {
     url: config.tournamentUrl,
     platform: platformName,
     lastPollAt,
+    // When the next poll runs (ZIP-13): the interval, the backoff, a Retry-After or the
+    // minimum gap, whichever is latest; null while none is armed (polling off, or a poll
+    // in flight). Unlike auto.waitingUntil it does not mean the page should show WAITING.
+    nextPollAt: pollDueAt !== null ? wallTime(pollDueAt) : null,
     lastError,
     commandNotice,
     intervalMs: config.pollIntervalMs,
@@ -775,21 +999,27 @@ function dispatch(command, value) {
       const refusal = url && url.startsWith('stub:') ? stubRefusal(url) : null;
       if (refusal) { refuse(refusal); return; }
       config.tournamentUrl = url;
+      // ZIP-02: a poll in flight now belongs to the old URL. It is stopped, and whatever
+      // it brings back is thrown away; the new URL is polled once the gap allows.
+      urlGeneration++;
+      if (pollAbort) pollAbort.abort(new Error('the tournament URL changed'));
       lastHash = null;
-      platformName = config.tournamentUrl ? (detectPlatform(config.tournamentUrl)?.name
-        ?? (config.tournamentUrl.startsWith('stub:') ? 'stub' : null)) : null;
+      platformName = platformFor(config.tournamentUrl);
+      // A Retry-After hold is left as it is: it belongs to its platform (see holdUntil).
       lastError = '';
+      consecutiveErrors = 0; // the new URL does not inherit the old one's backoff
       eventState = null; // new tournament — forget the old one's state/schedule
       eventStartAt = null;
       autoStopped = null;
+      waitingUntil = null;
       if (!config.tournamentUrl) {
         // ZIP-12: with no URL there is nothing to poll, so clearing it stops polling.
         polling = false;
-        waitingUntil = null;
-        if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+        pollAgain = false;
+        disarmPoll();
       }
       persist();
-      if (polling) schedulePoll(0);
+      requestPoll(true); // nothing while polling is off
       pushStatus();
       return;
     }
@@ -798,12 +1028,16 @@ function dispatch(command, value) {
     case 'pollNow':
       if (!config.tournamentUrl) { refuse(NO_URL_MESSAGE); return; }
       if (!polling) { polling = true; autoStopped = null; persist(); }
-      schedulePoll(0);
+      // Once the gap and any Retry-After allow; the status says when (nextPollAt).
+      requestPoll(true);
+      pushStatus();
       return;
     case 'setInterval':
       config.pollIntervalMs = clampInt(value, MIN_INTERVAL_MS, 3600000, config.pollIntervalMs);
       persist();
-      if (polling) schedulePoll(config.pollIntervalMs);
+      // Through the one next-delay function, so a longer backoff or a Retry-After is not
+      // cut short.
+      scheduleRegular();
       pushStatus();
       return;
     case 'setCapsText':
@@ -812,7 +1046,8 @@ function dispatch(command, value) {
       persist();
       // Stopped (or message-only, with no tournament) still needs the new caps
       // on screen, so push rather than wait for a poll that may never come.
-      if (polling) schedulePoll(0); else { pushCurrent(); pushStatus(); }
+      if (polling) requestPoll(false); else pushCurrent();
+      pushStatus();
       return;
     case 'setCapsLogo': {
       const logo = checkLogo(value);
@@ -820,20 +1055,23 @@ function dispatch(command, value) {
       config.caps.logo = logo;
       lastHash = null;
       persist();
-      if (polling) schedulePoll(0); else { pushCurrent(); pushStatus(); }
+      if (polling) requestPoll(false); else pushCurrent();
+      pushStatus();
       return;
     }
     case 'setTopN':
       config.topN = clampInt(value, 0, 100, config.topN);
       lastHash = null;
       persist();
-      if (polling) schedulePoll(0); else pushStatus();
+      requestPoll(false);
+      pushStatus();
       return;
     case 'setMaxItems':
       config.maxItems = clampInt(value, 1, 100, config.maxItems);
       lastHash = null;
       persist();
-      if (polling) schedulePoll(0); else pushStatus();
+      requestPoll(false);
+      pushStatus();
       return;
     // Batched setters — the control page sends ONE of these per button so it
     // never fires a burst of DoActions (Streamer.bot bleeds arguments between
@@ -852,7 +1090,8 @@ function dispatch(command, value) {
       }
       lastHash = null; // caps travel in the update payload — force a re-push
       persist();
-      if (polling) schedulePoll(0); else { pushCurrent(); pushStatus(); }
+      if (polling) requestPoll(false); else pushCurrent();
+      pushStatus();
       return;
     }
     // Persistent message mode — batched (text + enabled in one command) for the
@@ -879,19 +1118,32 @@ function dispatch(command, value) {
       persist();
       // Turning it off cancels a pending wait-for-start sleep and resumes the
       // normal cadence; turning it on takes effect at the next poll.
-      if (polling && !config.autoSchedule) { waitingUntil = null; schedulePoll(nextDelay()); }
+      if (polling && !config.autoSchedule) { waitingUntil = null; scheduleRegular(); }
       pushStatus();
       return;
     case 'setOptions': {
+      // The control page sends all three on every Apply. Only a changed maxItems or topN
+      // needs the payload rebuilt, which takes a poll (row 4.3 replaces it with a rebuild
+      // from the last result); that re-poll is a request, as setMaxItems and setTopN make.
+      // Otherwise, a new interval alone or no change at all, it is a reschedule through
+      // the one next-delay function, so it cannot cut a longer error backoff or a
+      // Retry-After short (ZIP-13).
       const o = parseJson(value);
+      let rebuild = false;
       if (o && typeof o === 'object') {
         if (o.intervalMs !== undefined) config.pollIntervalMs = clampInt(o.intervalMs, MIN_INTERVAL_MS, 3600000, config.pollIntervalMs);
-        if (o.maxItems !== undefined) config.maxItems = clampInt(o.maxItems, 1, 100, config.maxItems);
-        if (o.topN !== undefined) config.topN = clampInt(o.topN, 0, 100, config.topN);
+        if (o.maxItems !== undefined) {
+          const n = clampInt(o.maxItems, 1, 100, config.maxItems);
+          if (n !== config.maxItems) { config.maxItems = n; rebuild = true; }
+        }
+        if (o.topN !== undefined) {
+          const n = clampInt(o.topN, 0, 100, config.topN);
+          if (n !== config.topN) { config.topN = n; rebuild = true; }
+        }
       }
-      lastHash = null;
       persist();
-      if (polling) schedulePoll(0); else pushStatus();
+      if (rebuild) { lastHash = null; requestPoll(false); } else scheduleRegular();
+      pushStatus();
       return;
     }
     case 'status': pushStatus(); return;

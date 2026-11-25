@@ -143,9 +143,14 @@ command trigger at the `Ticker Command` action and type
 keeps API calls to a minimum: start polling any time — before the event begins
 the sidecar just sleeps until the platform's advertised start time (re-checking
 every 5 minutes if there isn't one), and once the event completes it pushes the
-final results and stops polling by itself. The results stay on the strip.
-**Start polling** / **Poll now** always force a fresh poll regardless; from
-chat: `!ticker setAutoSchedule off`.
+final results and stops polling by itself. The results stay on the strip. To
+turn it off from chat: `!ticker setAutoSchedule off`. **Start polling** /
+**Poll now** get a fresh poll even before the start time or after that stop,
+but no poll comes sooner than 15 seconds after the last one (a click inside
+that gap is polled when it ends). When a site answers "too many requests" (or
+"unavailable") with a time to wait, Zipper waits that long before polling that
+site again, **Poll now** included, up to 5 minutes, or the poll interval if
+that is longer.
 
 ### 6. Persistent message (optional)
 

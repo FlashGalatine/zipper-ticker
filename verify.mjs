@@ -1,6 +1,11 @@
 // Zipper verify suite — no network, no Streamer.bot install, no browser.
 //   1. Platform normalizer tests against recorded fixtures (pure functions).
 //   2. Platform detection/parseId routing.
+//   2b. The fetch wrapper (platforms/guarded-fetch.js), in-process against a local
+//      server on an OS-assigned port: its timeout, size cap, Retry-After and error
+//      wording; each adapter's wiring to it (signal, 429, User-Agent) against a
+//      stand-in for fetch; and a static check that no bare fetch( is left in the
+//      sidecar or an adapter.
 //   3. Mock-SB E2E: the REAL panel-core.js runs in a browser shim against the
 //      mock server — Subscribe (lowercase), sync-on-connect replay, live push.
 //   4. The mock itself: its HTTP maps, DoAction replies in Streamer.bot's shape,
@@ -17,7 +22,14 @@
 //      and which commands it accepts: stub: URLs only with ZIPPER_ALLOW_STUB=1 and
 //      only inside the repo, the logo rule, the __status guard in any casing, and
 //      refusals reported in commandNotice.
-//   7. Milestone announcements: a real sidecar against a mock StreamElements.
+//   6h. The poll loop (ZIP-02, ZIP-06, ZIP-13): a URL changed mid-poll, a stale
+//      failure, a result, failure or 429 that comes back after setUrl (a hold that
+//      ignores the abort), the poll's deadline, the backoff, Retry-After, the minimum gap
+//      between polls, re-timing by setInterval, setOptions and setAutoSchedule, the
+//      next poll time in the status, and a wall clock set back (a sidecar with
+//      tools/clock-step-preload.cjs).
+//   7. Milestone announcements: a real sidecar against a mock StreamElements, and a
+//      StreamElements request that never answers.
 //   8. start-zipper.bat's Node version check (Windows only), with a stand-in node.
 //
 // Uses off-default ports (HTTP 7476 / WS 8082 / sidecar guards 7497, 7492 and 7487 /
@@ -30,7 +42,7 @@
 
 import { spawn, spawnSync } from 'node:child_process';
 import { readFile, writeFile, rm, mkdir } from 'node:fs/promises';
-import { existsSync, rmSync, mkdirSync, writeFileSync, readFileSync } from 'node:fs';
+import { existsSync, rmSync, mkdirSync, writeFileSync, readFileSync, readdirSync } from 'node:fs';
 import { resolve, dirname, join, sep, basename, win32 } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { connect } from 'node:net';
@@ -212,6 +224,314 @@ function testDetection() {
       p ? `${p.name}/${p.parseId(input)}` : 'no match');
   }
   check('all platforms expose fetchTicker', PLATFORMS.every((p) => typeof p.fetchTicker === 'function'));
+}
+
+// ── 2b. The fetch wrapper, in-process (ZIP-06), and no bare fetch( left ───────
+// Decision 9: the wrapper is tested in this process against a local node:http server
+// that never answers (or answers too much, or says "slow down"). The server listens on
+// a port the OS assigns, so it can clash with nothing. No tournament adapter is driven
+// end to end through the network here; their wiring to the wrapper is checked in this
+// process against a stand-in for fetch, and StreamElements end to end in section 7.
+
+async function testFetchWrapper() {
+  console.log('\n[2b] the fetch wrapper (platforms/guarded-fetch.js), in-process; no bare fetch( left');
+
+  // The static check: every request in the sidecar and the adapters goes through the
+  // wrapper. A call to fetch( anywhere else in those files fails it, line by line.
+  {
+    const files = ['zipper-sidecar.mjs', ...readdirSync(resolve(__dirname, 'platforms'))
+      .filter((f) => f.endsWith('.js') && f !== 'guarded-fetch.js').map((f) => `platforms/${f}`)];
+    const bare = [];
+    for (const f of files) {
+      readFileSync(resolve(__dirname, f), 'utf-8').split(/\r?\n/).forEach((line, i) => {
+        if (/\bfetch\s*\(/.test(line)) bare.push(`${f}:${i + 1}`);
+      });
+    }
+    check(`no bare fetch( in zipper-sidecar.mjs or platforms/*.js outside the wrapper (${files.length} files)`,
+      files.length >= 7 && bare.length === 0, bare.join(', '));
+    const uaOld = files.filter((f) => /Zipper\/0\.1/.test(readFileSync(resolve(__dirname, f), 'utf-8')));
+    check('no adapter sends the old fixed User-Agent "Zipper/0.1" (the wrapper module gives the package version)', uaOld.length === 0, uaOld.join(', '));
+    // The README's promise about a site's Retry-After gives the cap the sidecar applies:
+    // MAX_BACKOFF_MS, or the interval when that is longer. It once said "never before".
+    const sidecarSrc = readFileSync(resolve(__dirname, 'zipper-sidecar.mjs'), 'utf-8');
+    const capMs = Number((/const MAX_BACKOFF_MS = (\d+);/.exec(sidecarSrc) || [])[1]);
+    const readme = readFileSync(resolve(__dirname, 'README.md'), 'utf-8').replace(/\s+/g, ' ');
+    const said = (/[^.]*"too many requests"[^.]*\./.exec(readme) || [''])[0];
+    check('docs: the README\'s sentence on a site\'s "too many requests" wait names the cap the sidecar applies (MAX_BACKOFF_MS, 5 minutes, or the poll interval if that is longer)',
+      capMs === 300000 && /up to 5 minutes, or the poll interval if that is longer/.test(said) && !/never before/.test(said), JSON.stringify({ capMs, said }));
+  }
+
+  let mod = null;
+  try { mod = await import('./platforms/guarded-fetch.js'); }
+  catch (err) { check('the fetch wrapper module platforms/guarded-fetch.js loads', false, err?.message || String(err)); return; }
+  check('the fetch wrapper module platforms/guarded-fetch.js loads', typeof mod.guardedFetch === 'function'
+    && typeof mod.statusError === 'function' && typeof mod.parseRetryAfter === 'function' && Number.isFinite(mod.MAX_RESPONSE_BYTES),
+    Object.keys(mod).join(', '));
+  const { guardedFetch, statusError, parseRetryAfter, MAX_RESPONSE_BYTES: CAP } = mod;
+  const pkgVersion = JSON.parse(readFileSync(resolve(__dirname, 'package.json'), 'utf-8')).version;
+  check('the User-Agent strings carry the package version: "Zipper/<version>", and "Mozilla/5.0 (compatible; Zipper/<version>)" for the Challonge embed page',
+    mod.USER_AGENT === `Zipper/${pkgVersion}` && mod.BROWSER_USER_AGENT === `Mozilla/5.0 (compatible; Zipper/${pkgVersion})`,
+    JSON.stringify({ USER_AGENT: mod.USER_AGENT, BROWSER_USER_AGENT: mod.BROWSER_USER_AGENT }));
+
+  // The override of the 10 seconds, as the sidecar reads it: it can only shorten it.
+  const envBefore = process.env.ZIPPER_REQUEST_TIMEOUT_MS;
+  const setLimit = (v) => { if (v === undefined) delete process.env.ZIPPER_REQUEST_TIMEOUT_MS; else process.env.ZIPPER_REQUEST_TIMEOUT_MS = v; };
+  {
+    const got = [];
+    for (const [v, want] of [[undefined, 10000], ['999999', 10000], ['1', 50], ['abc', 10000], ['300', 300]]) {
+      setLimit(v);
+      const ms = mod.requestTimeoutMs();
+      if (ms !== want) got.push(`${v} → ${ms}, wanted ${want}`);
+    }
+    check('ZIPPER_REQUEST_TIMEOUT_MS is clamped to 50–10000 ms (a test can only shorten the 10 seconds); unset or not a number gives 10000',
+      got.length === 0, got.join('; '));
+    setLimit(undefined); // the checks below run on the 10 seconds unless they shorten it
+  }
+
+  const { createServer } = await import('node:http');
+  const sockets = new Set();
+  const held = [];
+  let neverHits = 0;
+  const server = createServer((req, res) => {
+    const path = new URL(req.url, 'http://x').pathname;
+    const stream = (status, bytes) => {
+      res.writeHead(status, { 'content-type': 'application/octet-stream' });
+      const chunk = Buffer.alloc(1 << 20, 0x61);
+      let sent = 0;
+      const pump = () => {
+        while (sent < bytes) {
+          const part = bytes - sent < chunk.length ? chunk.subarray(0, bytes - sent) : chunk;
+          sent += part.length;
+          if (!res.write(part)) { res.once('drain', pump); return; }
+        }
+        res.end();
+      };
+      pump();
+    };
+    switch (path) {
+      case '/never': neverHits++; held.push(res); return; // accepted, never answered
+      case '/trickle': { // headers at once, then a byte every 100 ms, for ever
+        res.writeHead(200, { 'content-type': 'text/plain' });
+        res.write('x');
+        const t = setInterval(() => { try { res.write('x'); } catch {} }, 100);
+        res.on('close', () => clearInterval(t));
+        return;
+      }
+      case '/big-length': res.writeHead(200, { 'content-length': String(CAP + 1) }); res.flushHeaders(); held.push(res); return; // the body never comes
+      case '/big-chunked': stream(200, CAP + 1); return;
+      case '/big-500': stream(500, CAP + 1); return;
+      case '/ok': res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify({ ok: true, ua: req.headers['user-agent'] ?? null })); return;
+      case '/429s': res.writeHead(429, { 'retry-after': '120' }); res.end('slow down'); return;
+      case '/429d': res.writeHead(429, { 'retry-after': new Date(Date.now() + 120000).toUTCString() }); res.end(); return;
+      case '/503s': res.writeHead(503, { 'retry-after': '7' }); res.end(); return;
+      default: res.writeHead(404); res.end();
+    }
+  });
+  server.on('connection', (s) => { sockets.add(s); s.on('close', () => sockets.delete(s)); });
+  await new Promise((res, rej) => { server.once('error', rej); server.listen(0, '127.0.0.1', res); });
+  const port = server.address().port;
+  const base = `http://127.0.0.1:${port}`;
+  const host = `127.0.0.1:${port}`;
+  // Runs one request and says how it ended and how long it took. The test's own bound
+  // ends the wait, so a request the wrapper fails to stop (its timer cleared too soon, a
+  // signal not joined) fails its own check with a line instead of hanging the suite:
+  // /trickle and /never never end by themselves.
+  const ATTEMPT_BOUND_MS = 8000;
+  const attempt = async (path, opts) => {
+    const t0 = Date.now();
+    let bound = null;
+    const outcome = await Promise.race([
+      guardedFetch(`${base}${path}`, opts).then((r) => ({ r }), (err) => ({ err })),
+      new Promise((res) => { bound = setTimeout(() => res({ err: new Error(`test: the request neither ended nor failed within ${ATTEMPT_BOUND_MS / 1000} s`) }), ATTEMPT_BOUND_MS); }),
+    ]);
+    clearTimeout(bound);
+    return { ...outcome, ms: Date.now() - t0 };
+  };
+
+  try {
+    {
+      const { r, err } = await attempt('/ok', { headers: { 'User-Agent': mod.USER_AGENT, Accept: 'application/json' } });
+      let body = null; try { body = r?.json(); } catch {}
+      check('wrapper: an ordinary answer comes back with its status, its text and json(), and the headers given (the User-Agent here)',
+        !err && r?.status === 200 && r.ok === true && typeof r.text === 'string' && body?.ok === true && body?.ua === mod.USER_AGENT,
+        err ? err.message : JSON.stringify({ status: r?.status, body }));
+    }
+
+    setLimit('300');
+    {
+      const { err, ms } = await attempt('/never?api_key=SECRET-CANARY&x=1');
+      const msg = err?.message || '';
+      check('wrapper: a server that never answers times out at the limit (shortened to 0.3 s by its override); the message names the host and the limit, never the path or the query',
+        msg === `${host} took longer than 0.3 s to answer` && ms >= 250 && ms < 3000 && !/SECRET|api_key|never|\?/.test(msg),
+        JSON.stringify({ message: msg, ms }));
+    }
+    {
+      const { err, ms } = await attempt('/trickle');
+      check('wrapper: the timer stays armed until the body has been read, so a body that trickles in times out the same way',
+        err?.message === `${host} took longer than 0.3 s to answer` && ms < 3000, JSON.stringify({ message: err?.message, ms }));
+    }
+    setLimit(undefined);
+
+    const capText = `${host} sent more than ${CAP / 1048576} MB`;
+    {
+      const { err, ms } = await attempt('/big-length');
+      check(`wrapper: a Content-Length over the cap (${CAP} bytes) fails at once, without waiting for the body; the message names the host and the limit`,
+        err?.message === capText && ms < 3000, JSON.stringify({ message: err?.message, ms }));
+    }
+    {
+      const { err } = await attempt('/big-chunked');
+      check('wrapper: a body with no length that runs past the cap fails the same way', err?.message === capText, JSON.stringify({ message: err?.message }));
+    }
+    {
+      const { r, err } = await attempt('/big-500');
+      check('wrapper: an error answer is returned with its status (the adapter words the error); a body over the cap is cut at the cap rather than failing',
+        !err && r?.status === 500 && r.ok === false && r.text.length === CAP, err ? err.message : JSON.stringify({ status: r?.status, length: r?.text?.length }));
+    }
+
+    {
+      const s = await attempt('/429s');
+      const d = await attempt('/429d');
+      const u = await attempt('/503s');
+      const e = s.r && statusError('Example 429: slow down', s.r);
+      check('wrapper: a 429 with Retry-After in seconds gives retryAfterMs 120000; as an HTTP date about the same; a 503\'s Retry-After is read too',
+        s.r?.status === 429 && s.r.retryAfterMs === 120000 && d.r?.status === 429 && d.r.retryAfterMs > 115000 && d.r.retryAfterMs <= 120000
+          && u.r?.status === 503 && u.r.retryAfterMs === 7000,
+        JSON.stringify({ seconds: s.r?.retryAfterMs ?? s.err?.message, date: d.r?.retryAfterMs ?? d.err?.message, s503: u.r?.retryAfterMs ?? u.err?.message }));
+      check('wrapper: statusError puts the status code and the Retry-After on the error an adapter throws, under the adapter\'s own message',
+        e instanceof Error && e.message === 'Example 429: slow down' && e.status === 429 && e.retryAfterMs === 120000,
+        JSON.stringify({ message: e?.message, status: e?.status, retryAfterMs: e?.retryAfterMs }));
+      const now = Date.parse('2026-01-01T00:00:00Z');
+      const parsed = [['120', 120000], ['0', 0], ['Thu, 01 Jan 2026 00:02:00 GMT', 120000], ['Wed, 31 Dec 2025 23:00:00 GMT', 0], ['', null], ['soon', null], [null, null]]
+        .map(([v, want]) => [v, want, parseRetryAfter(v, now)]).filter(([, want, got]) => got !== want);
+      check('parseRetryAfter: seconds, an HTTP date (a past one gives 0), and nothing usable gives null', parsed.length === 0, JSON.stringify(parsed));
+    }
+
+    {
+      // The poll's own signal: the deadline aborts a request with its reason, and a
+      // signal that has already fired sends no request at all.
+      const ac = new AbortController();
+      const reason = new Error('the poll took longer than 45 s and was stopped');
+      setTimeout(() => ac.abort(reason), 150);
+      const { err, ms } = await attempt('/never', { signal: ac.signal });
+      check('wrapper: the poll\'s signal ends a request at once with the signal\'s reason, prefixed with the host',
+        err?.message === `${host}: the poll took longer than 45 s and was stopped` && ms < 3000, JSON.stringify({ message: err?.message, ms }));
+      const hitsBefore = neverHits;
+      const gone = new AbortController();
+      gone.abort(reason);
+      const early = await attempt('/never', { signal: gone.signal });
+      await sleep(100);
+      check('wrapper: a signal that has already fired ends the call at once and sends no request',
+        early.err?.message === `${host}: the poll took longer than 45 s and was stopped` && neverHits === hitsBefore,
+        JSON.stringify({ message: early.err?.message, requests: neverHits - hitsBefore }));
+    }
+
+    {
+      // Node's own error here says only "Invalid URL", so the message is pinned: the check
+      // must see the wrapper's words, not merely the absence of the key.
+      let bad = null;
+      try { await guardedFetch('not a url?api_key=SECRET-CANARY'); } catch (e) { bad = e; }
+      check('wrapper: an address that cannot be parsed is refused with its fixed message ("a request address could not be read"), which does not quote it',
+        bad?.message === 'a request address could not be read', bad ? bad.message : 'no error');
+    }
+
+    {
+      // A request that cannot be made at all: a port nothing listens on (taken from the OS
+      // and closed again). undici says only "fetch failed"; the wrapper names the host and
+      // the system's code, and never the path or the query.
+      const { createServer: createNetServer } = await import('node:net');
+      const closedPort = await new Promise((res, rej) => {
+        const s = createNetServer();
+        s.once('error', rej);
+        s.listen(0, '127.0.0.1', () => { const p = s.address().port; s.close(() => res(p)); });
+      });
+      let e = null;
+      try { await guardedFetch(`http://127.0.0.1:${closedPort}/never?api_key=SECRET-CANARY`); } catch (x) { e = x; }
+      check('wrapper: a connection refused fails with the host and the system\'s code ("<host>: the request failed (ECONNREFUSED)"), not undici\'s bare "fetch failed", and never the path or the query',
+        e?.message === `127.0.0.1:${closedPort}: the request failed (ECONNREFUSED)`, JSON.stringify({ message: e?.message }));
+    }
+
+    {
+      // A header value the request cannot carry: undici refuses it before connecting, with
+      // a message that quotes the whole value. A start.gg key or a StreamElements token
+      // pasted with a line break inside would reach lastError that way.
+      const token = 'TOKEN-CANARY-4321';
+      const { err } = await attempt('/ok', { headers: { Authorization: `Bearer abc\n${token}` } });
+      check('wrapper: a header the request cannot carry (a line break inside a key) fails with the host only; the header\'s value, and the key in it, are never quoted',
+        err?.message === `${host}: the request failed` && !err.message.includes(token), JSON.stringify({ message: err?.message }));
+    }
+  } finally {
+    setLimit(envBefore);
+    for (const r of held) { try { r.destroy(); } catch {} }
+    for (const s of sockets) { try { s.destroy(); } catch {} }
+    await new Promise((r) => server.close(r));
+  }
+
+  // The adapters' wiring, in this process with no network and no base-URL override
+  // (decision 9): for these calls only, fetch itself is replaced by a stand-in that
+  // records each request and answers it, so each adapter's own request path runs through
+  // the wrapper. Each must pass the poll's signal to its request (an abort ends the call
+  // at once, with the host and the signal's reason), throw a 429 with its status and
+  // Retry-After (statusError), and send its User-Agent.
+  {
+    const byName = Object.fromEntries(PLATFORMS.map((p) => [p.name, p]));
+    const realFetch = globalThis.fetch;
+    const limitBefore = process.env.ZIPPER_REQUEST_TIMEOUT_MS;
+    let mode = '429';
+    const seen = [];
+    globalThis.fetch = (url, init = {}) => {
+      seen.push({ host: new URL(String(url)).host, headers: { ...(init.headers || {}) } });
+      if (mode === '429') return Promise.resolve(new Response('slow down', { status: 429, headers: { 'retry-after': '120' } }));
+      // 'hang': no answer until the request's own signal (the wrapper's) aborts.
+      return new Promise((_, rej) => {
+        const s = init.signal;
+        const fail = () => rej(Object.assign(new Error('This operation was aborted'), { name: 'AbortError' }));
+        if (!s) return;
+        if (s.aborted) fail(); else s.addEventListener('abort', fail, { once: true });
+      });
+    };
+    // An adapter that does not pass the poll's signal leaves its request to end at the
+    // wrapper's own limit, shortened here so that shows as a timeout message, quickly.
+    process.env.ZIPPER_REQUEST_TIMEOUT_MS = '1500';
+    const SG_URL = 'https://www.start.gg/tournament/sol9/event/sf6-singles';
+    const cases = [
+      // [label, platform, id, config, original URL, host, User-Agent (undefined: not checked)]
+      ['start.gg (public proxy)', 'startgg', 'sol9/sf6-singles', { startggApiKey: null }, SG_URL, 'www.start.gg', mod.USER_AGENT],
+      ['start.gg (API key)', 'startgg', 'sol9/sf6-singles', { startggApiKey: 'FAKE-STARTGG-KEY' }, SG_URL, 'api.start.gg', mod.USER_AGENT],
+      ['Challonge (API key)', 'challonge', 'blko42', { challongeApiKey: 'FAKE-CHALLONGE-KEY' }, 'https://challonge.com/blko42', 'api.challonge.com', undefined],
+      ['Challonge (embed page)', 'challonge', 'blko42', {}, 'https://challonge.com/blko42', 'challonge.com', mod.BROWSER_USER_AGENT],
+      ['Matcherino', 'matcherino', '424242', {}, 'https://matcherino.com/tournaments/424242', 'api.matcherino.com', mod.USER_AGENT],
+    ];
+    const wrong = [];
+    try {
+      for (const [label, name, id, cfg, url, wantHost, wantUa] of cases) {
+        mode = '429';
+        seen.length = 0;
+        let e429 = null;
+        try { await byName[name].fetchTicker(id, cfg, url, new AbortController().signal); } catch (e) { e429 = e; }
+        if (!(e429?.status === 429 && e429.retryAfterMs === 120000)) {
+          wrong.push(`${label}: a 429 threw ${JSON.stringify({ message: e429?.message, status: e429?.status, retryAfterMs: e429?.retryAfterMs })}`);
+        }
+        if (seen.length !== 1 || seen[0].host !== wantHost) wrong.push(`${label}: requests to ${JSON.stringify(seen.map((s) => s.host))}, wanted one to ${wantHost}`);
+        else if (wantUa !== undefined && seen[0].headers['User-Agent'] !== wantUa) wrong.push(`${label}: User-Agent ${JSON.stringify(seen[0].headers['User-Agent'])}, wanted ${JSON.stringify(wantUa)}`);
+
+        mode = 'hang';
+        const ac = new AbortController();
+        const t0 = Date.now();
+        setTimeout(() => ac.abort(new Error('the poll took longer than 45 s and was stopped')), 50);
+        let eAbort = null;
+        try { await byName[name].fetchTicker(id, cfg, url, ac.signal); } catch (e) { eAbort = e; }
+        const ms = Date.now() - t0;
+        if (!(eAbort?.message === `${wantHost}: the poll took longer than 45 s and was stopped` && ms < 1000)) {
+          wrong.push(`${label}: an abort of the poll's signal gave ${JSON.stringify({ message: eAbort?.message, ms })}`);
+        }
+      }
+    } finally {
+      globalThis.fetch = realFetch;
+      if (limitBefore === undefined) delete process.env.ZIPPER_REQUEST_TIMEOUT_MS; else process.env.ZIPPER_REQUEST_TIMEOUT_MS = limitBefore;
+    }
+    check('adapters, in-process with a stand-in for fetch (no network): start.gg and Challonge (both paths each) and Matcherino pass the poll\'s signal to their request (an abort ends it at once, with the host and the reason), throw a 429 with its status and Retry-After, and send their User-Agent',
+      wrong.length === 0, wrong.join('; '));
+  }
 }
 
 // ── Mock server helpers ───────────────────────────────────────────────────────
@@ -633,14 +953,18 @@ const sidecars = [];
 // Starts a test sidecar with ZIPPER_ALLOW_STUB=1, or with no ZIPPER_ALLOW_STUB at all
 // when allowStub is false (removed in any casing, since Windows matches environment
 // names without regard to case, so a value in the developer's shell cannot turn it on).
+// The poll loop's three limit overrides are removed the same way, so only the values a
+// test passes apply.
 // If it exits before the suite stops it, the run fails at once with a line, and its
 // stdout and stderr are printed.
-function startSidecar(label, env, { allowStub = true } = {}) {
+// nodeArgs go before the script (section 6h preloads tools/clock-step-preload.cjs).
+const SHELL_ENV_DROPPED = ['ZIPPER_ALLOW_STUB', 'ZIPPER_REQUEST_TIMEOUT_MS', 'ZIPPER_POLL_DEADLINE_MS', 'ZIPPER_MIN_POLL_GAP_MS', 'ZIPPER_TEST_CLOCK_STEP_FILE'];
+function startSidecar(label, env, { allowStub = true, nodeArgs = [] } = {}) {
   const sc = { label, out: '', err: '', stopping: false, exited: false, code: null };
   const base = { ...process.env };
-  for (const k of Object.keys(base)) if (k.toUpperCase() === 'ZIPPER_ALLOW_STUB') delete base[k];
+  for (const k of Object.keys(base)) if (SHELL_ENV_DROPPED.includes(k.toUpperCase())) delete base[k];
   if (allowStub) base.ZIPPER_ALLOW_STUB = '1';
-  sc.proc = track(spawn(process.execPath, [resolve(__dirname, 'zipper-sidecar.mjs')], {
+  sc.proc = track(spawn(process.execPath, [...nodeArgs, resolve(__dirname, 'zipper-sidecar.mjs')], {
     env: { ...base, SB_WS_URL: WS_URL, ...env },
     stdio: ['ignore', 'pipe', 'pipe'],
   }));
@@ -704,7 +1028,10 @@ async function testSidecar() {
   }), 'utf-8');
 
   const client = await busClient();
-  const sc = startSidecar('test sidecar [6]', { ZIPPER_CONFIG: cfgPath, ZIPPER_GUARD_PORT: String(GUARD_PORT) });
+  // The minimum gap between polls is shortened for this sidecar (its override), so the
+  // checks below that send a command and wait a few seconds for the poll it starts keep
+  // their timing. Section 6h checks the gap itself.
+  const sc = startSidecar('test sidecar [6]', { ZIPPER_CONFIG: cfgPath, ZIPPER_GUARD_PORT: String(GUARD_PORT), ZIPPER_MIN_POLL_GAP_MS: '200' });
   const since = sinceOn(client, sc);
   const mark = () => client.events.length;
   const cmd = (command, value) => client.ws.send(JSON.stringify({
@@ -955,6 +1282,7 @@ async function testSidecar() {
   await sc.stop();
   await testConfigRanges(client);
   await testStubAtTheRead(client);
+  await testPollLoop(client);
 
   client.ws.close();
   await rm(cfgPath, { force: true });
@@ -973,17 +1301,27 @@ async function testStubHold(client, sc, since, mark, cmd) {
   if (block) {
     const env = (exists) => {
       const timers = new Map();
+      const delays = new Map();
       let seq = 0;
       const e = { calls: 0, logs: [] };
       e.existsSync = (p) => { e.calls++; return exists(p); };
-      e.setTimeout = (fn) => { const id = ++seq; timers.set(id, fn); return id; };
-      e.clearTimeout = (id) => { timers.delete(id); };
-      e.fire = () => { const first = timers.entries().next().value; if (first) { timers.delete(first[0]); first[1](); } };
+      e.setTimeout = (fn, ms) => { const id = ++seq; timers.set(id, fn); delays.set(id, ms); return id; };
+      e.clearTimeout = (id) => { timers.delete(id); delays.delete(id); };
+      e.fire = () => { const first = timers.entries().next().value; if (first) { timers.delete(first[0]); delays.delete(first[0]); first[1](); } };
+      // Fires the first pending timer set for `ms`; false when there is none.
+      e.fireAfter = (ms) => {
+        for (const [id, fn] of timers) if (delays.get(id) === ms) { timers.delete(id); delays.delete(id); fn(); return true; }
+        return false;
+      };
       e.pending = () => timers.size;
+      e.delays = () => [...timers.keys()].map((id) => delays.get(id));
       return e;
     };
-    const make = (allowed, e) => new Function('resolve', 'sep', 'existsSync', '__dirname', 'STUB_ALLOWED', 'log', 'setTimeout', 'clearTimeout',
-      `${block}\nreturn stubHold;`)(resolve, sep, e.existsSync, __dirname, allowed, (m) => e.logs.push(m), e.setTimeout, e.clearTimeout);
+    // The poll's deadline as the block sees it. Not the 50 ms of a file check, so the two
+    // timers can be told apart by their delays.
+    const HOLD_DEADLINE_MS = 4500;
+    const make = (allowed, e) => new Function('resolve', 'sep', 'existsSync', '__dirname', 'STUB_ALLOWED', 'log', 'setTimeout', 'clearTimeout', 'pollDeadlineMs',
+      `${block}\nreturn stubHold;`)(resolve, sep, e.existsSync, __dirname, allowed, (m) => e.logs.push(m), e.setTimeout, e.clearTimeout, HOLD_DEADLINE_MS);
     const state = (p) => { const s = { done: false, err: null }; p.then(() => { s.done = true; }, (err) => { s.err = err; }); return s; };
     const turn = () => new Promise((r) => setImmediate(r));
     const held = { stubHoldFile: `${TMP_REL}/hold-x` };
@@ -1032,6 +1370,59 @@ async function testStubHold(client, sc, since, mark, cmd) {
       await turn();
       check('stub hold: a fixture with no hold file, or one whose hold file is not inside the repo folder, is not held (no file check)',
         none.done && outside.done && e.calls === 0, JSON.stringify({ none, outside, calls: e.calls }));
+    }
+
+    // "stubHoldIgnoresAbort": true. The hold goes on when the poll is aborted, so a poll's
+    // result can come back after setUrl has moved on (section 6h); it is still bounded.
+    const ignoring = { ...held, stubHoldIgnoresAbort: true };
+    const LOOK_MS = 50; // STUB_HOLD_CHECK_MS, the file check's own timer
+    {
+      const e = env(() => true);
+      const s = state(make(false, e)(ignoring, new AbortController().signal));
+      await turn();
+      check('stubHoldIgnoresAbort: without ZIPPER_ALLOW_STUB=1 it does nothing either (no file check, no wait, no timer)',
+        s.done && e.calls === 0 && e.pending() === 0, JSON.stringify({ ...s, calls: e.calls, pending: e.pending() }));
+    }
+    {
+      let there = true;
+      const e = env(() => there);
+      const ac = new AbortController();
+      const s = state(make(true, e)(ignoring, ac.signal));
+      await turn();
+      ac.abort(new Error('the tournament URL changed'));
+      await turn();
+      const afterAbort = !s.done && !s.err && e.delays().includes(LOOK_MS);
+      e.fireAfter(LOOK_MS); await turn();
+      const stillWaiting = !s.done && !s.err && e.delays().includes(LOOK_MS);
+      there = false;
+      e.fireAfter(LOOK_MS); await turn();
+      check('stubHoldIgnoresAbort: with the variable an abort does not end the wait; the hold goes on while its file exists, and once the file is gone the poll goes on (its result comes back late), with no timer left',
+        afterAbort && stillWaiting && s.done && !s.err && e.pending() === 0,
+        JSON.stringify({ afterAbort, stillWaiting, done: s.done, err: s.err?.message ?? null, pending: e.delays() }));
+    }
+    {
+      const e = env(() => true);
+      const ac = new AbortController();
+      const s = state(make(true, e)(ignoring, ac.signal));
+      await turn();
+      const bounded = e.delays().includes(HOLD_DEADLINE_MS);
+      ac.abort(new Error('the tournament URL changed'));
+      await turn();
+      const fired = e.fireAfter(HOLD_DEADLINE_MS);
+      await turn();
+      check('stubHoldIgnoresAbort: bounded: from the start of the hold a timer of the poll\'s deadline runs, and a hold file that is never removed ends there, failing with the signal\'s reason, with no timer left',
+        bounded && fired && !s.done && s.err?.message === 'the tournament URL changed' && e.pending() === 0,
+        JSON.stringify({ bounded, fired, done: s.done, err: s.err?.message ?? null, pending: e.delays() }));
+    }
+    {
+      const e = env(() => true);
+      const ac = new AbortController();
+      const s = state(make(true, e)({ ...held, stubHoldIgnoresAbort: 'yes' }, ac.signal));
+      await turn();
+      ac.abort(new Error('deadline'));
+      await turn();
+      check('stubHoldIgnoresAbort: only the JSON value true turns it on ("yes" does not: the abort ends the wait at once)',
+        s.err?.message === 'deadline' && e.pending() === 0, JSON.stringify({ err: s.err?.message ?? null, pending: e.pending() }));
     }
   }
 
@@ -1232,6 +1623,8 @@ const MSG = {
   stubNotObject: 'stub: the test file is not a JSON object',
   logo: 'Logo not changed: use an http(s) URL or a path on the overlay\'s server, such as /zipper-overlay/assets/logo.png',
   noUrl: 'No tournament URL set',
+  // A stub fixture's stubFail (section 6h): a poll that fails as a site answering 429 would.
+  stub429: 'stub: the test file answered as HTTP 429',
 };
 // An in-progress fixture inside the repo, which every sidecar here may read.
 const SAFE_STUB = 'stub:platforms/fixtures/stub-result.json';
@@ -1725,6 +2118,655 @@ async function testStubAtTheRead(client) {
   }
 }
 
+// ── 6h. The poll loop (ZIP-02, ZIP-06, ZIP-13) ──────────────────────────────
+// Its own sidecar, with the poll's deadline shortened to 4 s and the minimum gap
+// between polls to 1.5 s by their overrides. The slow source is the stub hold, and a
+// stub fixture's stubFail makes a poll fail as a rate-limited site would. A fixture's
+// stubHoldIgnoresAbort keeps its hold going when setUrl aborts the poll, so the poll's
+// result or failure comes back after setUrl has moved on (a late result). A site's
+// Retry-After holds its platform back whatever URL is set, for as long as the sidecar
+// runs, so the checks that need a fresh one start the sidecar again (the hold lives in
+// memory only). The last one runs with a preload that sets its wall clock back.
+
+const POLL_LOOP_DEADLINE_MS = 4000;
+const POLL_LOOP_GAP_MS = 1500;
+// How long a command's own status may take, where a check must tell it apart from the
+// status that closes a poll.
+const REPLY_MS = 1000;
+// How far the clock-step sidecar's wall clock is set (back an hour).
+const CLOCK_STEP_MS = -3600000;
+
+async function testPollLoop(client) {
+  console.log('\n[6h] the poll loop: a URL changed mid-poll, a stale failure, a late result, the deadline, the minimum gap, re-timing, the backoff, Retry-After, a clock set back');
+  const statusOf = (d) => (isStatus(d) ? parseStatus(d) : null);
+  const T = (name) => `stub:${TMP_REL}/${name}`;
+  const fixture = (name, body) => writeFile(join(TMP_DIR, name), typeof body === 'string' ? body : JSON.stringify(body), 'utf-8');
+  const holdFor = (name) => writeFile(join(TMP_DIR, name), 'hold', 'utf-8');
+  const release = (name) => rm(join(TMP_DIR, name), { force: true });
+  const due = (s) => (s && s.nextPollAt && s.lastPollAt ? Date.parse(s.nextPollAt) - Date.parse(s.lastPollAt) : NaN);
+  const cfgPath = join(TMP_DIR, 'config-poll-loop.json');
+  const stepFile = join(TMP_DIR, 'clock-step');
+  // The first poll after a start fails (Round.one is recognised but not implemented, so
+  // its adapter throws without any network call): the status must still name the platform.
+  const roundOne = 'https://round.one/tournament/zipper-verify';
+  await writeFile(cfgPath, JSON.stringify({ tournamentUrl: roundOne, autoStart: true, autoSchedule: true, pollIntervalMs: 15000, caps: { text: '', logo: '' } }), 'utf-8');
+  const env = {
+    ZIPPER_CONFIG: cfgPath, ZIPPER_GUARD_PORT: String(GUARD_PORT),
+    ZIPPER_POLL_DEADLINE_MS: String(POLL_LOOP_DEADLINE_MS), ZIPPER_MIN_POLL_GAP_MS: String(POLL_LOOP_GAP_MS),
+  };
+  const at0 = client.events.length;
+  let runs = 1;
+  let sc = startSidecar('poll-loop sidecar [6h]', env);
+  let since = sinceOn(client, sc);
+  // Stops this sidecar and starts another on the same config file, so no Retry-After hold
+  // is left. Polling was stopped and saved as off, so the new one waits to be told.
+  // Resolves with the status it sends once it has connected.
+  const restart = async (label = `poll-loop sidecar [6h] #${++runs}`, extraEnv = {}, opts = {}) => {
+    await sc.stop();
+    const at = client.events.length;
+    sc = startSidecar(label, { ...env, ...extraEnv }, opts);
+    since = sinceOn(client, sc);
+    return statusOf(await since(at, isStatus, 8000));
+  };
+  const mark = () => client.events.length;
+  const cmd = (command, value) => client.ws.send(JSON.stringify({
+    request: 'DoAction', id: 'p', action: { name: 'Ticker Command' }, args: { command, value: value ?? '' },
+  }));
+  // The status that closes the next poll: one with a lastPollAt other than `before`.
+  const closed = (at, before, pred = () => true, timeoutMs = 6000) =>
+    since(at, (d) => !!statusOf(d)?.lastPollAt && statusOf(d).lastPollAt !== before && pred(statusOf(d)), timeoutMs).then(statusOf);
+  // How many polls closed among the statuses from `at` on, besides the one at `before`.
+  const pollsSince = (at, before) => new Set(client.events.slice(at).filter(isStatus).map(parseStatus).map((s) => s.lastPollAt).filter((t) => t && t !== before)).size;
+  const stopNow = async () => { const at = mark(); cmd('stop'); return statusOf(await since(at, (d) => statusOf(d)?.polling === false)); };
+  const holdLogged = (name, outAt) => waitFor(() => sc.out.slice(outAt).includes(`stub: holding the poll while ${TMP_REL}/${name} exists`), 6000);
+
+  try {
+    {
+      const first = statusOf(await since(at0, (d) => !!statusOf(d)?.lastPollAt, 6000));
+      check('a first poll after a start that fails still shows its platform in the status (platformName is set on a failure too)',
+        first?.platform === 'roundone' && /Round\.one/.test(first?.lastError || ''), JSON.stringify({ platform: first?.platform, lastError: first?.lastError }));
+      await stopNow();
+    }
+
+    // ZIP-02: setUrl to B while a poll of A (completed) is in flight.
+    {
+      await fixture('old.json', { tournamentName: 'Old Cup', state: 'completed', stubHoldFile: `${TMP_REL}/hold-old`,
+        matches: [{ id: 'o1', round: 'Grand Final', state: 'completed', p1: { name: 'Flash', score: 3 }, p2: { name: 'Rival', score: 0 }, winner: 1, order: 1 }],
+        standings: [{ placement: 1, name: 'Flash' }, { placement: 2, name: 'Rival' }] });
+      await fixture('new.json', { tournamentName: 'New Cup', state: 'in_progress', standings: [],
+        matches: [{ id: 'n1', round: 'Round 1', state: 'in_progress', p1: { name: 'Ann', score: 1 }, p2: { name: 'Bo', score: 0 }, winner: 0, order: 1 },
+          { id: 'n2', round: 'Round 1', state: 'upcoming', p1: { name: 'Cy', score: null }, p2: { name: 'Di', score: null }, winner: 0, order: 2 }] });
+      await holdFor('hold-old');
+      let at = mark();
+      cmd('setUrl', T('old.json'));
+      await since(at, (d) => statusOf(d)?.url === T('old.json'));
+      const outAt = sc.out.length;
+      cmd('start');
+      const holding = await holdLogged('hold-old', outAt);
+      at = mark();
+      const tSet = Date.now();
+      cmd('setUrl', T('new.json'));
+      // The old hold is not released until B has been seen: setUrl itself must stop the
+      // poll in flight (it obeys the poll's signal), or B waits for A's deadline.
+      const upd = await since(at, (d) => isUpdate(d) && d.tournament?.url === T('new.json') && d.tournament?.name === 'New Cup', 9000);
+      const tUpd = Date.now();
+      await release('hold-old'); // the old poll may go on now, as it would on its own
+      await sleep(300);
+      const oldPushed = client.events.slice(at).filter((d) => isUpdate(d) && d.tournament?.name === 'Old Cup').length;
+      const last = client.events.slice(at).filter(isStatus).map(parseStatus).pop();
+      check('ZIP-02: setUrl to B during a held poll of a completed A ends with B polled and B\'s results under B\'s URL and platform; A\'s result is never pushed, and A\'s "completed" does not stop polling',
+        !!holding && upd?.matches?.length === 2 && upd.tournament.platform === 'stub' && oldPushed === 0
+          && last?.polling === true && last?.auto?.stopped === null && last?.url === T('new.json'),
+        JSON.stringify({ holding: !!holding, newPushed: !!upd, oldPushed, polling: last?.polling, stopped: last?.auto?.stopped, url: last?.url }));
+      // Without the abort, B would come after A's deadline and then the gap: about 5.5 s.
+      check(`setUrl stops the poll in flight at once: B is pushed within the gap (${POLL_LOOP_GAP_MS / 1000} s) and 2 s of the setUrl, with A's hold never released, not after A's ${POLL_LOOP_DEADLINE_MS / 1000} s deadline`,
+        !!upd && tUpd - tSet < POLL_LOOP_GAP_MS + 2000, JSON.stringify({ pushedAfterMs: upd ? tUpd - tSet : null }));
+    }
+
+    // setUrl clears waitingUntil: a new URL is not left sleeping for the old event's start.
+    {
+      await stopNow();
+      await fixture('later2.json', { tournamentName: 'Later Cup', state: 'upcoming', startAt: new Date(Date.now() + 600000).toISOString(), matches: [], standings: [] });
+      let at = mark();
+      cmd('setUrl', T('later2.json'));
+      await since(at, (d) => statusOf(d)?.url === T('later2.json'));
+      at = mark();
+      cmd('start');
+      const waiting = statusOf(await since(at, (d) => !!statusOf(d)?.auto?.waitingUntil));
+      at = mark();
+      cmd('setUrl', T('new.json'));
+      // setUrl's own reply: the first status with the new URL, not a later one from a poll.
+      await since(at, (d) => statusOf(d)?.url === T('new.json'));
+      const reply = statusOf(client.events.slice(at).find((d) => statusOf(d)?.url === T('new.json')));
+      check('setUrl clears waitingUntil: its own status no longer shows the old event\'s start-time wait',
+        !!waiting && reply?.auto?.waitingUntil === null, JSON.stringify({ waited: waiting?.auto?.waitingUntil ?? null, after: reply?.auto?.waitingUntil }));
+      await stopNow();
+    }
+
+    // A stale failure: A has failed twice (so it is on a backoff), a slow poll of A is in
+    // flight, and the URL changes to B, which fails on its own.
+    {
+      await fixture('fail-a.json', 'not JSON');
+      let at = mark();
+      cmd('setUrl', T('fail-a.json'));
+      const set = statusOf(await since(at, (d) => statusOf(d)?.url === T('fail-a.json')));
+      at = mark();
+      cmd('start');
+      const f1 = await closed(at, set?.lastPollAt, (s) => s.lastError === MSG.stubNotObject);
+      at = mark();
+      cmd('pollNow');
+      const f2 = await closed(at, f1?.lastPollAt, (s) => s.lastError === MSG.stubNotObject);
+      // Two failures in a row: the backoff is four times the interval. setInterval goes
+      // through the one next-delay function and keeps it (ZIP-13: today it cut it short).
+      at = mark();
+      cmd('setInterval', '15000');
+      const iv = statusOf(await since(at, isStatus, 3000));
+      check('ZIP-13: setInterval does not cut a longer error backoff short: after two failures in a row the next poll stays four intervals after the last (nextPollAt unchanged)',
+        !!f2 && Math.abs(due(f2) - 60000) < 1500 && iv?.nextPollAt === f2.nextPollAt, JSON.stringify({ backoffMs: due(f2), before: f2?.nextPollAt, after: iv?.nextPollAt }));
+      // The control page changes the interval only through setOptions, which carries all
+      // three values on every Apply. With maxItems and topN unchanged it is a reschedule,
+      // through the same function: four of the new intervals, not the gap.
+      at = mark();
+      cmd('setOptions', JSON.stringify({ intervalMs: 20000, maxItems: 20, topN: 0 }));
+      const op = statusOf(await since(at, (d) => statusOf(d)?.intervalMs === 20000, REPLY_MS));
+      check('ZIP-13: setOptions that changes only the interval (the control page\'s Apply, all three values sent) does not cut the backoff short either: the next poll is four of the new intervals after the last, not the gap',
+        !!f2 && Math.abs(due(op) - 80000) < 1500 && op?.lastPollAt === f2.lastPollAt, JSON.stringify({ inMs: due(op), lastPollAt: op?.lastPollAt }));
+      at = mark();
+      cmd('setOptions', JSON.stringify({ intervalMs: 15000, maxItems: 20, topN: 0 }));
+      await since(at, (d) => statusOf(d)?.intervalMs === 15000, REPLY_MS);
+      await fixture('fail-a.json', { tournamentName: 'Slow A', state: 'in_progress', stubHoldFile: `${TMP_REL}/hold-a`, matches: [], standings: [] });
+      await holdFor('hold-a');
+      const outAt = sc.out.length;
+      cmd('pollNow');
+      const holding = await holdLogged('hold-a', outAt);
+      at = mark();
+      const tSet = Date.now();
+      cmd('setUrl', T('missing-b.json'));
+      await sleep(300);
+      await release('hold-a');
+      const b = await closed(at, f2?.lastPollAt, (s) => s.url === T('missing-b.json') && s.lastError === MSG.stubUnreadable, 8000);
+      const errorsSeen = [...new Set(client.events.slice(at).filter(isStatus).map(parseStatus).map((s) => s.lastError))];
+      check('a stale failure: after setUrl to B, no status carries an error from A\'s poll (A\'s old error, or the one its poll in flight ended with), only B\'s own',
+        !!f2 && !!holding && !!b && errorsSeen.every((e) => e === '' || e === MSG.stubUnreadable),
+        JSON.stringify({ failedTwice: !!f2, holding: !!holding, bPolled: !!b, errorsSeen }));
+      check('a stale failure: B is polled once the gap allows, without A\'s backoff, and B\'s own backoff starts from one error (twice the interval)',
+        !!b && Date.parse(b.lastPollAt) - tSet < POLL_LOOP_GAP_MS + 3000 && Math.abs(due(b) - 30000) < 1500,
+        JSON.stringify({ bPolledAfterMs: b ? Date.parse(b.lastPollAt) - tSet : null, nextPollInMs: due(b) }));
+      await stopNow();
+    }
+
+    // ZIP-02, a late result. A's hold ignores the abort setUrl sends (stubHoldIgnoresAbort),
+    // so A's poll is still under way when B is set and its result comes back afterwards,
+    // as an answer already on its way would. Only the URL check in pollOnce stops it then.
+    // A is a completed event, so a result taken as B's would also stop polling.
+    const lateLog = 'a poll of the previous tournament URL came back after setUrl; its result is thrown away';
+    const lateFailLog = 'a poll of the previous tournament URL failed after setUrl; its error is thrown away';
+    // Asked after setUrl to `url`: is A's poll still under way? Then no poll is armed, nothing
+    // has been pushed since `at`, and no poll has ended after the setUrl (the sidecar logs
+    // that, from `outAt` on). Had the abort ended A's poll, B would be armed by now for the
+    // end of the gap.
+    const stillUnderWay = async (url, at, outAt) => {
+      const atProbe = mark();
+      cmd('status');
+      const probe = statusOf(await since(atProbe, (d) => statusOf(d)?.url === url, REPLY_MS));
+      const ok = !!probe && probe.polling === true && probe.nextPollAt === null
+        && !client.events.slice(at).some((d) => isUpdate(d)) && !sc.out.slice(outAt).includes('after setUrl');
+      return { ok, nextPollAt: probe ? probe.nextPollAt : 'no status' };
+    };
+    {
+      await fixture('late-old.json', { tournamentName: 'Late Old Cup', state: 'completed', stubHoldFile: `${TMP_REL}/hold-late`, stubHoldIgnoresAbort: true,
+        matches: [{ id: 'lo1', round: 'Grand Final', state: 'completed', p1: { name: 'Flash', score: 3 }, p2: { name: 'Rival', score: 1 }, winner: 1, order: 1 }],
+        standings: [{ placement: 1, name: 'Flash' }, { placement: 2, name: 'Rival' }] });
+      await holdFor('hold-late');
+      let at = mark();
+      cmd('setUrl', T('late-old.json'));
+      const set = statusOf(await since(at, (d) => statusOf(d)?.url === T('late-old.json')));
+      const outAt = sc.out.length;
+      cmd('start');
+      const holding = await holdLogged('hold-late', outAt);
+      at = mark();
+      cmd('setUrl', T('new.json'));
+      await since(at, (d) => statusOf(d)?.url === T('new.json'), REPLY_MS);
+      await sleep(300);
+      const underWay = await stillUnderWay(T('new.json'), at, outAt);
+      const tRel = Date.now();
+      await release('hold-late');
+      const lateLogged = await waitFor(() => sc.out.slice(outAt).includes(lateLog), 3000);
+      const upd = await since(at, (d) => isUpdate(d) && d.tournament?.url === T('new.json') && d.tournament?.name === 'New Cup', POLL_LOOP_GAP_MS + 4000);
+      const tUpd = Date.now();
+      const good = await closed(at, set?.lastPollAt, (s) => s.url === T('new.json') && s.auto?.eventState === 'in_progress', 3000);
+      await sleep(300);
+      const evs = client.events.slice(at);
+      const statuses = evs.filter(isStatus).map(parseStatus);
+      const oldPushed = evs.filter((d) => isUpdate(d) && (d.tournament?.name === 'Late Old Cup' || d.tournament?.url === T('late-old.json'))).length;
+      const otherUnderB = evs.filter((d) => isUpdate(d) && d.tournament?.url === T('new.json') && d.tournament?.name !== 'New Cup').length;
+      // Under B's URL a status may carry only B's own poll: before it, the lastPollAt from
+      // before A's poll and no event state; never A's "completed".
+      const showsA = statuses.filter((s) => s.auto?.eventState === 'completed' || s.auto?.stopped === 'completed'
+        || (s.lastPollAt !== set?.lastPollAt && s.auto?.eventState !== 'in_progress')).length;
+      const stopped = statuses.filter((s) => s.polling !== true).length;
+      check('ZIP-02, a late result: with stubHoldIgnoresAbort the poll of A is still under way after setUrl to B (no poll armed, B not polled, nothing pushed), and once released its result comes back after the setUrl and is thrown away (logged)',
+        !!holding && underWay.ok && !!lateLogged,
+        JSON.stringify({ holding: !!holding, underWay, lateLogged: !!lateLogged }));
+      check('ZIP-02, a late result of a completed A: it is not pushed, not shown under B\'s URL (no update or status there carries A\'s tournament, poll time or state), and does not stop polling',
+        !!lateLogged && oldPushed === 0 && otherUnderB === 0 && showsA === 0 && stopped === 0 && statuses.length > 0,
+        JSON.stringify({ oldPushed, otherUnderB, statusesShowingA: showsA, statusesNotPolling: stopped, statuses: statuses.length }));
+      check('ZIP-02, a late result: B is then polled once the gap after A\'s late end allows, and pushed under B\'s URL and platform with B\'s results',
+        underWay.ok && !!upd && upd.matches?.length === 2 && upd.tournament.platform === 'stub' && tUpd - tRel < POLL_LOOP_GAP_MS + 2000
+          && !!good && good.lastError === '' && good.platform === 'stub' && good.polling === true,
+        JSON.stringify({ pushed: !!upd, pushedAfterReleaseMs: upd ? tUpd - tRel : null, matches: upd?.matches?.length ?? null, closedWith: good && { lastError: good.lastError, platform: good.platform } }));
+      await stopNow();
+    }
+
+    // ZIP-02, a late failure: A's poll fails after setUrl to B (HTTP 500, no Retry-After).
+    // B fails on its own too, so its backoff shows the error count it started from.
+    {
+      await fixture('late-fail.json', { tournamentName: 'Late Fail', state: 'in_progress', matches: [], standings: [],
+        stubHoldFile: `${TMP_REL}/hold-late-f`, stubHoldIgnoresAbort: true, stubFail: { status: 500 } });
+      await holdFor('hold-late-f');
+      let at = mark();
+      cmd('setUrl', T('late-fail.json'));
+      const set = statusOf(await since(at, (d) => statusOf(d)?.url === T('late-fail.json')));
+      const outAt = sc.out.length;
+      cmd('start');
+      const holding = await holdLogged('hold-late-f', outAt);
+      at = mark();
+      cmd('setUrl', T('missing-late.json'));
+      await since(at, (d) => statusOf(d)?.url === T('missing-late.json'), REPLY_MS);
+      await sleep(300);
+      const underWay = await stillUnderWay(T('missing-late.json'), at, outAt);
+      await release('hold-late-f');
+      const lateLogged = await waitFor(() => sc.out.slice(outAt).includes(lateFailLog), 3000);
+      const b = await closed(at, set?.lastPollAt, (s) => s.url === T('missing-late.json') && s.lastError === MSG.stubUnreadable, POLL_LOOP_GAP_MS + 4000);
+      const errorsSeen = [...new Set(client.events.slice(at).filter(isStatus).map(parseStatus).map((s) => s.lastError))];
+      check('ZIP-02, a late failure: a poll of A still under way after setUrl to B that then fails (HTTP 500) leaves lastError and the error count alone: no status shows A\'s error, and B\'s own failure starts its backoff from one error (twice the interval)',
+        !!holding && underWay.ok && !!lateLogged && !!b && errorsSeen.every((e) => e === '' || e === MSG.stubUnreadable) && Math.abs(due(b) - 30000) < 1500,
+        JSON.stringify({ holding: !!holding, underWay, lateLogged: !!lateLogged, bPolled: !!b, errorsSeen, bNextPollInMs: due(b) }));
+      await stopNow();
+    }
+
+    // The bound: a hold that ignores the abort, never released, still ends at the poll's
+    // deadline, so the poll loop goes on to B.
+    {
+      await fixture('late-stuck.json', { tournamentName: 'Stuck Cup', state: 'in_progress', matches: [], standings: [],
+        stubHoldFile: `${TMP_REL}/hold-stuck`, stubHoldIgnoresAbort: true });
+      await holdFor('hold-stuck');
+      let at = mark();
+      cmd('setUrl', T('late-stuck.json'));
+      const set = statusOf(await since(at, (d) => statusOf(d)?.url === T('late-stuck.json')));
+      const outAt = sc.out.length;
+      cmd('start');
+      const holding = await holdLogged('hold-stuck', outAt);
+      const tHold = Date.now();
+      at = mark();
+      cmd('setUrl', SAFE_STUB);
+      const b = await closed(at, set?.lastPollAt, (s) => s.url === SAFE_STUB && s.lastError === '', POLL_LOOP_DEADLINE_MS + POLL_LOOP_GAP_MS + 5000);
+      const tB = Date.now();
+      const endedLate = sc.out.slice(outAt).includes(lateFailLog);
+      const errorsSeen = [...new Set(client.events.slice(at).filter(isStatus).map(parseStatus).map((s) => s.lastError))];
+      check(`stubHoldIgnoresAbort is bounded: a hold that ignores the abort and is never released still ends at the poll's deadline (${POLL_LOOP_DEADLINE_MS / 1000} s here), thrown away as a late failure, and B is polled after it and the gap`,
+        !!holding && !!b && endedLate && tB - tHold >= POLL_LOOP_DEADLINE_MS - 500 && tB - tHold < POLL_LOOP_DEADLINE_MS + POLL_LOOP_GAP_MS + 2500
+          && errorsSeen.every((e) => e === ''),
+        JSON.stringify({ holding: !!holding, bPolled: !!b, bPolledAfterHoldMs: b ? tB - tHold : null, endedLate, errorsSeen }));
+      await stopNow();
+      await release('hold-stuck');
+    }
+
+    // A stalled poll: the hold never ends by itself. The poll's deadline aborts it, and a
+    // pollNow sent meanwhile is kept and runs afterwards.
+    {
+      await fixture('stalled.json', { tournamentName: 'Stalled Cup', state: 'in_progress', stubHoldFile: `${TMP_REL}/hold-s`, standings: [],
+        matches: [{ id: 's1', round: 'Round 1', state: 'in_progress', p1: { name: 'Ann', score: 0 }, p2: { name: 'Bo', score: 0 }, winner: 0, order: 1 }] });
+      await holdFor('hold-s');
+      let at = mark();
+      cmd('setUrl', T('stalled.json'));
+      const set = statusOf(await since(at, (d) => statusOf(d)?.url === T('stalled.json')));
+      const outAt = sc.out.length;
+      cmd('start');
+      const holding = await holdLogged('hold-s', outAt);
+      const tHold = Date.now();
+      at = mark();
+      cmd('pollNow');
+      // pollNow's own status: sent while the held poll runs, so it still carries the
+      // lastPollAt from before that poll, with no poll armed (nextPollAt null). The status
+      // that closes the held poll has a new lastPollAt, so it cannot stand in for it.
+      const replied = statusOf(await since(at, (d) => !!set?.lastPollAt && statusOf(d)?.lastPollAt === set.lastPollAt && statusOf(d)?.nextPollAt === null, REPLY_MS));
+      const deadline = await closed(at, set?.lastPollAt, (s) => s.lastError === `the poll took longer than ${POLL_LOOP_DEADLINE_MS / 1000} s and was stopped`, 8000);
+      const tDeadline = Date.now();
+      await release('hold-s'); // so the poll that pollNow asked for can finish
+      const upd = await since(at, (d) => isUpdate(d) && d.tournament?.name === 'Stalled Cup', 6000);
+      const good = await closed(at, deadline?.lastPollAt ?? set?.lastPollAt, (s) => s.lastError === '', 6000);
+      check(`the poll's deadline (shortened to ${POLL_LOOP_DEADLINE_MS / 1000} s) aborts a held stub delay: the poll fails with "the poll took longer than ${POLL_LOOP_DEADLINE_MS / 1000} s and was stopped" while the hold file still exists`,
+        !!holding && !!deadline && tDeadline - tHold < POLL_LOOP_DEADLINE_MS + 2000, JSON.stringify({ holding: !!holding, deadline: deadline?.lastError ?? null, afterMs: tDeadline - tHold }));
+      check(`a pollNow sent while a poll is held replies at once with its own status (within ${REPLY_MS / 1000} s, before the held poll ends, nextPollAt null), and is kept: a second poll runs after the held one ends, with no further command`,
+        !!replied && !!upd && !!good && pollsSince(at, set?.lastPollAt) >= 2,
+        JSON.stringify({ replied: !!replied, pushed: !!upd, polls: pollsSince(at, set?.lastPollAt) }));
+      await stopNow();
+    }
+
+    // The minimum gap: a burst of one command, sent inside the gap after a poll, costs one
+    // fetch, and every command still replies at once.
+    {
+      let at = mark();
+      cmd('setUrl', SAFE_STUB);
+      const set = statusOf(await since(at, (d) => statusOf(d)?.url === SAFE_STUB));
+      at = mark();
+      cmd('start');
+      let last = await closed(at, set?.lastPollAt);
+      const other = 'stub:./platforms/fixtures/stub-result.json';
+      const bursts = [
+        ['pollNow', () => cmd('pollNow')],
+        ['setUrl', (i) => cmd('setUrl', i % 2 ? SAFE_STUB : other)],
+        ['start', () => cmd('start')],
+      ];
+      for (const [name, send] of bursts) {
+        // Each burst starts right after a poll has closed, so all five fall inside the
+        // gap that follows it. start is sent with polling off; the gap still runs from
+        // the last poll.
+        at = mark();
+        cmd('pollNow');
+        last = await closed(at, last?.lastPollAt);
+        if (name === 'start') await stopNow();
+        at = mark();
+        for (let i = 0; i < 5; i++) { send(i); await sleep(40); }
+        // The commands' own statuses: those sent before the burst's poll closed still carry
+        // the lastPollAt from before the burst. The status that closes it is not counted.
+        const own = () => client.events.slice(at).filter(isStatus).map(parseStatus).filter((s) => s.lastPollAt === last?.lastPollAt);
+        const replies = await waitFor(() => own().length >= 5, 3000);
+        const polled = await closed(at, last?.lastPollAt, () => true, POLL_LOOP_GAP_MS + 4000);
+        await sleep(POLL_LOOP_GAP_MS + 800);
+        const n = pollsSince(at, last?.lastPollAt);
+        // A reply sent while the poll ran (nextPollAt null) means a command reached the
+        // sidecar after the gap had ended: this run's timing, which a second poll would
+        // then follow from, so the detail says so.
+        const late = own().filter((s) => s.nextPollAt === null).length;
+        check(`the gap: a burst of five ${name} commands 40 ms apart, inside the gap after a poll, costs one fetch, and each command replies at once with its own status`,
+          !!replies && !!polled && n === 1 && late === 0, JSON.stringify({ ownReplies: own().length, lateReplies: late, polls: n }));
+        last = polled || last;
+      }
+      await stopNow();
+    }
+
+    // ZIP-13: setInterval and setAutoSchedule off re-time the next poll through the one
+    // next-delay function, counted from the end of the last poll. nextPollAt is null while
+    // polling is off.
+    {
+      let at = mark();
+      cmd('setUrl', SAFE_STUB);
+      const set = statusOf(await since(at, (d) => statusOf(d)?.url === SAFE_STUB));
+      at = mark();
+      cmd('start');
+      const s = await closed(at, set?.lastPollAt, (x) => x.lastError === '', POLL_LOOP_GAP_MS + 4000);
+      at = mark();
+      cmd('setInterval', '60000');
+      const longer = statusOf(await since(at, (d) => statusOf(d)?.intervalMs === 60000, REPLY_MS));
+      at = mark();
+      cmd('setInterval', '15000');
+      const shorter = statusOf(await since(at, (d) => statusOf(d)?.intervalMs === 15000, REPLY_MS));
+      check('ZIP-13: setInterval re-times the next poll from the end of the last one: one interval after a good poll, 60 s after it with setInterval 60000, and 15 s again with 15000',
+        !!s && Math.abs(due(s) - 15000) < 1500 && Math.abs(due(longer) - 60000) < 1500 && Math.abs(due(shorter) - 15000) < 1500
+          && longer?.lastPollAt === s.lastPollAt && shorter?.lastPollAt === s.lastPollAt,
+        JSON.stringify({ afterPoll: due(s), after60000: due(longer), after15000: due(shorter) }));
+      const off = await stopNow();
+      check('nextPollAt: with polling off it is null', off?.nextPollAt === null, JSON.stringify({ whenOff: off?.nextPollAt }));
+
+      await fixture('later3.json', { tournamentName: 'Later Cup', state: 'upcoming', startAt: new Date(Date.now() + 600000).toISOString(), matches: [], standings: [] });
+      at = mark();
+      cmd('setUrl', T('later3.json'));
+      const set2 = statusOf(await since(at, (d) => statusOf(d)?.url === T('later3.json')));
+      at = mark();
+      cmd('start');
+      const w = await closed(at, set2?.lastPollAt, (x) => !!x.auto?.waitingUntil, POLL_LOOP_GAP_MS + 4000);
+      at = mark();
+      cmd('setAutoSchedule', 'off');
+      const manual = statusOf(await since(at, (d) => statusOf(d)?.auto?.enabled === false, REPLY_MS));
+      check('setAutoSchedule off ends a wait for the event\'s start at once: its own status shows no wait, and the next poll one interval after the last, not at the start time 10 minutes away',
+        !!w && Math.abs(due(w) - 600000) < 4000 && manual?.auto?.waitingUntil === null && Math.abs(due(manual) - 15000) < 1500 && manual?.lastPollAt === w.lastPollAt,
+        JSON.stringify({ waitBeforeMs: due(w), waitingUntil: manual?.auto?.waitingUntil, nextAfterMs: due(manual) }));
+      at = mark();
+      cmd('setAutoSchedule', 'on');
+      await since(at, (d) => statusOf(d)?.auto?.enabled === true, REPLY_MS);
+      await stopNow();
+    }
+
+    // ZIP-13: the backoff never goes below the interval, and is not doubled past it.
+    {
+      let at = mark();
+      cmd('setInterval', '3600000');
+      await since(at, (d) => statusOf(d)?.intervalMs === 3600000);
+      at = mark();
+      cmd('setUrl', T('missing-backoff.json'));
+      const set = statusOf(await since(at, (d) => statusOf(d)?.url === T('missing-backoff.json')));
+      at = mark();
+      cmd('start');
+      const s = await closed(at, set?.lastPollAt, (x) => x.lastError === MSG.stubUnreadable);
+      check('ZIP-13: with a one-hour interval, a failed poll waits one hour (read from nextPollAt): not the five-minute backoff cap, and not the doubled two hours',
+        !!s && due(s) >= 3600000 - 1000 && due(s) <= 3600000 + 1500, JSON.stringify({ lastPollAt: s?.lastPollAt, nextPollAt: s?.nextPollAt, inMs: due(s) }));
+      await stopNow();
+      at = mark();
+      cmd('setInterval', '15000');
+      await since(at, (d) => statusOf(d)?.intervalMs === 15000);
+    }
+
+    // Retry-After, through a stub fixture that answers like a rate-limited site.
+    const ra = (name, retryAfter) => fixture(name, { tournamentName: 'Busy Cup', state: 'in_progress', matches: [], standings: [], stubFail: { status: 429, retryAfter } });
+    {
+      await ra('ra-s.json', '120');
+      await ra('ra-s2.json', '120');
+      let at = mark();
+      cmd('setUrl', T('ra-s.json'));
+      const set = statusOf(await since(at, (d) => statusOf(d)?.url === T('ra-s.json')));
+      at = mark();
+      cmd('start');
+      const s = await closed(at, set?.lastPollAt, (x) => x.lastError === MSG.stub429, POLL_LOOP_GAP_MS + 4000);
+      check('Retry-After: a 429 with Retry-After 120 (seconds) puts the next poll 120 s after the failure (more than the interval and the backoff), in nextPollAt',
+        !!s && Math.abs(due(s) - 120000) < 1500, JSON.stringify({ lastError: s?.lastError, inMs: due(s) }));
+      // setInterval reschedules through the one next-delay function, which keeps the wait
+      // (today's code armed the new interval from now, cutting a longer wait short).
+      at = mark();
+      cmd('setInterval', '15000');
+      const iv = statusOf(await since(at, isStatus, 3000));
+      check('Retry-After: setInterval, rescheduled through the one next-delay function, does not cut the wait short (nextPollAt unchanged)',
+        !!s?.nextPollAt && iv?.nextPollAt === s.nextPollAt, JSON.stringify({ before: s?.nextPollAt, after: iv?.nextPollAt }));
+      // No poll can close during the wait, so every status here is a command's own reply.
+      at = mark();
+      cmd('pollNow');
+      const p = statusOf(await since(at, isStatus, REPLY_MS));
+      check('Retry-After: pollNow replies at once and does not cut the wait short (nextPollAt unchanged)',
+        !!s?.nextPollAt && p?.nextPollAt === s.nextPollAt, JSON.stringify({ before: s?.nextPollAt, afterPollNow: p?.nextPollAt }));
+      const atOpts = mark();
+      const optionWrong = [];
+      for (const [command, value, pred] of [
+        ['setTopN', '1', (x) => x.topN === 1],
+        ['setCapsText', 'held-a', (x) => x.caps?.text === 'held-a'],
+        ['setCapsLogo', '/zipper-overlay/held.png', (x) => x.caps?.logo === '/zipper-overlay/held.png'],
+        ['setCaps', JSON.stringify({ text: 'held-b', logo: '' }), (x) => x.caps?.text === 'held-b' && x.caps?.logo === ''],
+        ['setMaxItems', '19', (x) => x.maxItems === 19],
+        ['setOptions', JSON.stringify({ intervalMs: 15000, maxItems: 20, topN: 0 }), (x) => x.maxItems === 20 && x.topN === 0],
+      ]) {
+        const atC = mark();
+        cmd(command, value);
+        const r = statusOf(await since(atC, (d) => { const x = statusOf(d); return !!x && pred(x); }, REPLY_MS));
+        if (!r) optionWrong.push(`${command}: no status within ${REPLY_MS / 1000} s`);
+        else if (r.nextPollAt !== s?.nextPollAt) optionWrong.push(`${command}: nextPollAt ${r.nextPollAt}, was ${s?.nextPollAt}`);
+      }
+      await sleep(POLL_LOOP_GAP_MS + 800);
+      const polledAnyway = pollsSince(atOpts, s?.lastPollAt);
+      check(`Retry-After: each option command (setTopN, setCapsText, setCapsLogo, setCaps, setMaxItems, setOptions) replies with its own status within ${REPLY_MS / 1000} s, and none cuts the wait short (nextPollAt unchanged, no poll)`,
+        !!s?.nextPollAt && optionWrong.length === 0 && polledAnyway === 0, JSON.stringify({ wrong: optionWrong, polls: polledAnyway }));
+      at = mark();
+      cmd('setUrl', T('ra-s2.json'));
+      const same = statusOf(await since(at, (d) => statusOf(d)?.url === T('ra-s2.json')));
+      check('Retry-After: setUrl to another URL on the same platform keeps the wait (nextPollAt unchanged)',
+        !!s?.nextPollAt && same?.nextPollAt === s.nextPollAt, JSON.stringify({ before: s?.nextPollAt, after: same?.nextPollAt }));
+      at = mark();
+      const tOther = Date.now();
+      cmd('setUrl', roundOne);
+      const elsewhere = await closed(at, s?.lastPollAt, (x) => x.url === roundOne, POLL_LOOP_GAP_MS + 4000);
+      check('Retry-After: the wait is its platform\'s: a URL on another platform is polled as usual, once the gap allows',
+        !!elsewhere && Date.parse(elsewhere.lastPollAt) - tOther < POLL_LOOP_GAP_MS + 3000, JSON.stringify({ polledAfterMs: elsewhere ? Date.parse(elsewhere.lastPollAt) - tOther : null }));
+      // Going back: the other platform's poll armed its own next poll, sooner than the
+      // wait's end; the URL set back must not inherit it.
+      at = mark();
+      cmd('setUrl', T('ra-s2.json'));
+      const back = statusOf(await since(at, (d) => statusOf(d)?.url === T('ra-s2.json'), REPLY_MS));
+      check('Retry-After: setting a URL on the waiting platform again, after one on another platform, does not cut the wait short (nextPollAt is still its end)',
+        !!s?.nextPollAt && back?.nextPollAt === s.nextPollAt, JSON.stringify({ before: s?.nextPollAt, after: back?.nextPollAt }));
+      at = mark();
+      cmd('setUrl', '');
+      const cleared = statusOf(await since(at, (d) => statusOf(d)?.url === null && statusOf(d)?.polling === false, REPLY_MS));
+      at = mark();
+      cmd('setUrl', T('ra-s2.json'));
+      await since(at, (d) => statusOf(d)?.url === T('ra-s2.json'), REPLY_MS);
+      at = mark();
+      cmd('start');
+      const again = statusOf(await since(at, (d) => statusOf(d)?.polling === true, REPLY_MS));
+      check('Retry-After: clearing the URL does not drop the wait either: set again and started, the waiting platform still waits for its end (nextPollAt unchanged)',
+        !!s?.nextPollAt && !!cleared && again?.nextPollAt === s.nextPollAt, JSON.stringify({ cleared: !!cleared, before: s?.nextPollAt, after: again?.nextPollAt }));
+      await stopNow();
+    }
+
+    // ZIP-02, a late 429: A's poll answers 429 with Retry-After 120 after setUrl to B on
+    // another platform (stubHoldIgnoresAbort). Its error is thrown away like any late
+    // failure, but the wait is the platform's, so it is kept for A's platform (stub) and
+    // only for it. A fresh sidecar, so no wait is left from above.
+    {
+      await restart();
+      await fixture('late-ra.json', { tournamentName: 'Busy Cup', state: 'in_progress', matches: [], standings: [],
+        stubHoldFile: `${TMP_REL}/hold-late-ra`, stubHoldIgnoresAbort: true, stubFail: { status: 429, retryAfter: '120' } });
+      await holdFor('hold-late-ra');
+      let at = mark();
+      cmd('setUrl', T('late-ra.json'));
+      const set = statusOf(await since(at, (d) => statusOf(d)?.url === T('late-ra.json')));
+      const outAt = sc.out.length;
+      cmd('start');
+      const holding = await holdLogged('hold-late-ra', outAt);
+      at = mark();
+      cmd('setUrl', roundOne);
+      await since(at, (d) => statusOf(d)?.url === roundOne, REPLY_MS);
+      await sleep(300);
+      const underWay = await stillUnderWay(roundOne, at, outAt);
+      const tRel = Date.now();
+      await release('hold-late-ra');
+      const lateLogged = await waitFor(() => sc.out.slice(outAt).includes(lateFailLog), 3000);
+      const other = await closed(at, set?.lastPollAt, (s) => s.url === roundOne, POLL_LOOP_GAP_MS + 4000);
+      const tOther = Date.now();
+      const errorsSeen = [...new Set(client.events.slice(at).filter(isStatus).map(parseStatus).map((s) => s.lastError))];
+      check('ZIP-02, a late 429: a poll of A still under way after setUrl to B on another platform that then answers 429 does not hold B: B is polled as usual once the gap after A\'s late end allows, and no status shows A\'s error',
+        !!holding && underWay.ok && !!lateLogged && !!other && tOther - tRel < POLL_LOOP_GAP_MS + 2500 && /Round\.one/.test(other.lastError || '')
+          && errorsSeen.every((e) => e !== MSG.stub429),
+        JSON.stringify({ holding: !!holding, underWay, lateLogged: !!lateLogged, bPolledAfterReleaseMs: other ? tOther - tRel : null, bError: other?.lastError ?? null, errorsSeen }));
+      // Back to a URL on A's platform while polling: it waits for the end of A's 120 s.
+      at = mark();
+      cmd('setUrl', SAFE_STUB);
+      const back = statusOf(await since(at, (d) => statusOf(d)?.url === SAFE_STUB, REPLY_MS));
+      const want = tRel + 120000;
+      check('ZIP-02, a late 429: its Retry-After is kept for A\'s platform although the poll was thrown away: a URL on that platform set afterwards waits for the end of the 120 s (nextPollAt)',
+        underWay.ok && !!lateLogged && !!back && back.polling === true && Math.abs(Date.parse(back.nextPollAt) - want) < 1500,
+        JSON.stringify({ underWay, lateLogged: !!lateLogged, nextPollAt: back?.nextPollAt ?? null, want: new Date(want).toISOString() }));
+      await stopNow();
+    }
+
+    // As an HTTP date. A fresh sidecar, so no wait is left from above.
+    {
+      await restart();
+      const raDate = new Date(Date.now() + 125000).toUTCString(); // an HTTP date counts whole seconds
+      await ra('ra-d.json', raDate);
+      let at = mark();
+      cmd('setUrl', T('ra-d.json'));
+      const set = statusOf(await since(at, (d) => statusOf(d)?.url === T('ra-d.json')));
+      at = mark();
+      cmd('start');
+      const d = await closed(at, set?.lastPollAt, (x) => x.url === T('ra-d.json') && x.lastError === MSG.stub429, POLL_LOOP_GAP_MS + 4000);
+      check('Retry-After: as an HTTP date, the next poll is at that date',
+        !!d && Math.abs(Date.parse(d.nextPollAt) - Date.parse(raDate)) < 1500, JSON.stringify({ nextPollAt: d?.nextPollAt, retryAfter: raDate }));
+      await stopNow();
+    }
+
+    // The cap. A fresh sidecar again.
+    {
+      await restart();
+      await ra('ra-cap.json', '86400');
+      let at = mark();
+      cmd('setUrl', T('ra-cap.json'));
+      const set = statusOf(await since(at, (d) => statusOf(d)?.url === T('ra-cap.json')));
+      at = mark();
+      cmd('start');
+      const c = await closed(at, set?.lastPollAt, (x) => x.url === T('ra-cap.json') && x.lastError === MSG.stub429, POLL_LOOP_GAP_MS + 4000);
+      check('Retry-After: a wait longer than the cap is cut to the cap, five minutes with a 15-second interval',
+        !!c && Math.abs(due(c) - 300000) < 1500, JSON.stringify({ inMs: due(c) }));
+      await stopNow();
+    }
+
+    // The cap is never below the interval. With a 10-minute interval the next regular poll
+    // after a failure is 10 minutes away anyway, so the cap shows only on a poll a command
+    // asks for: pollNow.
+    {
+      await restart();
+      let at = mark();
+      cmd('setInterval', '600000');
+      await since(at, (d) => statusOf(d)?.intervalMs === 600000);
+      await ra('ra-floor.json', '86400');
+      at = mark();
+      cmd('setUrl', T('ra-floor.json'));
+      const set = statusOf(await since(at, (d) => statusOf(d)?.url === T('ra-floor.json')));
+      at = mark();
+      cmd('start');
+      const f = await closed(at, set?.lastPollAt, (x) => x.url === T('ra-floor.json') && x.lastError === MSG.stub429, POLL_LOOP_GAP_MS + 4000);
+      at = mark();
+      cmd('pollNow');
+      const pn = statusOf(await since(at, isStatus, REPLY_MS));
+      check('Retry-After: with a 10-minute interval the cap on the wait is the interval, not five minutes: after a 429 asking for a day, pollNow still waits the full 10 minutes (nextPollAt the same to within 5 ms)',
+        !!f && Math.abs(due(f) - 600000) < 1500 && !!pn?.nextPollAt && Math.abs(Date.parse(pn.nextPollAt) - Date.parse(f.nextPollAt)) <= 5, JSON.stringify({ failedInMs: due(f), afterPollNowInMs: due(pn) }));
+      await stopNow();
+      at = mark();
+      cmd('setInterval', '15000');
+      await since(at, (d) => statusOf(d)?.intervalMs === 15000);
+    }
+
+    // A wall clock set back an hour after a poll. Polls are timed on the monotonic clock,
+    // so neither a re-timed regular poll nor a command's poll waits out the step. This
+    // sidecar runs with a preload (tools/clock-step-preload.cjs, development only) that
+    // sets its wall clock back when the test writes the step file.
+    {
+      const first = await restart('clock-step sidecar [6h]', { ZIPPER_TEST_CLOCK_STEP_FILE: stepFile },
+        { nodeArgs: ['--require', resolve(__dirname, 'tools', 'clock-step-preload.cjs')] });
+      let at = mark();
+      cmd('setUrl', SAFE_STUB);
+      const set = statusOf(await since(at, (d) => statusOf(d)?.url === SAFE_STUB));
+      at = mark();
+      cmd('start');
+      const g = await closed(at, set?.lastPollAt, (x) => x.lastError === '', POLL_LOOP_GAP_MS + 4000);
+      const outAt = sc.out.length;
+      await writeFile(stepFile, String(CLOCK_STEP_MS), 'utf-8');
+      const stepped = await waitFor(() => sc.out.slice(outAt).includes('[clock-step] the wall clock was set by'), 3000);
+      at = mark();
+      cmd('setInterval', '20000');
+      const iv = statusOf(await since(at, (d) => statusOf(d)?.intervalMs === 20000, REPLY_MS));
+      // 20 s after the poll, read on the clock as it now is: an hour before the poll's own
+      // (unstepped) lastPollAt, plus 20 s.
+      const want = g ? Date.parse(g.lastPollAt) + CLOCK_STEP_MS + 20000 : NaN;
+      check('a wall clock set back an hour after a poll: setInterval re-times the next poll 20 s after that poll, and nextPollAt shows it on the clock as it now is, not an hour later',
+        !!first && !!g && !!stepped && Math.abs(Date.parse(iv?.nextPollAt) - want) < 1500,
+        JSON.stringify({ stepped: !!stepped, nextPollAt: iv?.nextPollAt ?? null, want: Number.isFinite(want) ? new Date(want).toISOString() : null }));
+      await sleep(POLL_LOOP_GAP_MS + 200); // past the gap after that poll, by the real clock
+      at = mark();
+      const tAsk = Date.now();
+      cmd('pollNow');
+      const p = await closed(at, g?.lastPollAt, () => true, 4000);
+      const tPolled = Date.now();
+      check('a wall clock set back an hour after a poll: pollNow, once the gap has passed, still polls at once, not an hour later',
+        !!g && !!stepped && !!p && tPolled - tAsk < 2500, JSON.stringify({ polled: !!p, afterMs: tPolled - tAsk }));
+      await stopNow();
+    }
+  } finally {
+    for (const f of ['hold-old', 'hold-a', 'hold-s', 'hold-late', 'hold-late-f', 'hold-stuck', 'hold-late-ra']) await release(f);
+    await rm(stepFile, { force: true });
+    await sc.stop();
+    await rm(cfgPath, { force: true });
+  }
+}
+
 // ── 7. Milestone announcements (SE mock + real sidecar) ──────────────────────
 
 let seServer = null;
@@ -1737,8 +2779,13 @@ async function testMilestones() {
   // first poll could not be lost for want of a connection.
   let followers = 250;
   let seOpen = false;
+  // The switch that makes it stop answering (row 3.2): a request that arrives while it
+  // is on is accepted and never answered.
+  let seStall = false;
+  const seStalled = [];
   seServer = createServer(async (req, res) => {
     if (req.url?.startsWith('/kappa/v2/sessions/')) {
+      if (seStall) { seStalled.push(res); return; }
       await waitFor(() => seOpen, 8000);
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ data: { 'follower-total': { count: followers } } }));
@@ -1763,10 +2810,14 @@ async function testMilestones() {
   const client = await busClient();
   const before = (await stats()).announceCount;
 
+  // The 10-second request limit is shortened to 2 s (its override) for the check below
+  // with a StreamElements that never answers.
+  const SE_LIMIT_MS = 2000;
   const sc = startSidecar('milestone test sidecar [7]', {
     ZIPPER_CONFIG: cfgPath,
     ZIPPER_GUARD_PORT: String(SE_GUARD_PORT),
     ZIPPER_SE_BASE: `http://127.0.0.1:${SE_PORT}`,
+    ZIPPER_REQUEST_TIMEOUT_MS: String(SE_LIMIT_MS),
   });
   const since = sinceOn(client, sc);
 
@@ -1789,6 +2840,30 @@ async function testMilestones() {
   check('milestones: crossing announces', ann?.kind === 'milestone' && /300 followers/.test(ann?.text), JSON.stringify(ann));
   const persisted2 = await savedConfig(cfgPath, (c) => c.milestoneState?.followers === 300);
   check('milestones: new threshold persisted', persisted2?.milestoneState?.followers === 300, JSON.stringify(persisted2?.milestoneState));
+
+  // StreamElements end to end through ZIPPER_SE_BASE (decision 9): the mock stops
+  // answering, the request times out, and the next poll still runs once it answers again.
+  // A StreamElements poll pushes no status, so the test asks for one.
+  {
+    const probe = async () => {
+      const at = client.events.length;
+      client.ws.send(JSON.stringify({ request: 'DoAction', id: 's', action: { name: 'Ticker Command' }, args: { command: 'status', value: '' } }));
+      const s = await since(at, (d) => isStatus(d) && parseStatus(d).se?.configured === true, 2000);
+      return s ? parseStatus(s).se : null;
+    };
+    const want = `127.0.0.1:${SE_PORT} took longer than ${SE_LIMIT_MS / 1000} s to answer`;
+    seStall = true;
+    let seen = null;
+    const timedOut = await waitFor(async () => { seen = await probe(); return seen?.lastError === want ? seen : null; }, 16000, 300);
+    seStall = false;
+    check('StreamElements: with the server not answering, the StreamElements error reports a timeout that names the host and the limit (shortened to 2 s), never the address or the token',
+      !!timedOut && !timedOut.lastError.includes(jwt) && !timedOut.lastError.includes('/kappa'), JSON.stringify({ lastError: seen?.lastError ?? null, stalledRequests: seStalled.length }));
+    const before = timedOut?.lastPollAt ?? seen?.lastPollAt ?? null;
+    const recovered = await waitFor(async () => { const s = await probe(); return s && s.lastError === '' && s.lastPollAt && s.lastPollAt !== before ? s : null; }, 16000, 300);
+    check('StreamElements: once the server answers again, the next StreamElements poll runs and clears the error',
+      !!recovered, JSON.stringify({ recovered: !!recovered }));
+    for (const r of seStalled) { try { r.destroy(); } catch {} }
+  }
 
   await sc.stop();
   client.ws.close();
@@ -1898,6 +2973,7 @@ try {
   await mkdir(TMP_DIR, { recursive: true });
   await testNormalizers();
   testDetection();
+  await testFetchWrapper();
   await startMock();
   await testPanelCore();
   await testMock();
