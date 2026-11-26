@@ -41,6 +41,12 @@
 //                                 catch block does when it throws (it stands for any throw)
 //   /mock/queue?name=…&queue=…    the replies for that action carry this queueName,
 //                                 whatever bleed mode says; an empty queue= clears it
+//   /mock/delay?name=…&ms=…       a slow Streamer.bot: the reply to each DoAction for that
+//                                 action is held ms milliseconds (0 to 60000; 0 clears
+//                                 it), and its run follows the reply, as a run follows
+//                                 the queueing. What the reply says (ok, or "was not
+//                                 found") is decided when the request arrives. A request
+//                                 whose connection closes during the wait gets neither.
 //   /mock/kick            closes every open WebSocket connection
 //   /mock/stats           counters, switches and the stored payload, for the suites
 // A switch's on= takes 1 or 0 only; any other value gets a 400 and changes nothing.
@@ -149,6 +155,8 @@ const missing = new Set();           // action names that answer "was not found"
 const silent = new Set();            // action names whose runs do nothing
 const throwing = new Map();          // action name → the message its ticker:error carries
 const queueFor = new Map();          // action name → the queueName its replies carry
+const delayFor = new Map();          // action name → how long its replies are held, in ms
+const MAX_DELAY_MS = 60000;
 const pendingByAction = new Map();   // bleed mode: name → [{ args }] waiting out the window
 let totalRuns = 0;
 
@@ -239,9 +247,16 @@ async function handleHttp(req, res) {
     if (on !== undefined) argBleed = on;
     return json(res, { argBleed });
   }
-  if (path === '/mock/missing' || path === '/mock/silent' || path === '/mock/throw' || path === '/mock/queue') {
+  if (path === '/mock/missing' || path === '/mock/silent' || path === '/mock/throw' || path === '/mock/queue' || path === '/mock/delay') {
     const name = query.get('name');
     if (!ACTIONS.includes(name)) return json(res, { ok: false, error: `name must be one of: ${ACTIONS.join(', ')}` }, 400);
+    if (path === '/mock/delay') {
+      const raw = query.get('ms') ?? '';
+      const ms = /^\d{1,5}$/.test(raw) ? Number(raw) : NaN;
+      if (!(ms <= MAX_DELAY_MS)) return json(res, { ok: false, error: `ms must be a whole number of milliseconds from 0 to ${MAX_DELAY_MS}` }, 400);
+      if (ms > 0) delayFor.set(name, ms); else delayFor.delete(name);
+      return json(res, { delays: Object.fromEntries(delayFor) });
+    }
     if (path === '/mock/queue') {
       if (query.has('queue')) { const q = query.get('queue'); if (q) queueFor.set(name, q); else queueFor.delete(name); }
       return json(res, { queues: Object.fromEntries(queueFor) });
@@ -267,6 +282,7 @@ async function handleHttp(req, res) {
     return json(res, {
       ...stats, totalRuns, clients: clients.size, hasPayload: !!storedPayload, storedPayload,
       argBleed, missing: [...missing], silent: [...silent], throwing: Object.fromEntries(throwing), queues: Object.fromEntries(queueFor),
+      delays: Object.fromEntries(delayFor),
     });
   }
   if (path === '/' || path === '/index.html') {
@@ -342,21 +358,32 @@ function handleRequest(ws, m) {
     // reply; one that exists gets "ok" AT ONCE, when it is queued (not when it has
     // run), echoing the request's own args plus the queue it was put in. So the
     // reply says nothing about what the run did, or whether it has happened yet.
-    if (!ACTIONS.includes(name) || missing.has(name)) {
-      ws.send(JSON.stringify({ id: m.id, status: 'error', error: `The action '${name}' was not found` }));
-      return;
-    }
+    // The delay switch holds the reply, and the run after it (a slow Streamer.bot).
+    const refused = !ACTIONS.includes(name) || missing.has(name);
     const args = (m.args && typeof m.args === 'object' && !Array.isArray(m.args)) ? m.args : {};
     const queueName = queueFor.has(name) ? queueFor.get(name) : (argBleed ? 'Default' : 'Mock Blocking');
-    ws.send(JSON.stringify({
-      id: m.id, status: 'ok',
-      args: {
-        ...args,
-        actionId: ACTION_IDS[name], actionName: name, queueName,
-        runningActionId: randomUUID(), actionQueuedAt: new Date().toISOString(),
-      },
-    }));
-    queueAction(name, args);
+    const answer = () => {
+      if (refused) {
+        ws.send(JSON.stringify({ id: m.id, status: 'error', error: `The action '${name}' was not found` }));
+        return;
+      }
+      ws.send(JSON.stringify({
+        id: m.id, status: 'ok',
+        args: {
+          ...args,
+          actionId: ACTION_IDS[name], actionName: name, queueName,
+          runningActionId: randomUUID(), actionQueuedAt: new Date().toISOString(),
+        },
+      }));
+      queueAction(name, args);
+    };
+    const wait = delayFor.get(name);
+    if (!wait) { answer(); return; }
+    console.log(`[mock] ${name}: the reply is held ${wait} ms (the delay switch)`);
+    setTimeout(() => {
+      if (ws.readyState !== ws.OPEN) { console.log(`[mock] ${name}: the connection closed during the delay; no reply and no run`); return; }
+      try { answer(); } catch (err) { console.error('[mock] request failed:', err && err.message); }
+    }, wait);
   }
 }
 

@@ -48,6 +48,27 @@ Rules:
 - `message` is present only while persistent message mode is on **and** its text
   is non-blank; the overlay then crawls `message.lines` (one item per line)
   instead of the results. See below.
+- `generatedAt` is when the sidecar built the payload; each one it stamps in one
+  run is later than the last. A page (the overlay and the control page, through
+  `panel-core.js`) ignores a `ticker:update` whose `generatedAt` is strictly
+  older than the newest it has applied, compared as dates (`…:00Z` and
+  `…:00.500Z` are told apart by time, not as text), when it arrives within
+  5 seconds of the moment the page applied that newest one. So a page's
+  connect-sync replay that read the stored payload just before the sidecar
+  replaced it cannot put the older results back. An older one that arrives
+  later than that is applied, and its stamp becomes the newest, so the updates
+  after it are judged against it: after a stamp from a clock that was ahead (a
+  sidecar restarted after the computer's clock was set back, or a stamp far in
+  the future), a page drops only the older updates that arrive within those
+  5 seconds, and applies the first one after them by itself, with no refresh.
+  An update it dropped stays dropped: the sidecar counted that push as queued
+  (its broadcast came), so it does not send it again, and the page keeps what it
+  shows until the next update it applies. The 5 seconds are timed on the page's
+  own steady clock, so a change of the computer's clock does not move them. An
+  update with the same stamp is applied, and so is one with no
+  `generatedAt` or one that is not a date, such as the empty update Ticker Push
+  replays when nothing is stored; none of these changes the newest stamp or
+  starts the 5 seconds again.
 
 ## Persistent message mode
 
@@ -69,12 +90,16 @@ Rules:
   omitted and results show. That's the fallback for any malformed line list too.
 - Results **keep polling underneath**: the same payload still carries `matches`
   and `standings`, so switching the message off restores live results on the
-  spot with no re-poll.
+  spot with no re-poll. The exception is while the current payload is the
+  blank, just after a restart or a `setUrl`: see *Nothing kept yet* below.
 - It needs no tournament at all. Message edits push **immediately** rather than
-  riding the next poll (which, with polling off, would never come), and the
-  sidecar re-pushes a configured message when it connects to Streamer.bot, so a
-  message-only setup survives a restart. For the same reason end-cap changes now
-  push immediately when polling is off.
+  riding the next poll (which, with polling off, would never come), and with
+  polling off the sidecar re-pushes a configured message when it connects to
+  Streamer.bot, so a message-only setup survives a restart (just after a restart
+  that push carries no results: see *Nothing kept yet* below). End-cap changes
+  push immediately too, polling or not, except that just after a restart with
+  a URL set one fetch runs first (see
+  [What the sidecar pushes](#what-the-sidecar-pushes)).
 - `ticker:announce` still interrupts it — announcements cover the strip for
   their duration and the message resumes.
 - Persisted in `config.json` (`message`), so it survives a sidecar restart.
@@ -87,20 +112,28 @@ reserved command `__status` with the status JSON as `value`:
 
 ```json
 { "type": "ticker:command", "command": "__status",
-  "value": "{\"type\":\"ticker:status\",\"polling\":true,\"url\":\"…\",\"platform\":\"challonge\",\"lastPollAt\":\"…\",\"nextPollAt\":\"…\",\"lastError\":\"\",\"commandNotice\":\"\",\"intervalMs\":30000,\"maxItems\":20,\"caps\":{…}}" }
+  "value": "{\"type\":\"ticker:status\",\"seq\":42,\"polling\":true,\"url\":\"…\",\"platform\":\"challonge\",\"lastPollAt\":\"…\",\"nextPollAt\":\"…\",\"lastError\":\"\",\"commandNotice\":\"\",\"actionNotice\":\"\",\"intervalMs\":30000,\"maxItems\":20,\"caps\":{…}}" }
 ```
 
 The sidecar ignores its own `__status` echo, in any casing; the control page
-unwraps `value`. Sent after every poll and after every command.
+unwraps `value`. A status is sent after every poll and after every command, but
+one still waiting to go out is replaced by the newer one (see
+[The sidecar's sends](#the-sidecars-sends)), so a burst of commands can bring
+fewer statuses than commands; each status says what is true when it goes out.
+`seq` counts the sidecar's statuses; it is how the sidecar knows the broadcast
+of each one, and the control page ignores it.
 
-- `lastError` — why the last poll failed; `""` after a good poll and after an
-  accepted `setUrl`. This includes the limits below: a site that took longer
-  than 10 s to answer, a poll that took longer than 45 s, or an answer over
-  16 MB. The message names the site's host and the limit, never the address.
-  A request that could not be made at all reads `<host>: the request failed`,
-  with the system's code when there is one (for example `ECONNREFUSED` or
-  `ENOTFOUND`), never the address or a header's value.
-  A poll of the previous URL that ends after a `setUrl` leaves it alone.
+- `lastError` — why the last poll failed, including the limits below: a site
+  that took longer than 10 s to answer, a poll that took longer than 45 s, or an
+  answer over 16 MB. The message names the site's host and the limit, never the
+  address. A request that could not be made at all reads `<host>: the request
+  failed`, with the system's code when there is one (for example `ECONNREFUSED`
+  or `ENOTFOUND`), never the address or a header's value. It is `""` after a
+  good poll and after a `setUrl` that changes the URL. A `setUrl` with the URL
+  already set leaves it as it is, and leaves the count of failed polls in a row
+  (which the error back-off is timed from) as it is too; while polling, it asks
+  for a poll, as `pollNow` does. A poll of the previous URL that ends after a
+  `setUrl` leaves it alone.
 - `nextPollAt` — when the next poll runs (ISO time), or `null` when none is
   waiting (polling off, or a poll under way). It counts the interval, the error
   backoff, a site's Retry-After and the minimum gap below, whichever is latest.
@@ -112,21 +145,34 @@ unwraps `value`. Sent after every poll and after every command.
   URL ("No tournament URL set"). `""` otherwise. The next accepted command clears
   it; `status`, which the control page sends every 10 seconds, does not. The
   control page shows it in its status line.
+- `actionNotice` — `"Ticker Push not found"` or `"Ticker Announce not found"`
+  (both, joined by ` · `, when both are), when Streamer.bot answered one of the
+  sidecar's own sends to that action with "was not found" (any other error
+  answer reads `<action>: Streamer.bot answered with an error (<its text>)`);
+  `""` otherwise. An ok answer from that action clears it. Only the answer to
+  the newest send to an action sets or clears it, late or not: a late answer to
+  an older send changes nothing, so an older push's late ok does not clear the
+  notice a newer push's refusal set. The control page shows it in its status
+  line. "Ticker Command not found" cannot travel here, since the status itself
+  goes through `Ticker Command`: the sidecar logs it instead.
 
 The status carries an `auto` block describing the auto-scheduler (see
 `setAutoSchedule` below):
 
 ```json
 "auto": { "enabled": true, "eventState": "upcoming",
-  "startAt": "2026-08-01T00:00:00.000Z", "waitingUntil": "2026-08-01T00:00:00.000Z",
+  "startAt": "2026-08-01T00:00:00.000Z", "waitingUntil": "2026-07-31T21:15:00.000Z",
   "stopped": null }
 ```
 
 - `eventState` / `startAt` — what the last successful poll said about the event
   (`startAt` is `null` when the platform has no date; Matcherino never reports
   either).
-- `waitingUntil` — set while polling is on but sleeping for the start time; the
-  next poll fires at that instant.
+- `waitingUntil` — set while polling is on and auto start/stop is waiting for an
+  upcoming event; the next poll fires at that instant. That is the platform's
+  start time when it is near, but never more than 15 minutes after the last poll
+  (or one poll interval, if that is longer), so in the example above, with the
+  start hours away, it is 15 minutes after the last poll.
 - `stopped` — `"completed"` after the scheduler stopped polling itself, `null`
   otherwise.
 
@@ -137,12 +183,12 @@ The status carries an `auto` block describing the auto-scheduler (see
   past a limit is stopped and fails (`lastError`).
 - **At least 15 s between polls**, counted from the end of one to the start of
   the next, whatever asks for them. A command that asks for a poll inside that
-  gap (`pollNow`, `start`, `setUrl`, or an option change while polling) is
-  answered with a status at once and polled when the gap ends, so a burst of
-  commands costs one poll. A `pollNow` or `start` that arrives while a poll is
-  under way runs after it. A cap or option change made while polling reaches
-  the strip with that poll, so it too waits for the gap, and for a site's
-  Retry-After.
+  gap (`pollNow`, `start`, `setUrl`, or a cap or option change that needs a
+  fetch, see [What the sidecar pushes](#what-the-sidecar-pushes)) is answered
+  with a status at once and polled when the gap ends, so a burst of commands
+  costs one poll. A `pollNow` or `start` that arrives while a poll is under way
+  runs after it. A cap or option change does not wait for a poll: it is pushed
+  at once from the payload and the last result the sidecar keeps.
 - **After an error** the wait doubles with each failure in a row, up to 5
   minutes, and is never shorter than the poll interval.
 - **A site's Retry-After** (on a 429 or 503) holds back every poll of that
@@ -153,6 +199,129 @@ The status carries an `auto` block describing the auto-scheduler (see
   waits for its end.
 - **A changed URL.** A poll still running for the old URL when `setUrl` arrives
   is stopped, and whatever it brings back is thrown away.
+- **Before an upcoming event** (auto start/stop on), the next poll is at the
+  platform's start time, but at most 15 minutes away (or one poll interval, if
+  that is longer), so a bracket that starts early is picked up. With no start
+  time it is 5 minutes away (or one interval, if that is longer).
+
+### What the sidecar pushes
+
+- **Only a change.** After a poll, the payload is pushed when what the strip
+  shows has changed: the tournament's name and state, the caps, the message, the
+  standings, and each match's id, state, round, winner, scores and names. So a
+  corrected winner with the same scores is pushed, and so is an event that
+  completes with no set changing (the stored payload then says `completed`).
+- **A new URL** (`setUrl` with a value other than the one set) pushes a blank
+  payload at once: no matches and no standings, under the new URL, with the
+  caps and the message kept. The old bracket leaves the strip, and stays gone if
+  the new URL keeps failing. The new URL's first good poll is pushed. A refused
+  `setUrl` pushes nothing, and the URL already set pushes nothing either.
+- **Cap changes** (`setCaps`, `setCapsText`, `setCapsLogo`) push the current
+  payload with the new caps at once, polling or not, so they show while a site
+  is failing (just after a restart there is no current payload yet: see
+  *Nothing kept yet* below).
+- **Option changes** (`setMaxItems`, `setTopN`, and `setOptions` when one of
+  them changes) rebuild the payload from the last good result the sidecar keeps,
+  with the URL and platform it was fetched under, and push it at once, polling
+  or not. When that result was cut short by its platform (`cutShort`) and the
+  change asks for more than it held (a higher `maxItems`, or `topN` switched
+  on), the sidecar also fetches again.
+- **Nothing kept yet.** After a restart, until its first good poll, the
+  sidecar holds no result and, until a message is pushed (below), no payload. A cap or option change with a URL set
+  then runs one fetch, which pushes what it brings with the change; with polling
+  off that fetch does not start polling, and it waits for the 15 s gap and a
+  site's Retry-After like a poll. If that fetch fails, the change reaches the
+  strip with the next good one. A change made while such a fetch is under way
+  is carried by it, so it costs no second fetch unless that one fails. With no
+  URL, an option change is only saved, and a cap change pushes the blank payload
+  with the caps (a message-only strip). A message is pushed even with nothing
+  kept: with a message on and polling off, the sidecar pushes its payload with
+  the message each time it connects to Streamer.bot, so just after a restart it
+  pushes the blank payload (no results, the caps kept) with the message. A
+  message edit before the first good poll, polling or not, pushes that blank
+  payload with the message too. That replaces the results Streamer.bot stored:
+  the message shows at once, and from then on the blank is the current payload,
+  as it is after a `setUrl` (below). A cap change then pushes the blank with the
+  new caps and fetches nothing, and a message switched off leaves the strip with
+  no results. The results come back with the next good poll or fetch: `start`,
+  `pollNow`, or an option change, which still runs one fetch (see *No blank over
+  the stored strip* below). With polling on, nothing is pushed on connect;
+  the first good poll pushes the results with the message.
+- **Since a new URL,** the blank payload `setUrl` pushed is the current one
+  until the new URL's first good poll: a cap change pushes it with the new caps,
+  and an option change runs one fetch, as above.
+- **No blank over the stored strip.** Apart from `setUrl`'s own blank, a cap or
+  option change never pushes a blank payload over the one Streamer.bot stored.
+  Message changes are not held back this way: after a restart, before the first
+  good poll, a message edit (and, with polling off, the configured message the
+  sidecar pushes again when it connects) goes out on a payload with no results,
+  which replaces the results Streamer.bot stored.
+- **A push that does not get through** (Streamer.bot down or still starting,
+  `Ticker Push` missing, or no answer within 5 s) is made good when the sidecar
+  next connects to Streamer.bot: it pushes the payload it holds again. While
+  the connection stays open (an action added in Streamer.bot does not reconnect
+  it), it is pushed again 30 s later, and on the next `status` command, which
+  the control page sends every 10 s; until a push is queued, that repeats
+  (every 30 s, and on each `status`), and "Ticker Push not found" is still
+  logged only once. An answer that comes late, inside the 5 s, counts: the push
+  got through (see [The sidecar's sends](#the-sidecars-sends)). One that comes
+  after the 5 s does not: that push stays timed out, so with a Streamer.bot that
+  takes longer than 5 s to answer, each repeat is timed out too and the repeats
+  go on. Only the newest push's outcome counts: once a newer push has been made
+  (it carries the whole payload), an older one's outcome changes nothing,
+  whether the older one times out while the newer one is queued or still
+  waiting for its answer (nothing is owed), or its late ok comes after the newer
+  one was refused (the newer one stays owed).
+
+### The sidecar's sends
+
+The sidecar sends one `DoAction` at a time. Streamer.bot answers a `DoAction`
+when the action is queued, not when it has run, so the next one goes once the
+answer **and** the run's own broadcast are both in (the `ticker:update` with
+that `generatedAt`, compared as a time, since Streamer.bot can write a date in
+another form, `…:00.120Z` as `…:00.12Z`; the `__status` with that `seq`; the
+`ticker:announce` with that kind and text), or after 800 ms. An error answer
+lets the next go at once, and a `ticker:error` counts as the end of the run. A
+push waiting to go is replaced by a newer push, and a status by a newer status;
+announcements are never merged.
+
+Each send ends with one outcome. The 800 ms only let the next send go: a send
+that has no answer then, and had neither its own broadcast nor a `ticker:error`
+while it was in flight, keeps waiting for its answer, so several can be waiting
+at once, and each answer is matched to its own send. A send with no answer that
+had one of those two is settled when the next goes.
+
+- **queued** — Streamer.bot answered ok (the action was queued; that says
+  nothing of the run), within 5 s of the send, or, with no answer yet, the
+  send's own broadcast arrived while it was the send in flight (the run has
+  happened).
+- **refused** — an error answer, such as "was not found".
+- **failed** — a `ticker:error` arrived while it was the send in flight, before
+  or after an ok answer, or with no answer at all (it names no sender, so a
+  page's failed run at that moment, or the late run of an earlier send, counts
+  against it).
+- **timed out** — no answer within 5 s of the send, and no broadcast of its own
+  while it was the send in flight. Its own broadcast that comes after the next
+  send has gone is not looked at, so it does not save the send from timing out.
+- **dropped** — the connection was closed when it was to be sent, or while it
+  waited to be sent, or while it was the send in flight with no answer and either
+  no broadcast of its own or a `ticker:error` (with no answer the error does
+  not make it failed: the close comes first), or while it waited for its
+  answer.
+
+So a slow Streamer.bot that answers within 5 s neither leaves a push owed nor
+repeats a milestone announcement. What follows from an outcome other than
+queued: the newest push is owed (see
+[What the sidecar pushes](#what-the-sidecar-pushes)), and a milestone's
+threshold stays where it was (see
+[StreamElements milestones](#streamelements-milestones-sidecar)).
+
+This orders only the sidecar's own sends: the blocking action
+queue the README asks for is what keeps a control page's, chat's or a Stream
+Deck's runs from mixing with them. The sidecar logs once when an action answers
+"was not found" (until it answers ok again; as for `actionNotice`, only the
+answer to the newest send to that action counts) and once when an action runs
+in Streamer.bot's Default queue (from any ok answer, late or not).
 
 ## ticker:command
 
@@ -170,23 +339,23 @@ passed as they are. An unknown name is ignored and reported in the status's
 
 | command       | value                          | effect |
 |---------------|--------------------------------|--------|
-| `setUrl`      | tournament URL (empty = none)  | switch tournaments (forces a re-push on next poll). A poll of the old URL still running is stopped and its result thrown away; while polling, the new URL is polled once the gap allows (see [When the sidecar polls](#when-the-sidecar-polls)). An empty value clears the URL and **stops polling**. A refused `stub:` URL (see [Test hook](#test-hook)) keeps the old URL, saves nothing and says why in `commandNotice` |
+| `setUrl`      | tournament URL (empty = none)  | switch tournaments: a blank payload (no results; caps and message kept) is pushed at once, and the new URL's first good poll is pushed (see [What the sidecar pushes](#what-the-sidecar-pushes)). A poll of the old URL still running is stopped and its result thrown away; while polling, the new URL is polled once the gap allows (see [When the sidecar polls](#when-the-sidecar-polls)). An empty value clears the URL, pushes the blank and **stops polling**. The URL already set (after trimming) changes nothing on the strip; while polling it asks for a poll, as `pollNow` does. A refused `stub:` URL (see [Test hook](#test-hook)) keeps the old URL, saves nothing, pushes nothing and says why in `commandNotice` |
 | `start`       | —                              | start polling |
 | `stop`        | —                              | stop polling |
 | `pollNow`     | —                              | a fresh poll as soon as the 15 s gap after the last poll and any Retry-After allow (starts polling if stopped); the status answers at once, with `nextPollAt` |
 | `setInterval` | milliseconds (min 15000)       | poll cadence |
-| `setCaps`     | JSON `{text,logo}`             | **batched** — sets both end caps in one command (the control page uses this). A logo `setCapsLogo` would refuse is refused here too: the old logo stays, the text still applies, and `commandNotice` says why |
-| `setOptions`  | JSON `{intervalMs,maxItems,topN}` | **batched** — sets all three options in one command. While polling, a changed `maxItems` or `topN` asks for a poll, as `setMaxItems` and `setTopN` do; a new interval alone (or no change) only re-times the next poll, so it never cuts an error backoff or a Retry-After short |
+| `setCaps`     | JSON `{text,logo}`             | **batched** — sets both end caps in one command (the control page uses this), pushed at once, polling or not (just after a restart with a URL set, after one fetch). A logo `setCapsLogo` would refuse is refused here too: the old logo stays, the text still applies, and `commandNotice` says why |
+| `setOptions`  | JSON `{intervalMs,maxItems,topN}` | **batched** — sets all three options in one command. A changed `maxItems` or `topN` rebuilds the payload from the last result and pushes it at once, as `setMaxItems` and `setTopN` do (see [What the sidecar pushes](#what-the-sidecar-pushes)); a new interval only re-times the next poll, so it never cuts an error backoff or a Retry-After short |
 | `setMessage`  | JSON `{text,enabled}`          | **batched** — persistent message text + on/off in one command (the control page uses this) |
 | `setMessageText` | string (≤1000 chars, `\n`-separated lines) | message text (single-field; for chat / Stream Deck) |
 | `setMessageEnabled` | `on`/`off` (also `true`/`false`, `1`/`0`, `yes`) | show the message instead of results |
 | `setCapsText` | string (≤120 chars)            | right-cap static text (single-field; for chat / Stream Deck) |
 | `setCapsLogo` | an http(s) URL, or a path on the overlay's server (≤500 chars; empty = no logo) | left-cap logo image (single-field). Anything else — `data:`, `file:`, `javascript:`, `//host`, `\\host` — is refused: the old logo stays and `commandNotice` says why. A saved logo that breaks this rule is dropped when `config.json` loads |
 | `setInterval` above, `setMaxItems`, `setTopN` | see below | single-field variants |
-| `setMaxItems` | 1–100                          | ticker item cap |
-| `setTopN`     | 0–100 (0 = off)                | only show matches involving the top-N placed participants (needs platform standings — start.gg always; Challonge via `final_rank` on the keyed API for your own tournaments, or derived from elimination order on finished brackets when scraping; also trims the standings crawl to N) |
-| `setAutoSchedule` | `on`/`off` (default on)    | auto start/stop: a poll that returns `completed` pushes the final payload then **stops polling**; one that returns `upcoming` **sleeps until the platform's start time** (re-checking every 5 min without one, and at most every 6 h for far-off dates) and resumes normal polling when the event goes live. `start`/`pollNow` get a poll even during that sleep or after that stop, but it still waits for the 15 s gap after the last poll and for a site's Retry-After (see [When the sidecar polls](#when-the-sidecar-polls)). |
-| `status`      | —                              | request a status re-broadcast |
+| `setMaxItems` | 1–100                          | ticker item cap; a change is rebuilt from the last result and pushed at once (after a fetch, when nothing is kept yet or the URL changed since) |
+| `setTopN`     | 0–100 (0 = off)                | only show matches involving the top-N placed participants (needs platform standings — start.gg always; Challonge via `final_rank` on the keyed API for your own tournaments, or derived from elimination order on finished brackets when scraping; also trims the standings crawl to N); a change is rebuilt from the last result and pushed at once (after a fetch, when nothing is kept yet or the URL changed since) |
+| `setAutoSchedule` | `on`/`off` (default on)    | auto start/stop: a poll that returns `completed` pushes the final payload then **stops polling**; one that returns `upcoming` **waits for the platform's start time**, checking again at least every 15 min (or every poll interval, if that is longer) so a bracket that starts early is picked up (every 5 min without a start time, or every poll interval if that is longer), and resumes normal polling when the event goes live. `start`/`pollNow` get a poll even during that sleep or after that stop, but it still waits for the 15 s gap after the last poll and for a site's Retry-After (see [When the sidecar polls](#when-the-sidecar-polls)). |
+| `status`      | —                              | request a status re-broadcast; a push still owed is pushed first (see [What the sidecar pushes](#what-the-sidecar-pushes)) |
 
 > **Why the batched `setCaps` / `setOptions` exist.** Streamer.bot can mix up
 > the arguments of two runs of the same action when the runs overlap: two
@@ -244,6 +413,26 @@ announced thresholds persist in `config.json` (`milestoneState`) so restarts
 don't repeat them. **The JWT never travels the bus** — `ticker:status` carries
 only `se: { configured, lastPollAt, lastError }`.
 
+- **A threshold moves on only once its announcement was queued** by
+  Streamer.bot. One that could not be sent (Streamer.bot down), was refused
+  (`Ticker Announce` missing) or failed is announced again by the next poll, and
+  its threshold saved only then. One that got no answer within 5 s is treated
+  the same way (a repeat is possible, a loss is not); an ok answer that comes
+  later than 800 ms but within the 5 s counts as queued. While one keeps failing,
+  the log says so once, not on every poll.
+- **A counter that falls** to 0, or to more than one step below the saved
+  threshold, is a new session: the threshold is reset silently to the new
+  value's, and the milestones above it are announced again as the counter
+  climbs back. A dip of a step or less changes nothing, so an unfollow and a
+  refollow within one step, or a sub that lapses and renews, never repeat an
+  announcement.
+- **The subs counter** is read from `subscriber-total`, or from
+  `subscriber-count` when that is missing. The key each value came from is saved
+  (`milestoneKeys`), and a reading from the other key is recorded silently, as a
+  first sighting, not taken as a rise or a drop.
+- **Polls never overlap**: each is timed from the end of the last, and two
+  milestones crossed in one poll are announced one after the other.
+
 ## ticker:error
 
 Broadcast by either C# action when it throws, so failures are visible instead
@@ -281,7 +470,17 @@ poll fail as a rate-limited site would
 or as an HTTP date), with the fixed message `stub: the test file answered as
 HTTP <status>`.
 
+A stub file is a normalized result, so it may also carry what a platform
+adapter's result carries: `"cutShort": true` marks a result its adapter stopped
+reading early, which an option change asking for more then fetches again (see
+[What the sidecar pushes](#what-the-sidecar-pushes)). That is not a test-only key:
+no adapter sets it yet (start.gg will, from its paging change).
+
 The tests shorten the poll loop's limits with `ZIPPER_REQUEST_TIMEOUT_MS` (10 s
 per request), `ZIPPER_POLL_DEADLINE_MS` (45 s per poll) and
-`ZIPPER_MIN_POLL_GAP_MS` (15 s between polls). Each is clamped, so it can only
-shorten its limit.
+`ZIPPER_MIN_POLL_GAP_MS` (15 s between polls), and the wait before an owed
+push is retried with `ZIPPER_PUSH_RETRY_MS` (30 s). Each is clamped, so it can
+only shorten its limit. `ZIPPER_PUSH_RETRY_MS` works only with
+`ZIPPER_ALLOW_STUB=1`: without it the wait stays 30 s whatever the variable
+says, so no setting on a normal install can make a missing `Ticker Push` be
+retried many times a second.

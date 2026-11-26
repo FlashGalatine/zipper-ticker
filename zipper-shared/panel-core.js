@@ -4,7 +4,7 @@
 // WebSocket protocol with a raw browser WebSocket (no @streamerbot/client / CDN,
 // so it works offline in the OBS CEF browser source). It subscribes to
 // General.Custom and unwraps every broadcast into window CustomEvents keyed by
-// the payload's `type`:
+// the payload's `type`, except a ticker:update the stamp rule drops (see dispatch):
 //
 //   ticker:update  — full ticker payload (detail = the payload object)
 //   ticker:status  — sidecar status       (detail = the payload object)
@@ -45,10 +45,45 @@
   // Offline indicator — the overlay styles body.offline.
   const setOffline = (off) => { if (document.body) document.body.classList.toggle('offline', off); };
 
+  // The stamp rule (ZIP-11, decision 14): the newest generatedAt of a ticker:update this
+  // page has applied, in ms, and when it applied it, on the monotonic clock.
+  let newestStamp = null;
+  let newestAt = null;
+  // How long after applying its newest stamp the page drops an update stamped older.
+  const STALE_WINDOW_MS = 5000;
+  // window.performance, read at each call: the verify suite's browser shim hands the page a
+  // stand-in clock there, so it can test the window without waiting for it.
+  const monoNow = () => window.performance.now();
+
   // Every ticker:* payload becomes a same-named window CustomEvent with the
   // payload as detail — the overlay and control page pick what they need.
+  //
+  // A ticker:update whose generatedAt is strictly older than the newest one this page
+  // has applied is dropped (ZIP-11), but only within STALE_WINDOW_MS of the moment it
+  // applied that newest one: a page's connect-sync replay that read the stored payload
+  // just before the sidecar replaced it arrives within moments of the new one. An older
+  // one that comes later is applied, and its stamp becomes the newest, so later updates
+  // are judged against it: a stamp from a clock that was ahead (a sidecar restarted after
+  // its clock was set back, or a far-future stamp) cannot freeze the page past the window.
+  // The window runs on the monotonic clock, so a change of the wall clock does not move it.
+  // Stamps are compared as dates (Date.parse), never as text: the fixture's "…:00Z" and
+  // toISOString's "…:00.500Z" sort the wrong way round as text. An equal stamp is applied
+  // (a replay carries the same content), and so is an update with no stamp, or one that is
+  // not a date, such as the C#'s connect-sync empty update; none of them moves the newest
+  // stamp or restarts the window.
   function dispatch(d) {
     if (!d || typeof d.type !== 'string' || !d.type.startsWith('ticker:')) return;
+    if (d.type === 'ticker:update') {
+      const t = typeof d.generatedAt === 'string' ? Date.parse(d.generatedAt) : NaN;
+      if (Number.isFinite(t)) {
+        const now = monoNow();
+        if (newestStamp !== null && t < newestStamp && now - newestAt <= STALE_WINDOW_MS) {
+          log('older ticker:update ignored', d.generatedAt);
+          return;
+        }
+        if (t !== newestStamp) { newestStamp = t; newestAt = now; } // newer, or older past the window
+      }
+    }
     window.dispatchEvent(new CustomEvent(d.type, { detail: d }));
   }
 

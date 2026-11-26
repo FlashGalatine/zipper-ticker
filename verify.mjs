@@ -6,11 +6,22 @@
 //      wording; each adapter's wiring to it (signal, 429, User-Agent) against a
 //      stand-in for fetch; and a static check that no bare fetch( is left in the
 //      sidecar or an adapter.
+//   2c. Two blocks of the sidecar, in-process: its send queue (one DoAction in
+//      flight, released on its reply and its own broadcast, or after 800 ms; each
+//      job's outcome, settled by a reply that comes after the release, up to 5 s, and its
+//      edges at a close; what replaces what; whether a reply answers the newest send to
+//      its action; the id map's bound; a push's stamp matched as a time, in the forms
+//      Streamer.bot writes a date in) and the milestone rule (resets, the one-step
+//      boundary, a switch of StreamElements key).
 //   3. Mock-SB E2E: the REAL panel-core.js runs in a browser shim against the
-//      mock server — Subscribe (lowercase), sync-on-connect replay, live push.
+//      mock server — Subscribe (lowercase), sync-on-connect replay, live push, and
+//      the stamp rule (an update older than the newest is dropped, compared as dates,
+//      but only within 5 s of the newest, which every newer update starts again: the
+//      shim's clock is moved on, not waited for).
 //   4. The mock itself: its HTTP maps, DoAction replies in Streamer.bot's shape,
-//      its test switches, and what it refuses (bad requests, other sites, messages
-//      over 1 MiB), and the file types it serves.
+//      its test switches (the delay switch, a slow Streamer.bot whose reply is decided
+//      when the request arrives, among them), and what it refuses (bad requests, other
+//      sites, messages over 1 MiB), and the file types it serves.
 //   5. The three bus actions as the mock runs them, against the case table
 //      tools/cs/ticker-cases.json (verify-cs.mjs runs the same rows through the
 //      compiled C#).
@@ -21,15 +32,32 @@
 //      there, and lower-cased), every range on the command path and the config path,
 //      and which commands it accepts: stub: URLs only with ZIPPER_ALLOW_STUB=1 and
 //      only inside the repo, the logo rule, the __status guard in any casing, and
-//      refusals reported in commandNotice.
+//      refusals reported in commandNotice; ZIPPER_PUSH_RETRY_MS ignored without
+//      ZIPPER_ALLOW_STUB.
 //   6h. The poll loop (ZIP-02, ZIP-06, ZIP-13): a URL changed mid-poll, a stale
 //      failure, a result, failure or 429 that comes back after setUrl (a hold that
 //      ignores the abort), the poll's deadline, the backoff, Retry-After, the minimum gap
 //      between polls, re-timing by setInterval, setOptions and setAutoSchedule, the
 //      next poll time in the status, and a wall clock set back (a sidecar with
 //      tools/clock-step-preload.cjs).
+//   6i. What is pushed, and when (ZIP-09, ZIP-11, ZIP-14, ZIP-15, ZIP-22): each
+//      status's seq and its release on its own broadcast, setUrl's blank payload (a
+//      cleared URL too), cap and option changes from the last result (setOptions
+//      included; polling on and off, the site failing, a result cut short, during a
+//      poll or a one-off fetch, a result that cannot be built, nothing kept after a
+//      restart, and the message pushed on connect after one, R3), the change check, the
+//      15-minute cap before an upcoming event, a one-off fetch of a completed event (no
+//      auto-stop), actionNotice and the reply logs, a slow Streamer.bot (the mock's delay
+//      switch: a late reply is queued, no reply in 5 s leaves the push owed, and only the
+//      newest push's outcome counts, and only its reply for the notice), and a push owed:
+//      paid across a reconnect (/mock/kick), on a status command, and by itself after the
+//      retry wait; a push in flight when the socket closes is settled at once.
 //   7. Milestone announcements: a real sidecar against a mock StreamElements, and a
-//      StreamElements request that never answers.
+//      StreamElements request that never answers; two milestones in one poll under
+//      the mock's bleed mode, a switch of the subs key, the bus down at a crossing,
+//      an announcement refused poll after poll, logged once, one whose reply comes late
+//      (queued, not announced again), and one with no reply in 5 s (timed out: its
+//      threshold kept, announced again).
 //   8. start-zipper.bat's Node version check (Windows only), with a stand-in node.
 //
 // Uses off-default ports (HTTP 7476 / WS 8082 / sidecar guards 7497, 7492 and 7487 /
@@ -534,6 +562,454 @@ async function testFetchWrapper() {
   }
 }
 
+// ── 2c. The sidecar's send queue and milestone rule, in-process (ZIP-11, ZIP-16) ─
+// Two blocks are taken from zipper-sidecar.mjs as they are and run here, with stand-ins
+// for the socket and the timers, so nothing waits: the send queue (one DoAction in
+// flight, released once its reply and its own broadcast have both arrived, or after
+// 800 ms; a job's outcome settled by its reply, which may come after the release, up to
+// 5 s after the send) with the broadcasts it matches, and the rule that moves a
+// milestone's saved threshold.
+
+function sidecarBlock(src, name) {
+  return (new RegExp(`// ── ${name}: BEGIN[^\\n]*\\n([\\s\\S]*?)// ── ${name}: END`).exec(src) || [])[1] || null;
+}
+
+async function testSidecarBlocks() {
+  console.log('\n[2c] the sidecar\'s send queue and milestone rule, in-process (blocks taken from zipper-sidecar.mjs)');
+  const src = (await readFile(resolve(__dirname, 'zipper-sidecar.mjs'), 'utf-8')).replace(/\r\n/g, '\n');
+  const turn = () => new Promise((r) => setImmediate(r));
+
+  const qBlock = sidecarBlock(src, 'send queue');
+  check('send queue: zipper-sidecar.mjs has the send queue block', !!qBlock);
+  if (qBlock) {
+    let lib = null;
+    try { lib = new Function(`${qBlock}\nreturn { createSendQueue, SEND_RELEASE_MS, SEND_OUTCOME_MS, pushMatch, statusMatch, announceMatch };`)(); }
+    catch (err) { check('send queue: the block runs on its own', false, err?.message || String(err)); }
+    if (lib) {
+      const { createSendQueue, SEND_RELEASE_MS, SEND_OUTCOME_MS, pushMatch, statusMatch, announceMatch } = lib;
+      check('send queue: the fail-safe is 800 ms (decision 3)', SEND_RELEASE_MS === 800, String(SEND_RELEASE_MS));
+      check('send queue: a job\'s outcome waits for its reply up to 5 s after the send (the owner\'s ruling of 2026-11-25)', SEND_OUTCOME_MS === 5000, String(SEND_OUTCOME_MS));
+      const WAIT_MS = SEND_OUTCOME_MS - SEND_RELEASE_MS; // the wait for a reply, after the release
+      // A stand-in socket and timers. `sent` is every DoAction sent, in order; `replies` every
+      // reply passed on to be read, and `newest` the same with whether it answers the newest
+      // job sent to its action.
+      const fake = () => {
+        const e = { sent: [], open: true, replies: [], newest: [], timers: new Map(), t: 0, ids: 0 };
+        e.q = createSendQueue({
+          send: (m) => { if (!e.open) return false; e.sent.push(m); return true; },
+          isOpen: () => e.open,
+          nextId: () => `j${++e.ids}`,
+          onReply: (name, m, newest) => { e.replies.push(`${name}:${m.status}`); e.newest.push(`${name}:${m.status}:${newest}`); },
+          setTimeout: (fn, ms) => { const id = ++e.t; e.timers.set(id, { fn, ms }); return id; },
+          clearTimeout: (id) => { e.timers.delete(id); },
+        });
+        e.fire = () => { const all = [...e.timers]; e.timers.clear(); for (const [, t] of all) t.fn(); return all.map(([, t]) => t.ms); };
+        // Fires only the timers set for `ms` (the 800 ms releases, or the waits for a reply).
+        e.fireOnly = (ms) => {
+          const hit = [...e.timers].filter(([, t]) => t.ms === ms);
+          for (const [id] of hit) e.timers.delete(id);
+          for (const [, t] of hit) t.fn();
+          return hit.length;
+        };
+        e.waits = () => [...e.timers.values()].map((t) => t.ms).sort((x, y) => x - y);
+        e.last = () => e.sent[e.sent.length - 1];
+        return e;
+      };
+      const out = (p) => { const s = { v: null }; p.then((v) => { s.v = v; }); return s; };
+      const ok = (m, args = {}) => ({ id: m.id, status: 'ok', args: { ...m.args, ...args } });
+      const notFound = (m) => ({ id: m.id, status: 'error', error: `The action '${m.action.name}' was not found` });
+      // A push is matched by its stamp as a time, so a short label ("S1", "P2") stands for a
+      // stamp of its own, one millisecond apart from every other label's; a real stamp is
+      // used as it is.
+      const labelStamps = new Map();
+      const stampOf = (s) => {
+        if (Number.isFinite(Date.parse(s))) return s;
+        if (!labelStamps.has(s)) labelStamps.set(s, new Date(Date.UTC(2026, 10, 25, 9, 0, 0, labelStamps.size + 1)).toISOString());
+        return labelStamps.get(s);
+      };
+      const update = (stamp) => ({ type: 'ticker:update', generatedAt: stampOf(stamp), matches: [] });
+      const status = (seq) => ({ type: 'ticker:command', command: '__status', value: JSON.stringify({ type: 'ticker:status', seq }) });
+      const announce = (kind, text) => ({ type: 'ticker:announce', kind, text, duration: 10 });
+      const push = (e, stamp) => out(e.q.enqueue({ name: 'Ticker Push', kind: 'push', args: { tickerPayload: stamp }, match: pushMatch(stampOf(stamp)) }));
+      const stat = (e, seq) => out(e.q.enqueue({ name: 'Ticker Command', kind: 'status', args: { command: '__status', value: String(seq) }, match: statusMatch(seq) }));
+      const ann = (e, text) => out(e.q.enqueue({ name: 'Ticker Announce', kind: 'announce', args: { kind: 'milestone', text }, match: announceMatch('milestone', text) }));
+
+      {
+        const e = fake();
+        const a = push(e, 'S1');
+        const b = stat(e, 1);
+        const c = ann(e, '300 followers — thank you!');
+        await turn();
+        const oneInFlight = e.sent.length === 1 && e.sent[0].action.name === 'Ticker Push' && e.sent[0].request === 'DoAction';
+        e.q.reply(ok(e.sent[0])); await turn();
+        const replyAlone = e.sent.length === 1 && a.v === null;
+        e.q.broadcast(update('S1')); await turn();
+        const afterBoth = e.sent.length === 2 && a.v === 'queued' && e.sent[1].action.name === 'Ticker Command';
+        e.q.broadcast(status(1)); await turn();
+        const broadcastAlone = e.sent.length === 2 && b.v === null;
+        e.q.reply(ok(e.sent[1])); await turn();
+        const otherOrder = e.sent.length === 3 && b.v === 'queued' && e.sent[2].action.name === 'Ticker Announce';
+        e.q.reply(ok(e.sent[2])); e.q.broadcast(announce('milestone', '300 followers — thank you!')); await turn();
+        check('send queue: one DoAction in flight; the next goes once the reply AND the job\'s own broadcast have both arrived, in either order (the reply alone, or the broadcast alone, holds it); each ends "queued"',
+          oneInFlight && replyAlone && afterBoth && broadcastAlone && otherOrder && c.v === 'queued' && e.timers.size === 0,
+          JSON.stringify({ oneInFlight, replyAlone, afterBoth, broadcastAlone, otherOrder, c: c.v, timers: e.timers.size }));
+      }
+      {
+        const e = fake();
+        const a = push(e, 'S1');
+        const b = ann(e, 'x');
+        await turn();
+        e.q.reply(ok(e.sent[0])); await turn();
+        const held = e.sent.length === 1 && a.v === null;
+        const fired = e.fire(); await turn();
+        check('send queue: with an ok reply and no broadcast, the fail-safe releases the next after 800 ms, and the outcome is "queued" (the action was queued; whether it ran is not known)',
+          held && fired.includes(800) && a.v === 'queued' && e.sent.length === 2 && b.v === null, JSON.stringify({ held, fired, a: a.v, sent: e.sent.length }));
+      }
+      {
+        // R2 (2026-11-25): no reply at the 800 ms release lets the next job go, but the
+        // outcome waits for the reply; one that comes late settles it.
+        const e = fake();
+        const a = push(e, 'S1');
+        stat(e, 1);
+        await turn();
+        const fired = e.fire(); await turn();
+        const released = fired.includes(SEND_RELEASE_MS) && e.sent.length === 2 && a.v === null;
+        const waits = e.waits(); // the status's release, and the push's wait for its reply
+        e.q.reply(ok(e.sent[0])); await turn();
+        check('send queue: a job with no reply at the 800 ms release lets the next go, but its outcome waits for its reply (4.2 s more, 5 s from the send): a late ok reply settles it "queued", and is read',
+          released && JSON.stringify(waits) === JSON.stringify([SEND_RELEASE_MS, WAIT_MS]) && a.v === 'queued' && e.replies.includes('Ticker Push:ok') && JSON.stringify(e.waits()) === JSON.stringify([SEND_RELEASE_MS]),
+          JSON.stringify({ released, waits, a: a.v, replies: e.replies, left: e.waits() }));
+      }
+      {
+        const e = fake();
+        const a = push(e, 'S1');
+        await turn();
+        e.fire(); await turn();
+        e.q.reply(notFound(e.sent[0])); await turn();
+        check('send queue: a late error reply ("was not found") settles a job waiting for its reply "refused", is passed on to be read, and leaves no timer',
+          a.v === 'refused' && e.replies[0] === 'Ticker Push:error' && e.timers.size === 0, JSON.stringify({ a: a.v, replies: e.replies, timers: e.timers.size }));
+      }
+      {
+        const e = fake();
+        const a = push(e, 'S1');
+        const b = stat(e, 1);
+        await turn();
+        e.fireOnly(SEND_RELEASE_MS); await turn(); // a waits for its reply; b is sent
+        e.fireOnly(SEND_RELEASE_MS); await turn(); // b waits too
+        const waiting = a.v === null && b.v === null && e.sent.length === 2;
+        const ended = e.fireOnly(WAIT_MS); await turn();
+        const outcomes = [a.v, b.v];
+        e.q.reply(ok(e.sent[0])); await turn();
+        check('send queue: with no reply 5 s after the send (the release, then 4.2 s), the outcome is "timed out", not before; a reply after that is still read and changes nothing',
+          waiting && ended === 2 && JSON.stringify(outcomes) === JSON.stringify(['timed out', 'timed out']) && a.v === 'timed out' && e.replies.includes('Ticker Push:ok') && e.timers.size === 0,
+          JSON.stringify({ waiting, ended, outcomes, after: a.v, replies: e.replies, timers: e.timers.size }));
+      }
+      {
+        const e = fake();
+        const a = push(e, 'S1');
+        const b = ann(e, 'B');
+        const c = stat(e, 3);
+        await turn();
+        e.fireOnly(SEND_RELEASE_MS); await turn(); // a waits; b is sent
+        e.fireOnly(SEND_RELEASE_MS); await turn(); // b waits; c is sent
+        const two = a.v === null && b.v === null && e.sent.length === 3 && e.waits().filter((ms) => ms === WAIT_MS).length === 2;
+        e.q.reply(notFound(e.sent[1])); await turn(); // b's reply comes first
+        const bFirst = b.v === 'refused' && a.v === null;
+        e.q.reply(ok(e.sent[0])); await turn();
+        e.q.reply(ok(e.sent[2])); e.q.broadcast(status(3)); await turn();
+        check('send queue: two jobs can wait for their replies at once; each late reply settles its own job, matched by request id, in whatever order they come',
+          two && bFirst && a.v === 'queued' && c.v === 'queued' && e.timers.size === 0, JSON.stringify({ two, bFirst, a: a.v, b: b.v, c: c.v, timers: e.timers.size }));
+      }
+      {
+        const e = fake();
+        const a = push(e, 'S1');
+        await turn();
+        e.q.broadcast(update('S1')); await turn();
+        const held = a.v === null;
+        e.fire(); await turn();
+        const e2 = fake();
+        const b = ann(e2, 'B');
+        await turn();
+        e2.q.broadcast(announce('milestone', 'B')); await turn();
+        e2.q.close(); await turn();
+        check('send queue: a job whose own broadcast arrived while it was in flight, with no reply yet, counts as "queued" when the release timer fires, and when the socket closes; it waits for nothing',
+          held && a.v === 'queued' && e.timers.size === 0 && b.v === 'queued' && e2.timers.size === 0, JSON.stringify({ held, a: a.v, timers: e.timers.size, b: b.v }));
+      }
+      {
+        const e = fake();
+        const a = ann(e, 'A');
+        await turn();
+        e.q.broadcast({ type: 'ticker:error', message: 'boom' }); await turn();
+        e.fire(); await turn();
+        check('send queue: a ticker:error while a job is in flight with no reply ends it "failed" at the release, as before; it does not wait for a reply',
+          a.v === 'failed' && e.timers.size === 0, JSON.stringify({ a: a.v, timers: e.timers.size }));
+      }
+      {
+        const e = fake();
+        const a = push(e, 'S1');
+        const b = ann(e, 'B');
+        const c = stat(e, 1);
+        await turn();
+        e.fireOnly(SEND_RELEASE_MS); await turn(); // a waits for its reply; b is in flight; c waits to be sent
+        const timers = e.waits();
+        e.q.close(); await turn();
+        check('send queue: when the socket closes, every job not yet settled is settled at once, "dropped": the one waiting for its reply, the one in flight with no reply and the one not yet sent; no timer is left',
+          JSON.stringify(timers) === JSON.stringify([SEND_RELEASE_MS, WAIT_MS]) && a.v === 'dropped' && b.v === 'dropped' && c.v === 'dropped' && e.timers.size === 0,
+          JSON.stringify({ timers, a: a.v, b: b.v, c: c.v, left: e.timers.size }));
+      }
+      {
+        // The edges of the outcomes, as docs/PROTOCOL.md words them. A ticker:error while a job
+        // is in flight with no reply, then the socket closes: "dropped" (the close comes
+        // first; at the release it would be "failed"). A job's own broadcast that comes after
+        // its release, while it waits for its reply, is not looked at: with no reply it still
+        // times out.
+        const e = fake();
+        const a = ann(e, 'A');
+        await turn();
+        e.q.broadcast({ type: 'ticker:error', message: 'boom' }); await turn();
+        e.q.close(); await turn();
+        const e2 = fake();
+        const b = ann(e2, 'B');
+        await turn();
+        e2.fireOnly(SEND_RELEASE_MS); await turn(); // b waits for its reply
+        e2.q.broadcast(announce('milestone', 'B')); await turn();
+        const stillWaiting = b.v === null;
+        e2.fireOnly(WAIT_MS); await turn();
+        check('send queue: a ticker:error while a job is in flight with no reply, then the socket closing, ends it "dropped", not "failed"; a job\'s own broadcast that comes after its release, while it waits for its reply, settles nothing, so with no reply it ends "timed out"',
+          a.v === 'dropped' && e.timers.size === 0 && stillWaiting && b.v === 'timed out' && e2.timers.size === 0,
+          JSON.stringify({ a: a.v, stillWaiting, b: b.v, timers: [e.timers.size, e2.timers.size] }));
+      }
+      {
+        // Every reply is passed on to be read with whether it answers the newest job sent to
+        // its action: an older push's late reply after a newer push was answered is not, so
+        // the sidecar does not let it undo the newer one's notice. Another action's sends in
+        // between do not count.
+        const e = fake();
+        const a = push(e, 'S1');
+        const b = push(e, 'S2');
+        await turn();
+        e.fireOnly(SEND_RELEASE_MS); await turn(); // a waits for its reply; b is sent
+        e.q.reply(notFound(e.sent[1])); await turn(); // b, the newest push, is refused
+        e.q.reply(ok(e.sent[0])); await turn(); // a's late ok
+        const e2 = fake();
+        const p = push(e2, 'S3');
+        stat(e2, 1);
+        await turn();
+        e2.fireOnly(SEND_RELEASE_MS); await turn(); // p waits for its reply; the status is sent
+        e2.q.reply(ok(e2.sent[1])); e2.q.broadcast(status(1)); await turn();
+        e2.q.reply(ok(e2.sent[0])); await turn(); // p's late ok: still the newest push sent
+        check('send queue: each reply is passed on to be read with whether it answers the newest job sent to its action: a newer push\'s refusal is, an older push\'s late ok after it is not; a status sent in between does not make a push\'s late reply an older one\'s',
+          JSON.stringify(e.newest) === JSON.stringify(['Ticker Push:error:true', 'Ticker Push:ok:false']) && a.v === 'queued' && b.v === 'refused'
+            && JSON.stringify(e2.newest) === JSON.stringify(['Ticker Command:ok:true', 'Ticker Push:ok:true']) && p.v === 'queued',
+          JSON.stringify({ first: e.newest, a: a.v, b: b.v, second: e2.newest, p: p.v }));
+      }
+      {
+        // The id map's bound (REPLIES_KEPT, 64): with Streamer.bot connected but silent, every
+        // send stays in it until its reply comes, so the oldest entry goes once there are more
+        // than 64. A send with no reply is in flight 800 ms, so the few still waiting for their
+        // replies (4.2 s after the release) are always among the newest and are never the one
+        // that goes. Here 70 announcements get no reply; as each is released, every wait for a
+        // reply but the last five ends (time passing); then every send gets its reply, late.
+        const e = fake();
+        const outs = [];
+        for (let i = 1; i <= 70; i++) outs.push(ann(e, `M${i}`));
+        await turn();
+        for (let i = 1; i <= 70; i++) {
+          e.fireOnly(SEND_RELEASE_MS); await turn();
+          const waits = [...e.timers].filter(([, t]) => t.ms === WAIT_MS);
+          for (const [id, t] of waits.slice(0, -5)) { e.timers.delete(id); t.fn(); }
+          await turn();
+        }
+        const sentAll = e.sent.length === 70;
+        const matched = e.sent.map((m) => e.q.reply(ok(m)));
+        await turn();
+        const outcomes = outs.map((o) => o.v);
+        check('send queue: the id map keeps the 64 newest sends: of 70 sends with no reply, a late reply finds only the last 64 (the six oldest are gone, and not read); the five still waiting for their replies are among them and are settled "queued" by them, the others stay "timed out"; no timer is left',
+          sentAll && matched.filter(Boolean).length === 64 && matched.slice(0, 6).every((x) => x === false) && matched.slice(6).every((x) => x === true)
+            && e.replies.length === 64 && outcomes.slice(0, 65).every((v) => v === 'timed out') && outcomes.slice(65).every((v) => v === 'queued') && e.timers.size === 0,
+          JSON.stringify({ sentAll, found: matched.filter(Boolean).length, firstSix: matched.slice(0, 6), read: e.replies.length, outcomes: outcomes.reduce((n, v) => ({ ...n, [v]: (n[v] || 0) + 1 }), {}), timers: e.timers.size }));
+      }
+      {
+        const e = fake();
+        const a = push(e, 'S1');
+        stat(e, 1);
+        await turn();
+        e.q.reply(notFound(e.sent[0])); await turn();
+        check('send queue: an error reply ("was not found") releases at once: "refused", the next is sent with no wait, and the reply is passed on to be read',
+          a.v === 'refused' && e.sent.length === 2 && e.replies[0] === 'Ticker Push:error', JSON.stringify({ a: a.v, sent: e.sent.length, replies: e.replies }));
+      }
+      {
+        const e = fake();
+        const a = ann(e, '300 followers — thank you!');
+        await turn();
+        e.q.reply(ok(e.sent[0])); e.q.broadcast({ type: 'ticker:error', message: 'boom' }); await turn();
+        const e2 = fake();
+        const b = ann(e2, 'y');
+        await turn();
+        e2.q.broadcast({ type: 'ticker:error', message: 'boom' }); await turn();
+        const beforeReply = b.v === null;
+        e2.q.reply(ok(e2.sent[0])); await turn();
+        check('send queue: a ticker:error while the job is in flight ends it "failed" (it is the run\'s end), before or after the reply',
+          a.v === 'failed' && beforeReply && b.v === 'failed', JSON.stringify({ a: a.v, beforeReply, b: b.v }));
+      }
+      {
+        const e = fake();
+        const a = push(e, '2026-11-25T10:00:00.002Z');
+        await turn();
+        e.q.reply(ok(e.sent[0])); await turn();
+        // Not this job's: a page's connect-sync replay (another stamp, or the C#'s empty
+        // update with none), a page's command, a status with no seq or another one, a
+        // Twitch announcement, our own announcement for another text.
+        for (const d of [update('2026-11-25T10:00:00.001Z'), { type: 'ticker:update', matches: [] }, { type: 'ticker:command', command: 'setUrl', value: 'x' },
+          status(undefined), status(7), announce('sub', 'Flash just subscribed!'), announce('milestone', 'other')]) e.q.broadcast(d);
+        await turn();
+        const stillHeld = a.v === null;
+        e.q.broadcast(update('2026-11-25T10:00:00.002Z')); await turn();
+        const s = fake();
+        const st = stat(s, 4);
+        await turn();
+        s.q.reply(ok(s.sent[0]));
+        for (const d of [status(3), { type: 'ticker:command', command: '__status', value: 'not json' }, update('x'), announce('milestone', 'x')]) s.q.broadcast(d);
+        await turn();
+        const statusHeld = st.v === null;
+        s.q.broadcast(status(4)); await turn();
+        const n = fake();
+        const an = ann(n, '50 subs — thank you!');
+        await turn();
+        n.q.reply(ok(n.sent[0]));
+        for (const d of [announce('sub', '50 subs — thank you!'), announce('milestone', '25 subs — thank you!'), status(1)]) n.q.broadcast(d);
+        await turn();
+        const annHeld = an.v === null;
+        n.q.broadcast(announce('milestone', '50 subs — thank you!')); await turn();
+        check('send queue: only the job\'s own broadcast releases it (a push by its generatedAt, a status by the seq in its value, an announcement by kind and text); a page\'s connect-sync, a page\'s command, another status and a Twitch announcement do not',
+          stillHeld && a.v === 'queued' && statusHeld && st.v === 'queued' && annHeld && an.v === 'queued',
+          JSON.stringify({ stillHeld, push: a.v, statusHeld, status: st.v, annHeld, announce: an.v }));
+      }
+      {
+        // Streamer.bot's WebsocketBroadcastJson writes a date-shaped string out again through
+        // Newtonsoft (measured on 1.0.7 for Greenroom: "…:00.000Z" comes back "…:00Z"), and
+        // its format drops trailing zeros of the fraction ("…:00.120Z" as "…:00.12Z"). A
+        // push's own broadcast must still release it; a stamp a millisecond off must not.
+        const forms = [['2026-11-25T10:00:00.120Z', '2026-11-25T10:00:00.12Z'], ['2026-11-25T10:00:00.000Z', '2026-11-25T10:00:00Z'], ['2026-11-25T10:00:00.100Z', '2026-11-25T10:00:00.1Z']];
+        const got = [];
+        for (const [stamp, echoed] of forms) {
+          const e = fake();
+          const a = push(e, stamp);
+          await turn();
+          e.q.reply(ok(e.sent[0]));
+          e.q.broadcast(update(new Date(Date.parse(stamp) + 1).toISOString()));
+          await turn();
+          const heldByOther = a.v === null;
+          e.q.broadcast(update(echoed));
+          await turn();
+          got.push({ stamp, echoed, heldByOther, outcome: a.v, timers: e.timers.size });
+        }
+        check('send queue: a push is matched to its broadcast by generatedAt as a time, not as text, so the forms Streamer.bot writes a date in ("…:00.12Z" for "…:00.120Z", "…:00Z" for "…:00.000Z") release it at once; a stamp a millisecond off does not',
+          got.every((g) => g.heldByOther && g.outcome === 'queued' && g.timers === 0), JSON.stringify(got));
+      }
+      {
+        const e = fake();
+        const s0 = stat(e, 0);
+        const p1 = push(e, 'P1');
+        const a1 = ann(e, 'A');
+        const p2 = push(e, 'P2');
+        const a2 = ann(e, 'A');
+        const st1 = stat(e, 1);
+        const st2 = stat(e, 2);
+        await turn();
+        const release = async (d) => { const m = e.last(); e.q.reply(ok(m)); e.q.broadcast(d); await turn(); };
+        await release(status(0));
+        // P2 is in flight now; a newer push waits behind it and does not replace it.
+        const p3 = push(e, 'P3');
+        await release(update('P2'));
+        await release(announce('milestone', 'A'));
+        await release(announce('milestone', 'A'));
+        await release(status(2));
+        await release(update('P3'));
+        const order = e.sent.map((m) => `${m.action.name}:${m.args.tickerPayload ?? m.args.text ?? m.args.value}`);
+        const want = ['Ticker Command:0', 'Ticker Push:P2', 'Ticker Announce:A', 'Ticker Announce:A', 'Ticker Command:2', 'Ticker Push:P3'];
+        check('send queue: a waiting push is replaced by a newer push, in its place, and a waiting status by a newer status (each settles with the newer one\'s outcome); announcements are never replaced, even with the same text; the job in flight is never replaced',
+          JSON.stringify(order) === JSON.stringify(want) && [s0, p1, p2, a1, a2, st1, st2, p3].every((x) => x.v === 'queued'),
+          JSON.stringify({ order, outcomes: [s0, p1, p2, a1, a2, st1, st2, p3].map((x) => x.v) }));
+      }
+      {
+        const e = fake();
+        const a = push(e, 'S1');
+        const b = ann(e, 'B');
+        await turn();
+        e.q.close(); await turn();
+        const e2 = fake();
+        const c = ann(e2, 'C');
+        await turn();
+        e2.q.reply(ok(e2.sent[0])); await turn();
+        e2.q.close(); await turn();
+        const e3 = fake();
+        e3.open = false;
+        const d = push(e3, 'S2');
+        await turn();
+        e3.open = true;
+        const f = push(e3, 'S3');
+        await turn();
+        check('send queue: when the socket closes, the job in flight with no reply and every waiting job end "dropped", one already answered ok ends "queued"; a send while the socket is closed is "dropped" at once and nothing is sent; once open again the next is sent',
+          a.v === 'dropped' && b.v === 'dropped' && c.v === 'queued' && d.v === 'dropped' && e3.sent.length === 1 && e3.sent[0].args.tickerPayload === 'S3' && f.v === null && e.timers.size === 0,
+          JSON.stringify({ a: a.v, b: b.v, c: c.v, d: d.v, e3sent: e3.sent.length }));
+      }
+      {
+        const e = fake();
+        let state = 'old';
+        stat(e, 0);
+        const lazy = out(e.q.enqueue({ name: 'Ticker Command', kind: 'status', args: () => ({ command: '__status', value: state }), match: statusMatch(9) }));
+        await turn();
+        state = 'new';
+        e.q.reply(ok(e.sent[0])); e.q.broadcast(status(0)); await turn();
+        check('send queue: arguments given as a function are taken when the job is sent, so a status that waited says what is true when it goes',
+          e.sent.length === 2 && e.sent[1].args.value === 'new' && lazy.v === null, JSON.stringify(e.sent.map((m) => m.args)));
+      }
+    }
+  }
+
+  const mBlock = sidecarBlock(src, 'milestone rule');
+  check('milestone rule: zipper-sidecar.mjs has the milestone rule block', !!mBlock);
+  if (mBlock) {
+    let milestoneStep = null;
+    try { milestoneStep = new Function(`${mBlock}\nreturn milestoneStep;`)(); }
+    catch (err) { check('milestone rule: the block runs on its own', false, err?.message || String(err)); }
+    if (milestoneStep) {
+      // Readings in order, as the poller takes them; an announcement counts as queued
+      // (its threshold is then saved). Gives what was announced and the threshold left.
+      const run = (step, readings, start = {}) => {
+        let saved = start.saved;
+        let savedKey = start.key;
+        const announced = [];
+        for (const r of readings) {
+          const [value, key] = Array.isArray(r) ? r : [r, 'subscriber-total'];
+          const res = milestoneStep({ saved, savedKey, value, key, step }) || {};
+          if (res.record !== undefined) saved = res.record;
+          if (res.announce !== undefined) { announced.push(res.announce); saved = res.announce; }
+          savedKey = key;
+        }
+        return { announced, saved };
+      };
+      const cases = [
+        ['first sighting records silently (450, step 100)', run(100, [450]), [], 400],
+        ['step 1000: 950, 1000, 999, 1000 announces once (a dip under the milestone does not repeat it)', run(1000, [950, 1000, 999, 1000]), [1000], 1000],
+        ['step 25: 20, 25, 24, 25 announces once (an unfollow and a refollow)', run(25, [20, 25, 24, 25]), [25], 25],
+        ['step 100 with 200 saved: 250, 0, 100 announces "100" once (a fall to 0 resets silently)', run(100, [250, 0, 100], { saved: 200 }), [100], 100],
+        ['step 100 with 300 saved: 150 is more than a step below, so it resets to 100 silently, and 200 announces', run(100, [150, 200], { saved: 300 }), [200], 200],
+        ['step 100 with 300 saved: 250 is less than a step below, so nothing resets, and 300 is not announced again', run(100, [250, 300], { saved: 300 }), [], 300],
+        ['step 100 with 300 saved: 200 is exactly one step below, which is not more than a step, so nothing resets, and 300 is not announced again', run(100, [200, 300], { saved: 300 }), [], 300],
+        ['step 25 with 50 saved: 25 is exactly one step below: nothing resets, and 50 is not announced again', run(25, [25, 50], { saved: 50 }), [], 50],
+        ['the subs reader switching keys (subscriber-count to subscriber-total) records the new value silently, as a first sighting, then announces from there',
+          run(25, [[200, 'subscriber-total'], [225, 'subscriber-total']], { saved: 25, key: 'subscriber-count' }), [225], 225],
+      ];
+      for (const [name, got, wantAnnounced, wantSaved] of cases) {
+        check(`milestone rule: ${name}`, JSON.stringify(got.announced) === JSON.stringify(wantAnnounced) && got.saved === wantSaved,
+          JSON.stringify({ got, wantAnnounced, wantSaved }));
+      }
+    }
+  }
+}
+
 // ── Mock server helpers ───────────────────────────────────────────────────────
 
 let mockProc = null;
@@ -611,19 +1087,22 @@ async function actAndCollect(c, name, args) {
 }
 
 // A client of the bus for the sidecar sections: the data of every General.Custom
-// broadcast it receives, unwrapped. Resolves once its Subscribe is acknowledged.
+// broadcast it receives, unwrapped, and when each arrived (times[i], performance.now(),
+// for events[i]). Resolves once its Subscribe is acknowledged.
 function busClient() {
   return new Promise((res, rej) => {
     const ws = new WebSocket(WS_URL);
     const events = [];
+    const times = [];
     ws.on('open', () => ws.send(JSON.stringify({ request: 'Subscribe', id: 'sub', events: { general: ['Custom'] } })));
     ws.on('message', (raw) => {
       let m; try { m = JSON.parse(raw.toString()); } catch { return; }
-      if (m && m.id === 'sub' && !m.event) { res({ ws, events }); return; }
+      if (m && m.id === 'sub' && !m.event) { res({ ws, events, times }); return; }
       if (m?.event?.source === 'General' && m.event.type === 'Custom') {
         let d = m.data;
         if (typeof d === 'string') { try { d = JSON.parse(d); } catch { return; } }
         events.push(d);
+        times.push(performance.now());
       }
     });
     ws.on('error', rej);
@@ -633,6 +1112,10 @@ function busClient() {
 // ── 3. panel-core in a browser shim ──────────────────────────────────────────
 
 const received = []; // every CustomEvent panel-core dispatches, for this whole run
+// The shim's monotonic clock, which panel-core reads as window.performance.now(): the real
+// one plus clockSkew, which only ever grows, so the stamp rule's 5 s window is tested by
+// moving the clock on instead of waiting.
+let clockSkew = 0;
 async function testPanelCore() {
   console.log('\n[3] panel-core (real file, browser shim, mock SB)');
 
@@ -640,6 +1123,7 @@ async function testPanelCore() {
   globalThis.CustomEvent = class { constructor(type, opts) { this.type = type; this.detail = opts?.detail; } };
   globalThis.window = {
     __SB_WS_URL: WS_URL,
+    performance: { now: () => performance.now() + clockSkew },
     addEventListener: (t, fn) => { (winListeners.get(t) || winListeners.set(t, []).get(t)).push(fn); },
     dispatchEvent: (ev) => { received.push(ev); (winListeners.get(ev.type) || []).forEach((fn) => fn(ev)); },
   };
@@ -674,6 +1158,95 @@ async function testPanelCore() {
   const ann = await waitFor(() => received.slice(atAnn).find((e) => e.type === 'ticker:announce'), 4000);
   check('panel-core: ticker:announce dispatched', ann && ann.detail.kind === 'sub' && ann.detail.duration === 3,
     JSON.stringify(ann?.detail));
+
+  // The stamp rule (ZIP-11, decision 14): panel-core drops a ticker:update whose
+  // generatedAt is strictly older than the newest it has dispatched, compared as dates,
+  // when it comes within 5 s of the moment it applied that newest one (the owner's ruling
+  // of 2026-11-25); later, it is applied and becomes the newest. An equal stamp, no stamp
+  // and a stamp that is not a date are dispatched. Each push is followed by an
+  // announcement as a marker: broadcasts reach a socket in order, so once the marker is
+  // in, the push was either dispatched before it or not at all. The first checks run
+  // well inside the window. Every stamp but the far-future one is in the fixture's day,
+  // and the last one dispatched is the newest, so the replay after section 4's kick (the
+  // last payload stored) is not older.
+  {
+    let n = 0;
+    const pushSeen = async (stamp, tag) => {
+      const at = received.length;
+      const body = { ...JSON.parse(sample), tournament: { ...JSON.parse(sample).tournament, name: tag } };
+      if (stamp === undefined) delete body.generatedAt; else body.generatedAt = stamp;
+      await fetch(`${HTTP}/mock/push`, { method: 'POST', body: JSON.stringify(body) });
+      const marker = `stamp marker ${++n}`;
+      await fetch(`${HTTP}/mock/announce?text=${enc(marker)}&kind=custom&duration=2`);
+      const seen = await waitFor(() => received.slice(at).some((e) => e.type === 'ticker:announce' && e.detail.text === marker), 4000);
+      return seen ? received.slice(at).some((e) => e.type === 'ticker:update' && e.detail.tournament?.name === tag) : 'no marker';
+    };
+    // The sample above set the newest to 20:15:00Z (no milliseconds, as the fixture writes it).
+    const laterSameSecond = await pushSeen('2026-07-11T20:15:00.500Z', 'stamp-later-ms');
+    const olderNoMs = await pushSeen('2026-07-11T20:15:00Z', 'stamp-older-no-ms');
+    const older = await pushSeen('2026-07-11T20:15:00.250Z', 'stamp-older');
+    check('panel-core: a ticker:update whose generatedAt is strictly older than the newest dispatched is not dispatched (here 0.25 s older, in toISOString\'s form)',
+      laterSameSecond === true && older === false, JSON.stringify({ laterSameSecond, older }));
+    check('panel-core: stamps are compared as dates, not as text: a toISOString stamp later in the same second (…:00.500Z) beats the fixture\'s …:00Z, and the fixture\'s …:00Z after it is older and dropped (as text each would sort the other way)',
+      laterSameSecond === true && olderNoMs === false, JSON.stringify({ laterSameSecond, olderNoMs }));
+    const equal = await pushSeen('2026-07-11T20:15:00.500Z', 'stamp-equal');
+    check('panel-core: an equal stamp with other content is dispatched', equal === true, JSON.stringify({ equal }));
+    const unstamped = await pushSeen(undefined, 'stamp-none');
+    const notADate = await pushSeen('not a date', 'stamp-not-a-date');
+    check('panel-core: a payload with no generatedAt, or one that is not a date, is dispatched (the C#\'s connect-sync empty update has none)',
+      unstamped === true && notADate === true, JSON.stringify({ unstamped, notADate }));
+    // Neither moves the newest: a stamp older than the newest before them (…:00.500Z) is
+    // still dropped after them.
+    const olderAfterNone = await pushSeen('2026-07-11T20:15:00.250Z', 'stamp-older-after-none');
+    check('panel-core: an update with no stamp, or one that is not a date, does not move the newest stamp: an older stamp after them is still dropped',
+      unstamped === true && notADate === true && olderAfterNone === false, JSON.stringify({ olderAfterNone }));
+    const newerNoMs = await pushSeen('2026-07-11T20:15:01Z', 'stamp-newer-no-ms');
+    check('panel-core: a newer stamp in the fixture\'s no-milliseconds form beats a toISOString stamp from the second before',
+      newerNoMs === true, JSON.stringify({ newerNoMs }));
+
+    // The window. The clock is moved on: 4 s after the newest (20:15:01Z) was applied an
+    // older one is still dropped; 5.2 s after, it is applied, and its stamp is the newest.
+    clockSkew += 4000;
+    const olderAt4s = await pushSeen('2026-07-11T20:15:00.900Z', 'stamp-older-4s');
+    clockSkew += 1200;
+    const olderAt5s = await pushSeen('2026-07-11T20:15:00.900Z', 'stamp-older-5s');
+    check('panel-core: an update stamped older than the newest is dropped within 5 s of the moment the page applied the newest (here 4 s after it), and applied once the window has passed (5.2 s after), on the monotonic clock',
+      olderAt4s === false && olderAt5s === true, JSON.stringify({ olderAt4s, olderAt5s }));
+    const belowReset = await pushSeen('2026-07-11T20:15:00.850Z', 'stamp-below-reset');
+    const aboveReset = await pushSeen('2026-07-11T20:15:00.950Z', 'stamp-above-reset');
+    check('panel-core: an older update applied past the window resets the newest stamp to its own: one older than it, just after, is dropped (within the new window), and one newer than it is applied, though older than the newest before',
+      belowReset === false && aboveReset === true, JSON.stringify({ belowReset, aboveReset }));
+    // A far-future stamp (a clock far ahead, or a sender's typo) no longer freezes the page.
+    const farFuture = await pushSeen('9999-12-31T23:59:59.000Z', 'stamp-far-future');
+    const frozen = await pushSeen('2026-07-11T20:15:02Z', 'stamp-after-far-future');
+    clockSkew += 5100;
+    const thawed = await pushSeen('2026-07-11T20:15:02Z', 'stamp-after-far-future-window');
+    const afterThaw = await pushSeen('2026-07-11T20:15:03Z', 'stamp-after-thaw');
+    check('panel-core: a far-future stamp ("9999-…") no longer freezes the page past the window: an ordinary stamp after it is dropped within the 5 s and applied once they have passed, and the next is judged against that one',
+      farFuture === true && frozen === false && thawed === true && afterThaw === true, JSON.stringify({ farFuture, frozen, thawed, afterThaw }));
+    // An equal stamp, and no stamp, neither move the newest nor restart the window: 4 s
+    // after the newest they are applied, and an older one 5.2 s after the newest is
+    // applied, although it comes 1.2 s after them.
+    clockSkew += 4000;
+    const equalLate = await pushSeen('2026-07-11T20:15:03Z', 'stamp-equal-late');
+    const noneLate = await pushSeen(undefined, 'stamp-none-late');
+    clockSkew += 1200;
+    const olderAfterEqual = await pushSeen('2026-07-11T20:15:02.500Z', 'stamp-older-after-equal');
+    check('panel-core: an equal stamp, and an update with no stamp, do not restart the window: an older stamp 5.2 s after the newest was applied is applied, though it comes 1.2 s after them',
+      equalLate === true && noneLate === true && olderAfterEqual === true, JSON.stringify({ equalLate, noneLate, olderAfterEqual }));
+    // Every newer update starts the window again, as each of the sidecar's pushes does in
+    // steady use: the connect-sync race (decision 14) can come at any time, not only in the
+    // page's first 5 s or just after a reset. Past the window once more, a newer stamp is
+    // applied; 4.7 s after it an older one is dropped. The last stamp is the newest again,
+    // for the replay after section 4's kick.
+    clockSkew += 6000;
+    const newerRestarts = await pushSeen('2026-07-11T20:15:04Z', 'stamp-newer-restarts');
+    clockSkew += 4700;
+    const olderInNewWindow = await pushSeen('2026-07-11T20:15:03.500Z', 'stamp-older-in-new-window');
+    const newestLast = await pushSeen('2026-07-11T20:15:05Z', 'stamp-newest-last');
+    check('panel-core: every newer update starts the 5 s window again: past the window, a newer stamp is applied, and an older one 4.7 s after it is dropped',
+      newerRestarts === true && olderInNewWindow === false && newestLast === true, JSON.stringify({ newerRestarts, olderInNewWindow, newestLast }));
+  }
 }
 
 // ── 4. The mock ───────────────────────────────────────────────────────────────
@@ -765,6 +1338,52 @@ async function testMock() {
     check('mock: /mock/queue sets the queueName of one action\'s replies; an empty queue= clears it',
       push?.m?.args?.queueName === 'Default' && command?.m?.args?.queueName === 'Mock Blocking' && cleared?.m?.args?.queueName === 'Mock Blocking',
       JSON.stringify([push?.m?.args?.queueName, command?.m?.args?.queueName, cleared?.m?.args?.queueName]));
+  }
+  // The delay switch (a slow Streamer.bot, for the send queue's late replies): the reply is
+  // held, and the run follows it; what the reply says is decided when the request arrives
+  // (/mock/missing switched on during the hold does not turn an ok into "was not found"); a
+  // request whose connection closes during the wait gets neither; ms=0 clears it; a value
+  // that is not a whole number from 0 to 60000 gets a 400.
+  {
+    let held = null, gone = null, decided = null;
+    await mockGet(`/mock/delay?name=${enc('Ticker Command')}&ms=300`);
+    try {
+      const at = a.frames.length;
+      const t0 = Date.now();
+      const r = await a.doAction('Ticker Command', { command: 'slowOne' });
+      const replyMs = Date.now() - t0;
+      const end = await a.doAction('Verify End Mark', {});
+      const before = r ? a.custom(at, r.index).filter((d) => d?.command === 'slowOne').length : null;
+      const after = r && end ? a.custom(r.index + 1, end.index).filter((d) => d?.command === 'slowOne').length : null;
+      held = { status: r?.m?.status, replyMs, before, after };
+      const pending = a.doAction('Ticker Command', { command: 'decidedOne' });
+      await sleep(100);
+      await mockGet(`/mock/missing?name=${enc('Ticker Command')}&on=1`);
+      try { decided = (await pending)?.m?.status ?? null; }
+      finally { await mockGet(`/mock/missing?name=${enc('Ticker Command')}&on=0`); }
+      await a.doAction('Verify End Mark', {}); // answered once that run is over
+      const c = await sbClient();
+      const commandsBefore = (await stats()).commandCount;
+      const atA = a.frames.length;
+      c.ws.send(JSON.stringify({ request: 'DoAction', id: 'gone', action: { name: 'Ticker Command' }, args: { command: 'goneOne' } }));
+      await sleep(50);
+      closeClient(c);
+      await sleep(500);
+      gone = { runs: (await stats()).commandCount - commandsBefore, relayed: a.custom(atA).some((d) => d?.command === 'goneOne') };
+    } finally {
+      await mockGet(`/mock/delay?name=${enc('Ticker Command')}&ms=0`);
+    }
+    const bad = [];
+    for (const v of ['-1', 'abc', '1.5', '60001', '']) {
+      const r = await fetch(`${HTTP}/mock/delay?name=${enc('Ticker Command')}&ms=${enc(v)}`);
+      if (r.status !== 400) bad.push(`${v}: ${r.status}`);
+    }
+    const fast = await a.doAction('Ticker Command', { command: 'status' });
+    const st = await stats();
+    check('mock: /mock/delay holds an action\'s reply that long and runs it after the reply; what the reply says is decided when the request arrives ("missing" switched on during the hold still gets "ok"); a request whose connection closes during the wait gets no reply and no run; ms=0 clears it, and a value that is not 0 to 60000 whole ms gets a 400',
+      held?.status === 'ok' && held.replyMs >= 290 && held.before === 0 && held.after === 1 && decided === 'ok' && gone?.runs === 0 && gone.relayed === false
+        && bad.length === 0 && fast?.m?.status === 'ok' && Object.keys(st.delays || {}).length === 0,
+      JSON.stringify({ held, decided, gone, bad, delays: st.delays }));
   }
   {
     const bad = await fetch(`${HTTP}/mock/missing?name=${enc('Ticker Pusher')}&on=1`);
@@ -953,12 +1572,12 @@ const sidecars = [];
 // Starts a test sidecar with ZIPPER_ALLOW_STUB=1, or with no ZIPPER_ALLOW_STUB at all
 // when allowStub is false (removed in any casing, since Windows matches environment
 // names without regard to case, so a value in the developer's shell cannot turn it on).
-// The poll loop's three limit overrides are removed the same way, so only the values a
-// test passes apply.
+// The poll loop's three limit overrides, the push retry override and the clock-step file
+// are removed the same way, so only the values a test passes apply.
 // If it exits before the suite stops it, the run fails at once with a line, and its
 // stdout and stderr are printed.
 // nodeArgs go before the script (section 6h preloads tools/clock-step-preload.cjs).
-const SHELL_ENV_DROPPED = ['ZIPPER_ALLOW_STUB', 'ZIPPER_REQUEST_TIMEOUT_MS', 'ZIPPER_POLL_DEADLINE_MS', 'ZIPPER_MIN_POLL_GAP_MS', 'ZIPPER_TEST_CLOCK_STEP_FILE'];
+const SHELL_ENV_DROPPED = ['ZIPPER_ALLOW_STUB', 'ZIPPER_REQUEST_TIMEOUT_MS', 'ZIPPER_POLL_DEADLINE_MS', 'ZIPPER_MIN_POLL_GAP_MS', 'ZIPPER_PUSH_RETRY_MS', 'ZIPPER_TEST_CLOCK_STEP_FILE'];
 function startSidecar(label, env, { allowStub = true, nodeArgs = [] } = {}) {
   const sc = { label, out: '', err: '', stopping: false, exited: false, code: null };
   const base = { ...process.env };
@@ -1283,6 +1902,7 @@ async function testSidecar() {
   await testConfigRanges(client);
   await testStubAtTheRead(client);
   await testPollLoop(client);
+  await testPushes();
 
   client.ws.close();
   await rm(cfgPath, { force: true });
@@ -1852,16 +2472,16 @@ async function testAccepts(client, sc, since, mark, cmd, cfgPath) {
     check('confinement: setUrl refuses a stub: path outside the repo (drive-absolute, .., a sibling folder named like the repo, UNC both ways, UNC spelling this folder\'s path, empty) with the confinement message, never ENOENT or a network error; the URL, platform, event state, start time and last poll error are kept',
       wrong.length === 0, wrong.join(' || '));
     // A save starts before the status that follows it is sent: watch the file for a
-    // change for a while after the last refusal's status. Polling is off here, so an
-    // accepted setUrl pushes nothing either: the update count can fail only from row 4.6
-    // on (an accepted URL blanks the strip). The check while polling, below, covers it now.
+    // change for a while after the last refusal's status. Polling is off here, but an
+    // accepted setUrl still pushes its blank payload at once (decision 5, row 4.6), so the
+    // update count fails if any of these refusals is taken as an accepted URL.
     const changed = await waitFor(async () => { try { return !(await readFile(cfgPath)).equals(bytesBefore); } catch { return false; } }, 1000, 50);
     const pushed = client.events.slice(at0).filter(isUpdate).length;
-    check('confinement: the refused setUrls leave config.json byte-identical and push no ticker:update (the update count is live from row 4.6)',
+    check('confinement: the refused setUrls leave config.json byte-identical and push no ticker:update (an accepted setUrl would push its blank, polling or not)',
       !!bytesBefore && !changed && pushed === 0, JSON.stringify({ configChanged: !!changed, updatesPushed: pushed }));
 
     // While polling, a refused setUrl starts no poll and pushes nothing (an accepted one
-    // polls at once), and the URL and polling stay as they were.
+    // polls once the 15 s gap allows), and the URL and polling stay as they were.
     at = mark();
     cmd('setUrl', SAFE_STUB);
     const safeSet = statusOf(await since(at, (d) => statusOf(d)?.url === SAFE_STUB));
@@ -1978,21 +2598,35 @@ async function testAccepts(client, sc, since, mark, cmd, cfgPath) {
     check('logo: an http(s) URL (remote hosts allowed), a relative path, a path on the overlay\'s server (trimmed) and an empty value (clears the cap) are accepted',
       bad.length === 0, bad.join(' || '));
 
-    // The notice outlasts the next poll, which row 6.1 relies on: with polling on, a
-    // refused logo in setCaps sets it, setCaps starts a poll, and the status that closes
-    // that poll still carries it.
-    at = mark();
-    cmd('setCaps', JSON.stringify({ text: '@PollBase', logo: keep }));
-    const pollBase = statusOf(await since(at, (d) => statusOf(d)?.caps?.text === '@PollBase'));
-    at = mark();
-    cmd('start');
-    const on = statusOf(await since(at, (d) => statusOf(d)?.polling === true && !!statusOf(d).lastPollAt && statusOf(d).lastPollAt !== pollBase?.lastPollAt));
-    at = mark();
-    cmd('setCaps', JSON.stringify({ text: '@DuringPoll', logo: 'javascript:alert(1)' }));
-    const afterPoll = statusOf(await since(at, (d) => statusOf(d)?.caps?.text === '@DuringPoll' && !!statusOf(d).lastPollAt && statusOf(d).lastPollAt !== on?.lastPollAt));
-    check('logo: commandNotice outlasts the next poll: with polling on, the status that closes the poll setCaps starts still says why the logo was refused',
-      !!on && afterPoll?.commandNotice === MSG.logo && afterPoll?.caps?.logo === keep && afterPoll?.lastError === '',
-      JSON.stringify({ polled: !!afterPoll, commandNotice: afterPoll?.commandNotice, logo: afterPoll?.caps?.logo, lastError: afterPoll?.lastError }));
+    // The notice outlasts the next poll, which row 6.1 relies on: with a poll under way
+    // (held by its stub hold file), a refused logo in setCaps sets it, and the status that
+    // closes that poll still carries it. (A cap change no longer starts a poll: it pushes
+    // the payload the sidecar holds, row 4.3.)
+    const heldName = 'held-notice.json';
+    const holdName = 'hold-notice';
+    await writeFile(join(TMP_DIR, heldName), JSON.stringify({ ...JSON.parse(await readFile(FIX('stub-result.json'), 'utf-8')), stubHoldFile: `${TMP_REL}/${holdName}` }), 'utf-8');
+    await writeFile(join(TMP_DIR, holdName), 'hold', 'utf-8');
+    try {
+      at = mark();
+      cmd('setCaps', JSON.stringify({ text: '@PollBase', logo: keep }));
+      await since(at, (d) => statusOf(d)?.caps?.text === '@PollBase');
+      at = mark();
+      cmd('setUrl', `stub:${TMP_REL}/${heldName}`);
+      const pollBase = statusOf(await since(at, (d) => statusOf(d)?.url === `stub:${TMP_REL}/${heldName}`));
+      const outAt = sc.out.length;
+      cmd('start');
+      const holding = await waitFor(() => sc.out.slice(outAt).includes(`stub: holding the poll while ${TMP_REL}/${holdName} exists`), 4000);
+      at = mark();
+      cmd('setCaps', JSON.stringify({ text: '@DuringPoll', logo: 'javascript:alert(1)' }));
+      const own = statusOf(await since(at, (d) => statusOf(d)?.caps?.text === '@DuringPoll'));
+      await rm(join(TMP_DIR, holdName), { force: true });
+      const afterPoll = statusOf(await since(at, (d) => statusOf(d)?.caps?.text === '@DuringPoll' && !!statusOf(d).lastPollAt && statusOf(d).lastPollAt !== pollBase?.lastPollAt));
+      check('logo: commandNotice outlasts the next poll: setCaps with a refused logo during a poll, and the status that closes that poll still says why the logo was refused',
+        !!holding && own?.commandNotice === MSG.logo && afterPoll?.commandNotice === MSG.logo && afterPoll?.caps?.logo === keep && afterPoll?.lastError === '',
+        JSON.stringify({ holding: !!holding, polled: !!afterPoll, commandNotice: afterPoll?.commandNotice, logo: afterPoll?.caps?.logo, lastError: afterPoll?.lastError }));
+    } finally {
+      await rm(join(TMP_DIR, holdName), { force: true });
+    }
     at = mark();
     cmd('stop');
     await since(at, (d) => statusOf(d)?.polling === false);
@@ -2066,7 +2700,8 @@ async function testStubAtTheRead(client) {
     const cfgPath = join(TMP_DIR, 'config-nostub.json');
     await writeFile(cfgPath, JSON.stringify({ tournamentUrl: SAFE_STUB, autoStart: true, pollIntervalMs: 15000, caps: { text: '', logo: '' } }), 'utf-8');
     const at = client.events.length;
-    const sc = startSidecar('no-stub sidecar [6g]', { ZIPPER_CONFIG: cfgPath, ZIPPER_GUARD_PORT: String(NOSTUB_GUARD_PORT) }, { allowStub: false });
+    // ZIPPER_PUSH_RETRY_MS asks for 60 ms: without ZIPPER_ALLOW_STUB it must not be honoured.
+    const sc = startSidecar('no-stub sidecar [6g]', { ZIPPER_CONFIG: cfgPath, ZIPPER_GUARD_PORT: String(NOSTUB_GUARD_PORT), ZIPPER_PUSH_RETRY_MS: '60' }, { allowStub: false });
     const since = sinceOn(client, sc);
     const polled = await since(at, (d) => isStatus(d) && !!parseStatus(d).lastPollAt, 6000);
     const p = polled && parseStatus(polled);
@@ -2085,6 +2720,25 @@ async function testStubAtTheRead(client) {
     check('without ZIPPER_ALLOW_STUB: setUrl with a stub: URL inside the repo is refused with the same message in commandNotice; the URL is kept and no platform is shown',
       rs?.commandNotice === MSG.stubOff && rs?.url === SAFE_STUB && rs?.platform === null,
       JSON.stringify({ commandNotice: rs?.commandNotice, url: rs?.url, platform: rs?.platform }));
+    // G7: a push refused while Ticker Push is missing is owed. The retry wait stays 30 s
+    // (the log says so), so once the action answers nothing is pushed by itself within a
+    // second; with the 60 ms asked for, it would be pushed again many times a second.
+    {
+      const outAt = sc.out.length;
+      let owed = null;
+      await mockGet(`/mock/missing?name=${enc('Ticker Push')}&on=1`);
+      try {
+        client.ws.send(JSON.stringify({ request: 'DoAction', id: 'n', action: { name: 'Ticker Command' }, args: { command: 'setMessage', value: JSON.stringify({ text: 'G7 line', enabled: true }) } }));
+        owed = await waitFor(() => (/Ticker Push refused: .*\bin (\S+ s) while it stays connected/.exec(sc.out.slice(outAt)) || [])[1], 4000);
+      } finally {
+        await mockGet(`/mock/missing?name=${enc('Ticker Push')}&on=0`);
+      }
+      const pushesBefore = (await stats()).pushCount;
+      await sleep(1000);
+      const pushesAfter = (await stats()).pushCount;
+      check('without ZIPPER_ALLOW_STUB, ZIPPER_PUSH_RETRY_MS is not honoured: asked for 60 ms, a push owed while Ticker Push was missing is retried in 30 s (the log says so), and nothing is pushed again by itself within a second once the action answers',
+        owed === '30 s' && pushesAfter === pushesBefore, JSON.stringify({ retryIn: owed, pushedAgain: pushesAfter - pushesBefore }));
+    }
     await sc.stop();
     await rm(cfgPath, { force: true });
   }
@@ -2302,15 +2956,15 @@ async function testPollLoop(client) {
     const lateLog = 'a poll of the previous tournament URL came back after setUrl; its result is thrown away';
     const lateFailLog = 'a poll of the previous tournament URL failed after setUrl; its error is thrown away';
     // Asked after setUrl to `url`: is A's poll still under way? Then no poll is armed, nothing
-    // has been pushed since `at`, and no poll has ended after the setUrl (the sidecar logs
-    // that, from `outAt` on). Had the abort ended A's poll, B would be armed by now for the
-    // end of the gap.
+    // has been pushed since `at` but setUrl's own blank payload (decision 5), and no poll
+    // has ended after the setUrl (the sidecar logs that, from `outAt` on). Had the abort
+    // ended A's poll, B would be armed by now for the end of the gap.
     const stillUnderWay = async (url, at, outAt) => {
       const atProbe = mark();
       cmd('status');
       const probe = statusOf(await since(atProbe, (d) => statusOf(d)?.url === url, REPLY_MS));
       const ok = !!probe && probe.polling === true && probe.nextPollAt === null
-        && !client.events.slice(at).some((d) => isUpdate(d)) && !sc.out.slice(outAt).includes('after setUrl');
+        && !client.events.slice(at).some((d) => isUpdate(d) && !isSetUrlBlank(d, url)) && !sc.out.slice(outAt).includes('after setUrl');
       return { ok, nextPollAt: probe ? probe.nextPollAt : 'no status' };
     };
     {
@@ -2339,7 +2993,8 @@ async function testPollLoop(client) {
       const evs = client.events.slice(at);
       const statuses = evs.filter(isStatus).map(parseStatus);
       const oldPushed = evs.filter((d) => isUpdate(d) && (d.tournament?.name === 'Late Old Cup' || d.tournament?.url === T('late-old.json'))).length;
-      const otherUnderB = evs.filter((d) => isUpdate(d) && d.tournament?.url === T('new.json') && d.tournament?.name !== 'New Cup').length;
+      // setUrl's own blank payload (decision 5) is B's, not A's.
+      const otherUnderB = evs.filter((d) => isUpdate(d) && d.tournament?.url === T('new.json') && d.tournament?.name !== 'New Cup' && !isSetUrlBlank(d, T('new.json'))).length;
       // Under B's URL a status may carry only B's own poll: before it, the lastPollAt from
       // before A's poll and no event state; never A's "completed".
       const showsA = statuses.filter((s) => s.auto?.eventState === 'completed' || s.auto?.stopped === 'completed'
@@ -2623,7 +3278,60 @@ async function testPollLoop(client) {
       const again = statusOf(await since(at, (d) => statusOf(d)?.polling === true, REPLY_MS));
       check('Retry-After: clearing the URL does not drop the wait either: set again and started, the waiting platform still waits for its end (nextPollAt unchanged)',
         !!s?.nextPollAt && !!cleared && again?.nextPollAt === s.nextPollAt, JSON.stringify({ cleared: !!cleared, before: s?.nextPollAt, after: again?.nextPollAt }));
-      await stopNow();
+      const off = await stopNow();
+      // Row 4.3, polling off: nothing is kept for the URL now set (setUrl dropped it), so an
+      // option change runs one fetch outside the poll loop. That fetch waits for the
+      // platform's Retry-After as a poll does.
+      const atOff = mark();
+      const offWrong = [];
+      for (const [command, value, pred] of [
+        ['setTopN', '2', (x) => x.topN === 2],
+        ['setMaxItems', '18', (x) => x.maxItems === 18],
+        ['setOptions', JSON.stringify({ intervalMs: 15000, maxItems: 20, topN: 0 }), (x) => x.maxItems === 20 && x.topN === 0],
+      ]) {
+        const atC = mark();
+        cmd(command, value);
+        const r = statusOf(await since(atC, (d) => { const x = statusOf(d); return !!x && pred(x); }, REPLY_MS));
+        if (!r) offWrong.push(`${command}: no status within ${REPLY_MS / 1000} s`);
+        else if (r.polling !== false) offWrong.push(`${command}: polling ${r.polling}`);
+      }
+      await sleep(POLL_LOOP_GAP_MS + 800);
+      const fetchedAnyway = pollsSince(atOff, off?.lastPollAt);
+      check('Retry-After, polling off: an option change with nothing kept (setTopN, setMaxItems, setOptions) asks for one fetch, and that fetch waits for the Retry-After too: no fetch runs, polling stays off',
+        !!off && off.polling === false && offWrong.length === 0 && fetchedAnyway === 0, JSON.stringify({ wrong: offWrong, fetches: fetchedAnyway }));
+    }
+
+    // Row 4.3, polling off, with no Retry-After (a fresh sidecar): the one fetch an option
+    // change runs outside the poll loop waits for the minimum gap after the last poll, and
+    // a setUrl before it runs drops it (it was asked for under the old URL).
+    {
+      await restart();
+      for (const n of ['oo-a', 'oo-b', 'oo-c']) await fixture(`${n}.json`, { tournamentName: `Gap ${n}`, state: 'in_progress', matches: [], standings: [] });
+      let at = mark();
+      cmd('setUrl', T('oo-a.json'));
+      const set = statusOf(await since(at, (d) => statusOf(d)?.url === T('oo-a.json')));
+      at = mark();
+      cmd('start');
+      const a = await closed(at, set?.lastPollAt, () => true, POLL_LOOP_GAP_MS + 4000);
+      // Straight after that poll: stop, a new URL (so nothing is kept), and an option change.
+      at = mark();
+      cmd('stop'); cmd('setUrl', T('oo-b.json')); cmd('setTopN', '3');
+      const b = await closed(at, a?.lastPollAt, (x) => x.url === T('oo-b.json'), POLL_LOOP_GAP_MS + 4000);
+      const apart = a && b ? Date.parse(b.lastPollAt) - Date.parse(a.lastPollAt) : NaN;
+      check(`row 4.3, polling off: the one fetch an option change runs waits for the minimum gap after the last poll (here ${POLL_LOOP_GAP_MS / 1000} s), and does not start polling`,
+        !!a && !!b && b.polling === false && apart >= POLL_LOOP_GAP_MS - 100, JSON.stringify({ apartMs: apart, polling: b?.polling }));
+      // Again straight after a fetch: a new URL, an option change (its fetch waits for the
+      // gap), and another new URL before the gap ends.
+      at = mark();
+      cmd('setUrl', T('oo-c.json')); cmd('setTopN', '4'); cmd('setUrl', T('oo-a.json'));
+      await since(at, (d) => statusOf(d)?.url === T('oo-a.json'), REPLY_MS);
+      await sleep(POLL_LOOP_GAP_MS + 800);
+      const fetched = pollsSince(at, b?.lastPollAt);
+      check('row 4.3, polling off: a setUrl before that fetch runs drops it: neither URL is fetched',
+        !!b && fetched === 0, JSON.stringify({ fetches: fetched }));
+      at = mark();
+      cmd('setTopN', '0');
+      await since(at, (d) => statusOf(d)?.topN === 0, REPLY_MS);
     }
 
     // ZIP-02, a late 429: A's poll answers 429 with Retry-After 120 after setUrl to B on
@@ -2749,6 +3457,16 @@ async function testPollLoop(client) {
       check('a wall clock set back an hour after a poll: setInterval re-times the next poll 20 s after that poll, and nextPollAt shows it on the clock as it now is, not an hour later',
         !!first && !!g && !!stepped && Math.abs(Date.parse(iv?.nextPollAt) - want) < 1500,
         JSON.stringify({ stepped: !!stepped, nextPollAt: iv?.nextPollAt ?? null, want: Number.isFinite(want) ? new Date(want).toISOString() : null }));
+      // The pages drop an update stamped older than the newest they have (decision 14), so
+      // a push after the clock was set back must not carry an older generatedAt than the
+      // poll's push before it.
+      const pushedBefore = client.events.filter((d) => isUpdate(d) && d.tournament?.url === SAFE_STUB).pop();
+      at = mark();
+      cmd('setCapsText', '@AfterClockStep');
+      const pushedAfter = await since(at, (d) => isUpdate(d) && d.caps?.text === '@AfterClockStep', REPLY_MS * 2);
+      check('a wall clock set back an hour: the next push\'s generatedAt is still later than the push before it (each stamp is later than the last), so no page drops it as older',
+        !!stepped && !!pushedBefore && !!pushedAfter && Date.parse(pushedAfter.generatedAt) > Date.parse(pushedBefore.generatedAt),
+        JSON.stringify({ before: pushedBefore?.generatedAt ?? null, after: pushedAfter?.generatedAt ?? null }));
       await sleep(POLL_LOOP_GAP_MS + 200); // past the gap after that poll, by the real clock
       at = mark();
       const tAsk = Date.now();
@@ -2767,6 +3485,881 @@ async function testPollLoop(client) {
   }
 }
 
+// ── 6i. What is pushed, and when (ZIP-09, ZIP-11, ZIP-14, ZIP-15, ZIP-22) ────
+// Its own sidecar and bus client, with the minimum gap between polls shortened to
+// 200 ms. The checks that close every connection (/mock/kick) come after the others, and
+// open the bus client again; the ones that restart the sidecar come last.
+
+// A stub result with three matches (two completed, one live) and four standings.
+const threeMatches = (name, extra = {}) => ({
+  tournamentName: name, state: 'in_progress',
+  matches: [
+    { id: 'c1', round: 'Round 1', state: 'completed', p1: { name: 'Ann', score: 2 }, p2: { name: 'Bo', score: 0 }, winner: 1, order: 1 },
+    { id: 'c2', round: 'Round 1', state: 'completed', p1: { name: 'Cy', score: 2 }, p2: { name: 'Di', score: 1 }, winner: 1, order: 2 },
+    { id: 'l1', round: 'Round 2', state: 'in_progress', p1: { name: 'Ann', score: 1 }, p2: { name: 'Cy', score: 1 }, winner: 0, order: 3 },
+  ],
+  standings: [{ placement: 1, name: 'Ann' }, { placement: 2, name: 'Cy' }, { placement: 3, name: 'Bo' }, { placement: 4, name: 'Di' }],
+  ...extra,
+});
+const hasResults = (u) => (u?.matches?.length ?? 0) > 0 || (u?.standings?.length ?? 0) > 0;
+// setUrl's own blank payload (decision 5): the new URL, no results, no name.
+const isSetUrlBlank = (d, url) => isUpdate(d) && d.tournament?.url === url && !hasResults(d) && !d.tournament?.name;
+
+async function testPushes() {
+  console.log('\n[6i] what is pushed, and when: setUrl\'s blank, caps and options from the last result, the change check, the 15-minute cap, actionNotice, a push owed across a reconnect');
+  const statusOf = (d) => (isStatus(d) ? parseStatus(d) : null);
+  const T = (name) => `stub:${TMP_REL}/${name}`;
+  const fixture = (name, body) => writeFile(join(TMP_DIR, name), typeof body === 'string' ? body : JSON.stringify(body), 'utf-8');
+  const cfgPath = join(TMP_DIR, 'config-pushes.json');
+  const holdFile = join(TMP_DIR, 'hold-6i');
+  const baseCfg = { tournamentUrl: null, autoStart: false, autoSchedule: true, pollIntervalMs: 15000, maxItems: 20, topN: 0, caps: { text: '', logo: '' } };
+  await writeFile(cfgPath, JSON.stringify(baseCfg), 'utf-8');
+  const env = { ZIPPER_CONFIG: cfgPath, ZIPPER_GUARD_PORT: String(GUARD_PORT), ZIPPER_MIN_POLL_GAP_MS: '200', ZIPPER_POLL_DEADLINE_MS: '4000' };
+  let client = await busClient();
+  let sc = null;
+  let since = null;
+  let runs = 0;
+  const start = async (cfg, extraEnv = {}) => {
+    if (sc) await sc.stop();
+    if (cfg) await writeFile(cfgPath, JSON.stringify(cfg), 'utf-8');
+    const at = client.events.length;
+    sc = startSidecar(`pushes sidecar [6i]${runs++ ? ` #${runs}` : ''}`, { ...env, ...extraEnv });
+    since = sinceOn(client, sc);
+    return statusOf(await since(at, isStatus, 8000));
+  };
+  const mark = () => client.events.length;
+  const cmd = (command, value) => client.ws.send(JSON.stringify({
+    request: 'DoAction', id: 'u', action: { name: 'Ticker Command' }, args: { command, value: value ?? '' },
+  }));
+  const statusAfter = async (command, value, pred = () => true, timeoutMs = 4000) => {
+    const at = mark();
+    cmd(command, value);
+    return statusOf(await since(at, (d) => !!statusOf(d) && pred(statusOf(d)), timeoutMs));
+  };
+  // The status that closes the next poll or fetch: one with a lastPollAt other than `before`.
+  const closed = (at, before, pred = () => true, timeoutMs = 6000) =>
+    since(at, (d) => !!statusOf(d)?.lastPollAt && statusOf(d).lastPollAt !== before && pred(statusOf(d)), timeoutMs).then(statusOf);
+  const stored = async () => { try { return JSON.parse((await stats()).storedPayload); } catch { return null; } };
+  const updatesSince = (at) => client.events.slice(at).filter(isUpdate);
+  // A status asked for after everything above: the sidecar sends in order, one at a
+  // time, so whatever it pushed before is in by the time this status is.
+  const settle = () => statusAfter('status');
+  // Sets the URL and polls it once (start, then stop once the poll has closed), so its
+  // result is the one the sidecar keeps. Gives the update that poll pushed and its status.
+  const pollOnceFor = async (url, name) => {
+    const s = await statusAfter('setUrl', url, (x) => x.url === url);
+    const at = mark();
+    cmd('start');
+    const update = await since(at, (d) => isUpdate(d) && d.tournament?.url === url && d.tournament?.name === name);
+    const status = await closed(at, s?.lastPollAt);
+    await statusAfter('stop', '', (x) => x.polling === false);
+    return { update, status };
+  };
+  // Closes every connection and waits until the mock has none; reconnect() opens the bus
+  // client again and waits for the sidecar itself to be back (it waits 3 s before it
+  // dials again, and logs when it is connected). A count of the mock's clients would not
+  // do: section 3's panel-core shim is connected too, and comes back sooner (2 s).
+  let kickedAt = 0;
+  const kick = async () => {
+    kickedAt = sc.out.length;
+    await mockGet('/mock/kick');
+    await waitFor(async () => (await stats()).clients === 0, 3000, 50);
+  };
+  const reconnect = async () => {
+    client = await busClient();
+    since = sinceOn(client, sc);
+    return waitFor(() => sc.out.slice(kickedAt).includes('Connected to Streamer.bot'), 8000, 50);
+  };
+
+  try {
+    await start();
+
+    // Row 4.2: each status carries an integer seq, rising, and the send queue releases a
+    // status on its own broadcast (the __status with that seq), not on the 800 ms
+    // fail-safe. `status` and a cap change sent together: the sidecar sends the status
+    // first, and the push waits behind it until that status's broadcast is in.
+    {
+      const at = mark();
+      cmd('status');
+      cmd('setCapsText', '@Seq');
+      const upd = await since(at, (d) => isUpdate(d) && d.caps?.text === '@Seq', 3000);
+      await settle();
+      const evs = client.events.slice(at);
+      const seqs = evs.filter(isStatus).map(parseStatus).map((x) => x.seq);
+      const rising = seqs.length >= 3 && seqs.every((q, i) => Number.isInteger(q) && (i === 0 || q > seqs[i - 1]));
+      const iStatus = evs.findIndex(isStatus);
+      const iUpd = evs.findIndex((d) => isUpdate(d) && d.caps?.text === '@Seq');
+      const afterMs = iStatus >= 0 && iUpd > iStatus ? Math.round(client.times[at + iUpd] - client.times[at + iStatus]) : null;
+      check('row 4.2: every status carries an integer seq that rises from one status to the next (the send queue tells each status\'s own broadcast by it)',
+        rising, JSON.stringify({ seqs }));
+      check('row 4.2: a status is released by its own broadcast, not by the 800 ms fail-safe: a push queued behind it follows that broadcast within 400 ms',
+        !!upd && afterMs !== null && afterMs < 400, JSON.stringify({ pushed: !!upd, afterMs }));
+      await statusAfter('setCapsText', '', (x) => x.caps?.text === '');
+    }
+
+    // Decision 5, polling off: setUrl pushes a blank payload with the caps and message kept,
+    // and option and cap changes rebuild from nothing until the new URL has a good poll.
+    {
+      await statusAfter('setMessage', JSON.stringify({ text: 'D5 line', enabled: true }), (x) => x.message?.enabled === true);
+      await statusAfter('setCaps', JSON.stringify({ text: '@D5', logo: '' }), (x) => x.caps?.text === '@D5');
+      await fixture('d5-good.json', threeMatches('D5 Cup'));
+      const before = await pollOnceFor(T('d5-good.json'), 'D5 Cup');
+      const at = mark();
+      await statusAfter('setUrl', T('d5-missing.json'), (x) => x.url === T('d5-missing.json'));
+      const blank = updatesSince(at).find((u) => u.tournament?.url === T('d5-missing.json'));
+      check('decision 5, polling off: setUrl to a URL that keeps failing pushes a blank payload at once: no matches or standings, under the new URL, the caps and the message kept',
+        hasResults(before.update) && !!blank && !hasResults(blank) && blank.tournament?.name === '' && blank.caps?.text === '@D5' && blank.message?.lines?.[0] === 'D5 line',
+        JSON.stringify({ polledBefore: !!before.update, blank }));
+      await statusAfter('setTopN', '2', (x) => x.topN === 2);
+      // Nothing is held for the new URL and polling is off: the option change runs one
+      // fetch of it, which fails.
+      const fetched = await closed(at, before.status?.lastPollAt, (x) => x.lastError === MSG.stubUnreadable, 3000);
+      // The value already set is no change: no fetch (one would run, nothing being kept).
+      const atSame = mark();
+      await statusAfter('setTopN', '2', (x) => x.topN === 2);
+      await sleep(600); // past the gap
+      await settle();
+      const sameFetches = new Set(client.events.slice(atSame).filter(isStatus).map(parseStatus).map((x) => x.lastPollAt).filter((t) => t && t !== fetched?.lastPollAt)).size;
+      check('row 4.3: setTopN to the value already set changes nothing: no fetch, although nothing is kept for the URL (a change would fetch)',
+        !!fetched && sameFetches === 0, JSON.stringify({ fetches: sameFetches }));
+      await statusAfter('setMaxItems', '5', (x) => x.maxItems === 5);
+      const capsAt = mark();
+      cmd('setCapsText', '@D5b');
+      const capsUpd = await since(capsAt, (d) => isUpdate(d) && d.caps?.text === '@D5b');
+      await sleep(600); // past the gap, for a fetch setMaxItems may have asked for
+      await settle();
+      const ups = updatesSince(at);
+      const st = await stored();
+      check('row 4.3: with nothing held for the URL just set and polling off, an option change runs one fetch of it (here it fails, in lastError); polling stays off',
+        !!fetched && fetched.polling === false && fetched.url === T('d5-missing.json'), JSON.stringify({ fetched }));
+      check('decision 5, polling off: then setTopN, setMaxItems and setCapsText push or rebuild without bringing back any match or standing from the old URL; the stored payload holds none',
+        !!capsUpd && !hasResults(capsUpd) && ups.every((u) => !hasResults(u)) && !!st && !hasResults(st),
+        JSON.stringify({ capsPushed: !!capsUpd, withResults: ups.filter(hasResults).map((u) => u.tournament?.name), stored: st && { matches: st.matches?.length, standings: st.standings?.length } }));
+    }
+
+    // Decision 5, polling on.
+    {
+      await fixture('d5-good2.json', threeMatches('D5 Cup Two'));
+      const s = await statusAfter('setUrl', T('d5-good2.json'), (x) => x.url === T('d5-good2.json'));
+      let at = mark();
+      cmd('start');
+      const good = await since(at, (d) => isUpdate(d) && d.tournament?.name === 'D5 Cup Two');
+      const first = await closed(at, s?.lastPollAt);
+      at = mark();
+      await statusAfter('setUrl', T('d5-missing2.json'), (x) => x.url === T('d5-missing2.json'));
+      const blank = updatesSince(at).find((u) => u.tournament?.url === T('d5-missing2.json'));
+      await statusAfter('setTopN', '1', (x) => x.topN === 1);
+      await statusAfter('setMaxItems', '6', (x) => x.maxItems === 6);
+      const capsAt = mark();
+      cmd('setCaps', JSON.stringify({ text: '@D5c', logo: '' }));
+      const capsUpd = await since(capsAt, (d) => isUpdate(d) && d.caps?.text === '@D5c');
+      const failed = await closed(at, first?.lastPollAt, (x) => x.url === T('d5-missing2.json') && x.lastError === MSG.stubUnreadable);
+      await statusAfter('stop', '', (x) => x.polling === false);
+      await settle();
+      const ups = updatesSince(at);
+      const st = await stored();
+      check('decision 5, polling on: the same: setUrl\'s blank (caps and message kept), then setTopN, setMaxItems and setCaps bring back no match or standing from the old URL while the new URL\'s polls fail; the stored payload holds none',
+        hasResults(good) && !!blank && !hasResults(blank) && blank.caps?.text === '@D5b' && blank.message?.lines?.[0] === 'D5 line'
+          && !!capsUpd && !hasResults(capsUpd) && !!failed && ups.every((u) => !hasResults(u)) && !!st && !hasResults(st),
+        JSON.stringify({ polledBefore: !!good, blank, capsPushed: !!capsUpd, failed: !!failed, withResults: ups.filter(hasResults).map((u) => u.tournament?.name), stored: st && { matches: st.matches?.length, standings: st.standings?.length } }));
+      await statusAfter('setMessage', JSON.stringify({ text: '', enabled: false }), (x) => x.message?.enabled === false);
+      await statusAfter('setCaps', JSON.stringify({ text: '', logo: '' }), (x) => x.caps?.text === '');
+      await statusAfter('setOptions', JSON.stringify({ intervalMs: 15000, maxItems: 20, topN: 0 }), (x) => x.maxItems === 20 && x.topN === 0);
+    }
+
+    // A refused setUrl changes nothing on the strip; the same URL set again does not blank it.
+    {
+      await fixture('keep.json', threeMatches('Keep Cup'));
+      const before = await pollOnceFor(T('keep.json'), 'Keep Cup');
+      let at = mark();
+      const refused = await statusAfter('setUrl', 'stub:../zipper-verify-outside.json', (x) => x.commandNotice === MSG.stubOutside);
+      await settle();
+      let st = await stored();
+      check('decision 5: a refused setUrl changes nothing: no blank payload is pushed, the URL stays, and the stored payload keeps its results',
+        hasResults(before.update) && refused?.url === T('keep.json') && updatesSince(at).length === 0 && st?.tournament?.name === 'Keep Cup' && hasResults(st),
+        JSON.stringify({ url: refused?.url, pushed: updatesSince(at).length, stored: st?.tournament?.name }));
+      at = mark();
+      const same = await statusAfter('setUrl', `  ${T('keep.json')}  `, (x) => x.url === T('keep.json') && x.commandNotice === '');
+      await settle();
+      st = await stored();
+      check('row 4.6 (the choice left open): setUrl to the URL already set, after trimming, does not blank the strip: nothing is pushed and the stored payload keeps its results',
+        !!same && updatesSince(at).length === 0 && st?.tournament?.name === 'Keep Cup' && hasResults(st),
+        JSON.stringify({ pushed: updatesSince(at).map((u) => u.tournament?.name), stored: st?.tournament?.name }));
+      // While polling, the same URL asks for a poll, as pollNow does (the interval is 15 s).
+      at = mark();
+      cmd('start');
+      const p1 = await closed(at, before.status?.lastPollAt);
+      at = mark();
+      await statusAfter('setUrl', T('keep.json'), (x) => x.url === T('keep.json'));
+      const p2 = await closed(at, p1?.lastPollAt, () => true, 3000);
+      await statusAfter('stop', '', (x) => x.polling === false);
+      check('row 4.6 (the choice left open): setUrl to the URL already set, while polling, asks for a poll as pollNow does: one runs once the gap allows, not one interval later',
+        !!p1 && !!p2 && p2.url === T('keep.json'), JSON.stringify({ polled: !!p1, pollAfterSetUrl: !!p2 }));
+    }
+
+    // ZIP-12 with decision 5: clearing the URL pushes the blank too, under no URL, with the
+    // caps and the message kept, so the old bracket leaves the strip.
+    {
+      await statusAfter('setMessage', JSON.stringify({ text: 'Clear line', enabled: true }), (x) => x.message?.enabled === true);
+      await statusAfter('setCapsText', '@Clear', (x) => x.caps?.text === '@Clear');
+      const had = await stored();
+      const at = mark();
+      await statusAfter('setUrl', '', (x) => x.url === null);
+      await settle();
+      const blank = updatesSince(at).find((u) => u.tournament?.url === null);
+      const st = await stored();
+      check('decision 5: setUrl with an empty value pushes the blank payload too: no results, no URL, the caps and the message kept; the stored payload no longer holds the old results',
+        hasResults(had) && !!blank && !hasResults(blank) && blank.caps?.text === '@Clear' && blank.message?.lines?.[0] === 'Clear line' && !!st && !hasResults(st),
+        JSON.stringify({ hadResults: hasResults(had), blank, stored: st && { url: st.tournament?.url, matches: st.matches?.length } }));
+      await statusAfter('setMessage', JSON.stringify({ text: '', enabled: false }), (x) => x.message?.enabled === false);
+      await statusAfter('setCapsText', '', (x) => x.caps?.text === '');
+    }
+
+    // ZIP-14: a cap or option change shows while the site is failing (polling on), and an
+    // option change shows with polling off, rebuilt from the last good result.
+    {
+      await fixture('flaky.json', threeMatches('Flaky Cup'));
+      const s = await statusAfter('setUrl', T('flaky.json'), (x) => x.url === T('flaky.json'));
+      let at = mark();
+      cmd('start');
+      const good = await since(at, (d) => isUpdate(d) && d.tournament?.name === 'Flaky Cup');
+      const first = await closed(at, s?.lastPollAt);
+      await fixture('flaky.json', 'not JSON');
+      at = mark();
+      cmd('pollNow');
+      const bad = await closed(at, first?.lastPollAt, (x) => x.lastError === MSG.stubNotObject);
+      at = mark();
+      cmd('setCapsText', '@Failing');
+      const capsUpd = await since(at, (d) => isUpdate(d) && d.caps?.text === '@Failing', 2000);
+      const logoAt = mark();
+      cmd('setCapsLogo', '/zipper-overlay/flaky-on.png');
+      const logoOn = await since(logoAt, (d) => isUpdate(d) && d.caps?.logo === '/zipper-overlay/flaky-on.png', 2000);
+      const topAt = mark();
+      cmd('setTopN', '1');
+      const topUpd = await since(topAt, (d) => isUpdate(d) && d.caps?.text === '@Failing' && d.matches?.length === 2, 2000);
+      // The control page sends Max items and Top N only through setOptions (its Apply).
+      const optAt = mark();
+      cmd('setOptions', JSON.stringify({ intervalMs: 15000, maxItems: 1, topN: 1 }));
+      const optOn = await since(optAt, (d) => isUpdate(d) && d.matches?.length === 1, 2000);
+      await settle();
+      const polls = client.events.slice(at).filter(isStatus).map(parseStatus).filter((x) => x.lastPollAt !== bad?.lastPollAt).length;
+      const annOnly = (u) => !!u && u.matches.every((m) => m.p1.name === 'Ann' || m.p2.name === 'Ann');
+      check('ZIP-14: polling on with the site failing, a cap change shows at once: the current payload, with the last good results, is pushed with the new caps, with no poll',
+        !!good && !!bad && capsUpd?.tournament?.name === 'Flaky Cup' && capsUpd.matches?.length === 3 && polls === 0,
+        JSON.stringify({ failed: bad?.lastError ?? null, pushed: capsUpd && { name: capsUpd.tournament?.name, matches: capsUpd.matches?.length }, polls }));
+      check('ZIP-14: polling on with the site failing, setTopN rebuilds from the last good result and pushes it at once (top 1: Ann\'s two matches), with no poll',
+        topUpd?.tournament?.name === 'Flaky Cup' && annOnly(topUpd) && polls === 0,
+        JSON.stringify({ pushed: topUpd && topUpd.matches.map((m) => `${m.p1.name}-${m.p2.name}`), polls }));
+      check('ZIP-14: polling on with the site failing, setOptions (the control page\'s Apply) with a new maxItems rebuilds from the last good result and pushes it at once (one of Ann\'s matches), with no poll',
+        optOn?.tournament?.name === 'Flaky Cup' && optOn.matches.length === 1 && annOnly(optOn) && polls === 0,
+        JSON.stringify({ pushed: optOn && optOn.matches.map((m) => `${m.p1.name}-${m.p2.name}`), polls }));
+      const off = await statusAfter('stop', '', (x) => x.polling === false);
+      at = mark();
+      cmd('setMaxItems', '2');
+      const maxUpd = await since(at, (d) => isUpdate(d) && d.matches?.length === 2, 2000);
+      const after = await settle();
+      check('ZIP-14: polling off, setMaxItems rebuilds from the last result and pushes it at once, with no fetch (lastPollAt unchanged, the site still failing)',
+        maxUpd?.tournament?.name === 'Flaky Cup' && after?.lastPollAt === off?.lastPollAt && after?.polling === false,
+        JSON.stringify({ pushed: maxUpd && { name: maxUpd.tournament?.name, matches: maxUpd.matches?.length }, lastPollAt: [off?.lastPollAt, after?.lastPollAt] }));
+      at = mark();
+      cmd('setOptions', JSON.stringify({ intervalMs: 15000, maxItems: 20, topN: 0 }));
+      const optOff = await since(at, (d) => isUpdate(d) && d.matches?.length === 3, 2000);
+      const afterOpt = await settle();
+      check('ZIP-14: polling off, setOptions (the control page\'s Apply) rebuilds from the last result and pushes it at once (all three matches, topN off), with no fetch (lastPollAt unchanged)',
+        optOff?.tournament?.name === 'Flaky Cup' && afterOpt?.lastPollAt === off?.lastPollAt && afterOpt?.polling === false,
+        JSON.stringify({ pushed: optOff && { name: optOff.tournament?.name, matches: optOff.matches?.length }, lastPollAt: [off?.lastPollAt, afterOpt?.lastPollAt] }));
+      // The values already set: nothing is pushed.
+      at = mark();
+      await statusAfter('setMaxItems', '20', (x) => x.maxItems === 20);
+      await statusAfter('setTopN', '0', (x) => x.topN === 0);
+      await sleep(400);
+      await settle();
+      check('row 4.3: setMaxItems and setTopN to the values already set change nothing on the strip: nothing is pushed',
+        updatesSince(at).length === 0, JSON.stringify({ pushed: updatesSince(at).length }));
+      at = mark();
+      cmd('setCapsLogo', '/zipper-overlay/flaky-off.png');
+      const logoOff = await since(at, (d) => isUpdate(d) && d.caps?.logo === '/zipper-overlay/flaky-off.png', 2000);
+      check('an accepted setCapsLogo pushes the current payload with the new logo at once, polling on and polling off (here with the last good results, the site failing)',
+        logoOn?.tournament?.name === 'Flaky Cup' && logoOn.matches?.length === 3 && logoOff?.tournament?.name === 'Flaky Cup' && logoOff.matches?.length === 3,
+        JSON.stringify({ on: logoOn && logoOn.tournament?.name, off: logoOff && logoOff.tournament?.name }));
+      await statusAfter('setCaps', JSON.stringify({ text: '', logo: '' }), (x) => x.caps?.text === '' && x.caps?.logo === '');
+    }
+
+    // Row 4.3: a result its adapter cut short is fetched again when a command asks for more
+    // than it holds; one that was not is rebuilt.
+    {
+      const cutMatches = (n) => Array.from({ length: n }, (_, k) => k + 1).map((i) => ({ id: `k${i}`, round: 'Round 1', state: 'completed', p1: { name: i === 1 ? 'Ann' : `P${i}`, score: 2 }, p2: { name: `Q${i}`, score: 0 }, winner: 1, order: i }));
+      const cutStandings = [{ placement: 1, name: 'Ann' }, { placement: 2, name: 'P2' }];
+      // As the adapter would give it under maxItems 2: it stopped reading at two matches.
+      await fixture('cut.json', { tournamentName: 'Cut Cup', state: 'in_progress', cutShort: true, matches: cutMatches(2), standings: cutStandings });
+      await fixture('full.json', { tournamentName: 'Full Cup', state: 'in_progress', cutShort: false, matches: cutMatches(3), standings: cutStandings });
+      await statusAfter('setMaxItems', '2', (x) => x.maxItems === 2);
+      const p = await pollOnceFor(T('cut.json'), 'Cut Cup');
+      // Read again, the site has a third.
+      await fixture('cut.json', { tournamentName: 'Cut Cup', state: 'in_progress', cutShort: true, matches: cutMatches(3), standings: cutStandings });
+      let at = mark();
+      cmd('setMaxItems', '3');
+      const refetched = await closed(at, p.status?.lastPollAt, () => true, 3000);
+      const cutUps = updatesSince(at).filter((d) => d.tournament?.name === 'Cut Cup');
+      const iRebuilt = cutUps.findIndex((d) => d.matches?.length === 2);
+      const iFetched = cutUps.findIndex((d) => d.matches?.length === 3);
+      check('row 4.3: a result its adapter cut short (cutShort) is rebuilt at once when setMaxItems asks for more than it held, then fetched again (polling off): the fetch\'s third match is pushed after the rebuild; polling stays off',
+        p.update?.matches?.length === 2 && !!refetched && refetched.polling === false && iRebuilt >= 0 && iFetched > iRebuilt,
+        JSON.stringify({ first: p.update?.matches?.length, refetched: !!refetched, pushed: cutUps.map((d) => d.matches?.length) }));
+      await statusAfter('setMaxItems', '2', (x) => x.maxItems === 2);
+      const f = await pollOnceFor(T('full.json'), 'Full Cup');
+      at = mark();
+      cmd('setMaxItems', '3');
+      const u2 = await since(at, (d) => isUpdate(d) && d.tournament?.name === 'Full Cup' && d.matches?.length === 3, 2000);
+      await sleep(400);
+      const after = await settle();
+      check('row 4.3: a result that was not cut short is rebuilt when setMaxItems rises, and not fetched again (lastPollAt unchanged)',
+        f.update?.matches?.length === 2 && !!u2 && after?.lastPollAt === f.status?.lastPollAt,
+        JSON.stringify({ pushed: u2?.matches?.length ?? null, lastPollAt: [f.status?.lastPollAt, after?.lastPollAt] }));
+      await statusAfter('setMaxItems', '2', (x) => x.maxItems === 2);
+      const p3 = await pollOnceFor(T('cut.json'), 'Cut Cup');
+      at = mark();
+      cmd('setTopN', '1');
+      const refetched3 = await closed(at, p3.status?.lastPollAt, () => true, 3000);
+      check('row 4.3: topN switched on after a result cut short fetches again', !!p3.update && !!refetched3 && refetched3.polling === false,
+        JSON.stringify({ refetched: !!refetched3 }));
+      await statusAfter('setOptions', JSON.stringify({ intervalMs: 15000, maxItems: 20, topN: 0 }), (x) => x.maxItems === 20 && x.topN === 0);
+
+      // Polling on, and the command comes while a poll is under way: that poll was fetched
+      // under the old maxItems, so it can come back cut short too. Once it ends the sidecar
+      // fetches again, after the gap, not one interval (15 s) later.
+      await fixture('cutp.json', { tournamentName: 'Cut Poll Cup', state: 'in_progress', cutShort: true, matches: cutMatches(2), standings: cutStandings, stubHoldFile: `${TMP_REL}/hold-6i` });
+      await statusAfter('setMaxItems', '2', (x) => x.maxItems === 2);
+      const pp = await pollOnceFor(T('cutp.json'), 'Cut Poll Cup'); // no hold file yet: no wait
+      await writeFile(holdFile, 'hold', 'utf-8');
+      const outAt = sc.out.length;
+      at = mark();
+      cmd('start');
+      const holding = await waitFor(() => sc.out.slice(outAt).includes('stub: holding the poll'), 4000);
+      // The held poll has read its file; the next read finds a third match.
+      await fixture('cutp.json', { tournamentName: 'Cut Poll Cup', state: 'in_progress', cutShort: true, matches: cutMatches(3), standings: cutStandings, stubHoldFile: `${TMP_REL}/hold-6i` });
+      await statusAfter('setMaxItems', '3', (x) => x.maxItems === 3);
+      await rm(holdFile, { force: true });
+      const pollsAfter = () => [...new Set(client.events.slice(at).filter(isStatus).map(parseStatus).map((x) => x.lastPollAt).filter((t) => t && t !== pp.status?.lastPollAt))];
+      const two = await waitFor(() => (pollsAfter().length >= 2 ? pollsAfter() : null), 5000); // one interval would be 15 s
+      const third = updatesSince(at).find((d) => d.tournament?.name === 'Cut Poll Cup' && d.matches?.length === 3);
+      await statusAfter('stop', '', (x) => x.polling === false);
+      check('row 4.3, polling on: a command asking for more than a cut-short result held, made while a poll is under way, is not lost: once that poll ends the sidecar polls again after the gap, and the third match is pushed',
+        !!pp.update && !!holding && !!two && !!third, JSON.stringify({ holding: !!holding, polls: pollsAfter().length, thirdPushed: !!third }));
+      await statusAfter('setOptions', JSON.stringify({ intervalMs: 15000, maxItems: 20, topN: 0 }), (x) => x.maxItems === 20 && x.topN === 0);
+    }
+
+    // Row 4.3, polling off: an option change made while the one fetch another asked for is
+    // under way is carried by that fetch (it builds with the settings as they are when it
+    // returns), so no second fetch follows when it succeeds; when it fails, nothing is kept
+    // still, and one more fetch runs once the gap allows.
+    {
+      const fetchesSince = (at, before) => new Set(client.events.slice(at).filter(isStatus).map(parseStatus).map((x) => x.lastPollAt).filter((t) => t && t !== before)).size;
+      const outcomes = {};
+      for (const [name, extra, label] of [['oo-ok.json', {}, 'ok'], ['oo-fail.json', { stubFail: { status: 500 } }, 'fail']]) {
+        await fixture(name, { ...threeMatches(`One-off ${label}`), stubHoldFile: `${TMP_REL}/hold-6i`, ...extra });
+        const s = await statusAfter('setUrl', T(name), (x) => x.url === T(name)); // polling off, nothing kept
+        await writeFile(holdFile, 'hold', 'utf-8');
+        const outAt = sc.out.length;
+        const at = mark();
+        cmd('setTopN', '1');
+        const holding = await waitFor(() => sc.out.slice(outAt).includes('stub: holding the poll'), 4000);
+        await statusAfter('setMaxItems', label === 'ok' ? '5' : '6', (x) => x.maxItems === (label === 'ok' ? 5 : 6));
+        await rm(holdFile, { force: true });
+        await closed(at, s?.lastPollAt, () => true, 3000);
+        // A second fetch, if one comes, runs once the gap (200 ms) has passed.
+        if (label === 'fail') await waitFor(() => fetchesSince(at, s?.lastPollAt) >= 2, 3000);
+        else await sleep(800);
+        await settle();
+        const pushed = updatesSince(at).find((d) => d.tournament?.name === `One-off ${label}`);
+        outcomes[label] = { holding: !!holding, fetches: fetchesSince(at, s?.lastPollAt), pushed: pushed ? pushed.matches.length : null };
+        await statusAfter('setOptions', JSON.stringify({ intervalMs: 15000, maxItems: 20, topN: 0 }), (x) => x.maxItems === 20 && x.topN === 0);
+      }
+      check('row 4.3, polling off: an option change during the one fetch another asked for adds no second fetch when that fetch succeeds; its result is built with both changes (top 1: Ann\'s two matches)',
+        outcomes.ok?.holding && outcomes.ok.fetches === 1 && outcomes.ok.pushed === 2, JSON.stringify(outcomes.ok));
+      check('row 4.3, polling off: when that fetch fails, nothing is kept still, so one more fetch runs once the gap allows (two in all)',
+        outcomes.fail?.holding && outcomes.fail.fetches === 2, JSON.stringify(outcomes.fail));
+    }
+
+    // Row 4.3: a result that cannot be built (a standing that is not an object) fails its
+    // poll and is not kept: an option change rebuilds from the last result that built. One
+    // that builds only under the settings it was polled with (a lone such standing, read
+    // once topN is on) must not end the process when an option change rebuilds it.
+    {
+      await fixture('odd.json', threeMatches('Odd Cup'));
+      const p = await pollOnceFor(T('odd.json'), 'Odd Cup');
+      await fixture('odd.json', { ...threeMatches('Odd Cup Bad'), standings: [null, { placement: 1, name: 'Ann' }] });
+      let at = mark();
+      cmd('start');
+      const failed = await closed(at, p.status?.lastPollAt, (x) => !!x.lastError, 3000);
+      await statusAfter('stop', '', (x) => x.polling === false);
+      at = mark();
+      cmd('setMaxItems', '2');
+      const rebuilt = await since(at, (d) => isUpdate(d) && d.matches?.length === 2, 2000);
+      check('row 4.3: a poll whose result cannot be built fails (lastError), and that result is not kept: setMaxItems then rebuilds from the last result that built',
+        !!p.update && !!failed && rebuilt?.tournament?.name === 'Odd Cup', JSON.stringify({ lastError: failed?.lastError ?? null, rebuilt: rebuilt?.tournament?.name ?? null }));
+      await fixture('odd.json', { ...threeMatches('Odd Cup One'), standings: [null] });
+      at = mark();
+      cmd('start');
+      const lone = await since(at, (d) => isUpdate(d) && d.tournament?.name === 'Odd Cup One', 3000);
+      await statusAfter('stop', '', (x) => x.polling === false);
+      const outAt = sc.out.length;
+      at = mark();
+      const answered = await statusAfter('setTopN', '2', (x) => x.topN === 2, 3000);
+      await sleep(300);
+      check('row 4.3: an option change whose rebuild throws (a lone standing that is not an object, read once topN is on) is logged and pushes nothing; the sidecar keeps running and answers',
+        !!lone && !!answered && !sc.gone() && updatesSince(at).length === 0 && sc.out.slice(outAt).includes('could not rebuild the payload'),
+        JSON.stringify({ polled: !!lone, answered: !!answered, running: !sc.gone(), pushed: updatesSince(at).length }));
+      await statusAfter('setOptions', JSON.stringify({ intervalMs: 15000, maxItems: 20, topN: 0 }), (x) => x.maxItems === 20 && x.topN === 0);
+    }
+
+    // ZIP-15: the change check covers the winner, the round and the event's state.
+    {
+      const change = (winner, round, state) => ({ tournamentName: 'Change Cup', state, standings: [],
+        matches: [{ id: 'w1', round, state: 'completed', p1: { name: 'Ann', score: 2 }, p2: { name: 'Bo', score: 1 }, winner, order: 1 }] });
+      await fixture('change.json', change(2, 'Round 1', 'in_progress'));
+      const s = await statusAfter('setUrl', T('change.json'), (x) => x.url === T('change.json'));
+      let at = mark();
+      cmd('start');
+      const first = await since(at, (d) => isUpdate(d) && d.tournament?.name === 'Change Cup');
+      let last = await closed(at, s?.lastPollAt);
+      const pollAgain = async (body) => {
+        await fixture('change.json', body);
+        const a = mark();
+        cmd('pollNow');
+        last = await closed(a, last?.lastPollAt);
+        await settle();
+        return updatesSince(a).find((u) => u.tournament?.name === 'Change Cup') || null;
+      };
+      const winner = await pollAgain(change(1, 'Round 1', 'in_progress'));
+      check('ZIP-15: a winner corrected with unchanged scores is pushed', first?.matches?.[0]?.winner === 2 && winner?.matches?.[0]?.winner === 1,
+        JSON.stringify({ before: first?.matches?.[0]?.winner, pushed: winner?.matches?.[0]?.winner ?? null }));
+      const round = await pollAgain(change(1, 'Winners Round 1', 'in_progress'));
+      check('ZIP-15: a changed round name, all else the same, is pushed', round?.matches?.[0]?.round === 'Winners Round 1', JSON.stringify({ pushed: round?.matches?.[0]?.round ?? null }));
+      const done = await pollAgain(change(1, 'Winners Round 1', 'completed'));
+      const st = await stored();
+      check('ZIP-15: the event moving to completed with no set changing is pushed before the auto-stop, so the stored payload says completed',
+        done?.tournament?.state === 'completed' && last?.polling === false && last?.auto?.stopped === 'completed' && st?.tournament?.state === 'completed',
+        JSON.stringify({ pushed: done?.tournament?.state ?? null, polling: last?.polling, stopped: last?.auto?.stopped, stored: st?.tournament?.state }));
+    }
+
+    // A fetch outside the poll loop (polling off, nothing kept, an option change) whose
+    // result is a completed event: it is pushed, but auto start/stop does not act on it, so
+    // a one-off fetch never reads as an automatic stop (auto.stopped stays null).
+    {
+      await fixture('done-oneoff.json', { ...threeMatches('Done One-off Cup'), state: 'completed' });
+      const s = await statusAfter('setUrl', T('done-oneoff.json'), (x) => x.url === T('done-oneoff.json') && x.polling === false && x.auto?.enabled === true);
+      const outAt = sc.out.length;
+      const at = mark();
+      cmd('setMaxItems', '7');
+      const fetched = await closed(at, s?.lastPollAt, () => true, 3000);
+      await settle();
+      const up = updatesSince(at).find((d) => d.tournament?.name === 'Done One-off Cup');
+      check('a one-off fetch with polling off whose result is a completed event is pushed, but does not auto-stop: auto.stopped stays null and the log has no "polling auto-stopped"',
+        !!fetched && fetched.polling === false && fetched.auto?.eventState === 'completed' && fetched.auto?.stopped === null && up?.tournament?.state === 'completed'
+          && !sc.out.slice(outAt).includes('polling auto-stopped'),
+        JSON.stringify({ fetched: fetched && { polling: fetched.polling, eventState: fetched.auto?.eventState, stopped: fetched.auto?.stopped }, pushed: !!up, logged: sc.out.slice(outAt).includes('polling auto-stopped') }));
+      await statusAfter('setMaxItems', '20', (x) => x.maxItems === 20);
+    }
+
+    // Row 4.6: the wait before an upcoming event is at most 15 minutes, never below the interval.
+    {
+      const due = (x) => (x?.nextPollAt && x?.lastPollAt ? Date.parse(x.nextPollAt) - Date.parse(x.lastPollAt) : NaN);
+      await fixture('later.json', { tournamentName: 'Later Cup', state: 'upcoming', startAt: new Date(Date.now() + 2 * 3600000).toISOString(), matches: [], standings: [] });
+      const s = await statusAfter('setUrl', T('later.json'), (x) => x.url === T('later.json'));
+      let at = mark();
+      cmd('start');
+      const w = await closed(at, s?.lastPollAt, (x) => !!x.auto?.waitingUntil);
+      check('row 4.6: before an event that starts in 2 hours, the next poll is 15 minutes away, not at the start time, so a bracket started early is picked up',
+        Math.abs(due(w) - 900000) < 1500 && w?.auto?.waitingUntil === w?.nextPollAt, JSON.stringify({ inMs: due(w), waitingUntil: w?.auto?.waitingUntil, nextPollAt: w?.nextPollAt }));
+      const iv = await statusAfter('setInterval', '3600000', (x) => x.intervalMs === 3600000);
+      check('row 4.6: the 15-minute cap never goes below the poll interval: with a one-hour interval the wait before that event is one hour',
+        Math.abs(due(iv) - 3600000) < 1500, JSON.stringify({ inMs: due(iv) }));
+      await statusAfter('stop', '', (x) => x.polling === false);
+      await statusAfter('setInterval', '15000', (x) => x.intervalMs === 15000);
+      await fixture('nostart.json', { tournamentName: 'No Date Cup', state: 'upcoming', matches: [], standings: [] });
+      const s2 = await statusAfter('setUrl', T('nostart.json'), (x) => x.url === T('nostart.json'));
+      at = mark();
+      cmd('start');
+      const n = await closed(at, s2?.lastPollAt, (x) => !!x.auto?.waitingUntil);
+      check('row 4.6: with no start time the slow re-check stays as it was: 5 minutes with a 15-second interval',
+        Math.abs(due(n) - 300000) < 1500, JSON.stringify({ inMs: due(n) }));
+      await statusAfter('stop', '', (x) => x.polling === false);
+    }
+
+    // R2 (the owner's ruling of 2026-11-25), through the mock's delay switch: a slow
+    // Streamer.bot. The send queue still lets the next send go 800 ms after one with no
+    // reply, but each push's outcome is settled by its reply when it comes (within 5 s),
+    // and only the newest push's outcome counts.
+    {
+      const NOT_FOUND = 'Ticker Push not found';
+      const owedLines = (from) => sc.out.slice(from).split(/\r?\n/).filter((l) => /Ticker Push (timed out|dropped|refused|failed):/.test(l));
+      const heldSince = (mark) => waitFor(() => mockOutSince(mark).includes('Ticker Push: the reply is held'), 3000, 20);
+      await fixture('slow.json', threeMatches('Slow Cup'));
+      await pollOnceFor(T('slow.json'), 'Slow Cup');
+
+      // A reply 1.5 s late (after the release, inside the 5 s): queued, nothing owed. The
+      // check is made once the 5 s are over, so a reply that settled nothing would show.
+      {
+        const outAt = sc.out.length;
+        const mockAt = mockOutTotal;
+        let held = null, heldAt = 0, up = null;
+        await mockGet(`/mock/delay?name=${enc('Ticker Push')}&ms=1500`);
+        try {
+          const at = mark();
+          cmd('setCapsText', '@Slow');
+          held = await heldSince(mockAt);
+          heldAt = Date.now();
+          up = await since(at, (d) => isUpdate(d) && d.caps?.text === '@Slow', 4000);
+        } finally {
+          await mockGet(`/mock/delay?name=${enc('Ticker Push')}&ms=0`);
+        }
+        await sleep(Math.max(0, heldAt + 5400 - Date.now()));
+        const pushesBefore = (await stats()).pushCount;
+        await settle(); // a status command pays a push still owed
+        await sleep(400);
+        const pushesAfter = (await stats()).pushCount;
+        check('R2: a push whose reply comes 1.5 s late (after the 800 ms release, inside the 5 s) is queued: no push is owed once the 5 s are over (no "Ticker Push timed out" line, and the next status command pushes nothing)',
+          !!held && !!up && owedLines(outAt).length === 0 && pushesAfter === pushesBefore,
+          JSON.stringify({ held: !!held, delivered: !!up, owedLines: owedLines(outAt), pushedAgain: pushesAfter - pushesBefore }));
+      }
+
+      // A push that gets no reply within 5 s, with no newer push, is "timed out" and owed:
+      // the log says so about 5 s after the send, its reply at 6 s does not pay it (its
+      // outcome is settled), and the next status command pushes it again.
+      {
+        const outAt = sc.out.length;
+        const mockAt = mockOutTotal;
+        let held = null, heldAt = 0;
+        await mockGet(`/mock/delay?name=${enc('Ticker Push')}&ms=6000`);
+        try {
+          cmd('setCapsText', '@TimedOut');
+          held = await heldSince(mockAt);
+          heldAt = Date.now();
+        } finally {
+          await mockGet(`/mock/delay?name=${enc('Ticker Push')}&ms=0`); // the push paid later is answered at once
+        }
+        const timedOut = await waitFor(() => owedLines(outAt).find((l) => l.includes('Ticker Push timed out:')), 6500, 50);
+        const timedOutMs = timedOut ? Date.now() - heldAt : null;
+        const lateRun = await waitFor(async () => (await stored())?.caps?.text === '@TimedOut', 4000, 100); // the late run, at 6 s
+        await sleep(200);
+        const pushesBefore = (await stats()).pushCount;
+        await settle(); // a status command pays a push still owed
+        await sleep(400);
+        const pushesAfter = (await stats()).pushCount;
+        check('R2: a push with no reply within 5 s, and no newer push, is "timed out" and owed: the log says so about 5 s after the send, its late reply (at 6 s) does not pay it, and the next status command pushes it again',
+          !!held && !!timedOut && timedOutMs >= 4500 && !!lateRun && pushesAfter === pushesBefore + 1,
+          JSON.stringify({ held: !!held, timedOutMs, lateRun: !!lateRun, pushedAgain: pushesAfter - pushesBefore }));
+      }
+
+      // An older push that times out while a newer push is still waiting for its reply owes
+      // nothing and logs nothing: only the newest push's outcome counts. The older one's reply
+      // is held 7 s and the newer one's 4.6 s (it is sent at the older one's 800 ms release),
+      // so the older one's 5 s end comes about 0.4 s before the newer one's reply settles it
+      // "queued", inside its own 5 s.
+      {
+        const outAt = sc.out.length;
+        const mockAt = mockOutTotal;
+        let held = null, heldAt = 0, newerHeld = null, newer = null;
+        await mockGet(`/mock/delay?name=${enc('Ticker Push')}&ms=7000`);
+        try {
+          cmd('setCapsText', '@OlderTimesOut');
+          held = await heldSince(mockAt);
+          heldAt = Date.now();
+          await mockGet(`/mock/delay?name=${enc('Ticker Push')}&ms=4600`);
+          const mockAt2 = mockOutTotal;
+          const at = mark();
+          cmd('setCapsText', '@NewerSlow');
+          newerHeld = await waitFor(() => mockOutSince(mockAt2).includes('Ticker Push: the reply is held 4600 ms'), 3000, 20);
+          newer = await since(at, (d) => isUpdate(d) && d.caps?.text === '@NewerSlow', 7000);
+        } finally {
+          await mockGet(`/mock/delay?name=${enc('Ticker Push')}&ms=0`);
+        }
+        const newerMs = newer ? Date.now() - heldAt : null;
+        await sleep(Math.max(0, heldAt + 7400 - Date.now())); // past the older one's late reply and run
+        const pushesBefore = (await stats()).pushCount;
+        await settle();
+        await sleep(300);
+        const pushesAfter = (await stats()).pushCount;
+        check('R2: an older push that times out while a newer push is still waiting for its reply owes nothing: no "Ticker Push timed out" line (the newer one is queued by its reply, after the older one\'s 5 s), and the next status command pushes nothing',
+          !!held && !!newerHeld && !!newer && newerMs > 5000 && owedLines(outAt).length === 0 && pushesAfter === pushesBefore,
+          JSON.stringify({ held: !!held, newerHeld: !!newerHeld, newerMs, owedLines: owedLines(outAt), pushedAgain: pushesAfter - pushesBefore }));
+      }
+
+      // An older push that gets no reply within 5 s, after a newer push was queued, owes
+      // nothing: the newer one carried the whole payload. (Its run comes 7 s late and puts
+      // the older payload in the store, as a run that late would.)
+      {
+        const outAt = sc.out.length;
+        const mockAt = mockOutTotal;
+        let held = null, heldAt = 0, newer = null, beforeLate = null;
+        await mockGet(`/mock/delay?name=${enc('Ticker Push')}&ms=7000`);
+        try {
+          cmd('setCapsText', '@OlderSlow');
+          held = await heldSince(mockAt);
+          heldAt = Date.now();
+        } finally {
+          await mockGet(`/mock/delay?name=${enc('Ticker Push')}&ms=0`);
+        }
+        await sleep(900); // the 800 ms release has let the next send go
+        const at = mark();
+        cmd('setCapsText', '@NewerFast');
+        newer = await since(at, (d) => isUpdate(d) && d.caps?.text === '@NewerFast', 3000);
+        await sleep(Math.max(0, heldAt + 5400 - Date.now())); // the older push's 5 s are over
+        const pushesBefore = (await stats()).pushCount;
+        await settle();
+        await sleep(300);
+        const pushesAfter = (await stats()).pushCount;
+        beforeLate = { owed: owedLines(outAt), pushedAgain: pushesAfter - pushesBefore, elapsedMs: Date.now() - heldAt };
+        await waitFor(async () => (await stored())?.caps?.text === '@OlderSlow', 4000, 100); // the late run
+        check('R2: an older push with no reply within 5 s, settled after a newer push was queued, owes nothing: no "Ticker Push timed out" line, and the next status command pushes nothing',
+          !!held && !!newer && beforeLate.owed.length === 0 && beforeLate.pushedAgain === 0 && beforeLate.elapsedMs < 7000,
+          JSON.stringify({ held: !!held, newer: !!newer, ...beforeLate }));
+      }
+
+      // A late "queued" for an older push does not pay a newer push that was refused: the
+      // newer one stays owed, and the next status command pushes it. Nor does that late ok
+      // clear the "Ticker Push not found" the newer one's refusal set: only the reply to the
+      // newest send counts for the notice (no "answers again" line, no status with it cleared).
+      {
+        const outAt = sc.out.length;
+        const mockAt = mockOutTotal;
+        let held = null, refused = null, afterRefused = 0;
+        await mockGet(`/mock/delay?name=${enc('Ticker Push')}&ms=2000`);
+        try {
+          cmd('setCapsText', '@OlderOk');
+          held = await heldSince(mockAt);
+        } finally {
+          await mockGet(`/mock/delay?name=${enc('Ticker Push')}&ms=0`);
+        }
+        await mockGet(`/mock/missing?name=${enc('Ticker Push')}&on=1`);
+        try {
+          await sleep(900);
+          refused = await statusAfter('setCapsText', '@NewerRefused', (x) => x.caps?.text === '@NewerRefused' && x.actionNotice === NOT_FOUND);
+          afterRefused = mark();
+        } finally {
+          await mockGet(`/mock/missing?name=${enc('Ticker Push')}&on=0`);
+        }
+        const lateRun = await waitFor(async () => (await stored())?.caps?.text === '@OlderOk', 4000, 100);
+        await sleep(200);
+        const clearedBy = client.events.slice(afterRefused).filter(isStatus).map(parseStatus).filter((x) => x.actionNotice === '').length;
+        const answersAgain = sc.out.slice(outAt).includes('Ticker Push answers again');
+        await statusAfter('status', '', (x) => x.actionNotice === '', 3000);
+        const paid = await waitFor(async () => (await stored())?.caps?.text === '@NewerRefused', 3000, 100);
+        check('R2: a late "queued" for an older push does not pay a newer push that was refused: once the older one\'s late run is in, the newer one is still owed, and the next status command pushes it',
+          !!held && !!refused && !!lateRun && !!paid, JSON.stringify({ held: !!held, refused: !!refused, lateRun: !!lateRun, paid: !!paid }));
+        check('R2: nor does that late ok clear the "Ticker Push not found" the newer push\'s refusal set: until the next status command, no status clears actionNotice and the log has no "Ticker Push answers again" (the paid push\'s own ok then clears it)',
+          !!refused && !!lateRun && clearedBy === 0 && !answersAgain, JSON.stringify({ clearedBy, answersAgain }));
+      }
+      await statusAfter('setCapsText', '', (x) => x.caps?.text === '' && x.actionNotice === '');
+    }
+
+    // Replies are read: a Default queue is logged once; an action answering "not found" is
+    // logged once until it answers ok, and Push and Announce go in actionNotice.
+    {
+      await fixture('notice.json', threeMatches('Notice Cup'));
+      await pollOnceFor(T('notice.json'), 'Notice Cup');
+      let outAt = sc.out.length;
+      await mockGet(`/mock/queue?name=${enc('Ticker Push')}&queue=Default`);
+      try {
+        for (const text of ['@Q1', '@Q2']) { const at = mark(); cmd('setCapsText', text); await since(at, (d) => isUpdate(d) && d.caps?.text === text); }
+      } finally {
+        await mockGet(`/mock/queue?name=${enc('Ticker Push')}&queue=`);
+      }
+      const queueLines = sc.out.slice(outAt).split(/\r?\n/).filter((l) => /Ticker Push/.test(l) && /Default/.test(l));
+      check('a reply that says queueName "Default" is logged once for that action, however many follow',
+        queueLines.length === 1, JSON.stringify(queueLines));
+
+      const NOT_FOUND = 'Ticker Push not found';
+      const lines = (from) => sc.out.slice(from).split(/\r?\n/).filter((l) => l.includes(NOT_FOUND)).length;
+      outAt = sc.out.length;
+      let s1 = null, s2 = null;
+      await mockGet(`/mock/missing?name=${enc('Ticker Push')}&on=1`);
+      try {
+        s1 = await statusAfter('setCapsText', '@Refused1', (x) => x.caps?.text === '@Refused1' && x.actionNotice === NOT_FOUND);
+        s2 = await statusAfter('setCapsText', '@Refused2', (x) => x.caps?.text === '@Refused2' && x.actionNotice === NOT_FOUND);
+      } finally {
+        await mockGet(`/mock/missing?name=${enc('Ticker Push')}&on=0`);
+      }
+      check('Ticker Push answering "was not found": the status\'s actionNotice says "Ticker Push not found", and the log says it once, not once per push',
+        !!s1 && !!s2 && lines(outAt) === 1, JSON.stringify({ s1: s1?.actionNotice ?? null, s2: s2?.actionNotice ?? null, logLines: lines(outAt) }));
+      const before = await stored();
+      await kick();
+      await reconnect();
+      const delivered = await waitFor(async () => (await stored())?.caps?.text === '@Refused2', 8000, 100);
+      const cleared = await statusAfter('status', '', (x) => x.actionNotice === '', 3000);
+      check('ZIP-09: pushes refused while Ticker Push was missing are made good when the sidecar connects again: it pushes the current payload, and the ok reply clears actionNotice',
+        before?.caps?.text !== '@Refused2' && !!delivered && !!cleared, JSON.stringify({ storedBefore: before?.caps?.text, delivered: !!delivered, actionNotice: cleared?.actionNotice ?? 'no status' }));
+      outAt = sc.out.length;
+      await mockGet(`/mock/missing?name=${enc('Ticker Push')}&on=1`);
+      try { await statusAfter('setCapsText', '@Refused3', (x) => x.actionNotice === NOT_FOUND); }
+      finally { await mockGet(`/mock/missing?name=${enc('Ticker Push')}&on=0`); }
+      await statusAfter('setCapsText', '', (x) => x.caps?.text === '' && x.actionNotice === '');
+      check('"Ticker Push not found" is logged again once the action has answered ok in between', lines(outAt) === 1, JSON.stringify({ logLines: lines(outAt) }));
+
+      // While connected: a push refused while Ticker Push was missing is paid once the action
+      // answers, with no reconnect (adding the action in Streamer.bot keeps the socket
+      // open), on the next `status` command, which the control page sends every 10 s.
+      {
+        let refused = null;
+        await mockGet(`/mock/missing?name=${enc('Ticker Push')}&on=1`);
+        try { refused = await statusAfter('setCapsText', '@OwedWhileUp', (x) => x.caps?.text === '@OwedWhileUp' && x.actionNotice === NOT_FOUND); }
+        finally { await mockGet(`/mock/missing?name=${enc('Ticker Push')}&on=0`); }
+        const storedBefore = await stored();
+        const paid = await statusAfter('status', '', (x) => x.actionNotice === '', 3000);
+        const st = await stored();
+        check('ZIP-09 while connected: a push refused while Ticker Push was missing is pushed again on the next status command once the action answers (no reconnect), and the ok reply clears actionNotice',
+          !!refused && storedBefore?.caps?.text !== '@OwedWhileUp' && !!paid && st?.caps?.text === '@OwedWhileUp',
+          JSON.stringify({ storedBefore: storedBefore?.caps?.text, actionNotice: paid?.actionNotice ?? 'no status', storedAfter: st?.caps?.text }));
+        await statusAfter('setCapsText', '', (x) => x.caps?.text === '' && x.actionNotice === '');
+      }
+
+      outAt = sc.out.length;
+      const pushesBefore = (await stats()).pushCount;
+      await mockGet(`/mock/missing?name=${enc('Ticker Command')}&on=1`);
+      let logged = null;
+      try {
+        await kick();
+        logged = await waitFor(() => sc.out.slice(outAt).includes('Ticker Command not found'), 8000, 100);
+      } finally {
+        await mockGet(`/mock/missing?name=${enc('Ticker Command')}&on=0`);
+      }
+      await reconnect();
+      const back = await statusAfter('status', '', () => true, 3000);
+      await sleep(300);
+      const pushesAfter = (await stats()).pushCount;
+      check('"Ticker Command not found" is logged (the status travels on Ticker Command, so the log is the only place it can show); the status comes back once the action answers',
+        !!logged && !!back, JSON.stringify({ logged: !!logged, status: !!back }));
+      check('ZIP-09: a later push that was queued clears the push owed: once the refused pushes above were made good, the sidecar pushes nothing when it connects again, nor on a status command',
+        pushesAfter === pushesBefore, JSON.stringify({ pushes: pushesAfter - pushesBefore }));
+    }
+
+    // ZIP-09: a push made while the sidecar is disconnected is delivered when it connects
+    // again: a held poll of a completed event ends after /mock/kick, so polling stops and
+    // no later poll would carry it.
+    {
+      await fixture('held-done.json', { ...threeMatches('Held Done Cup'), state: 'completed', stubHoldFile: `${TMP_REL}/hold-6i` });
+      await writeFile(holdFile, 'hold', 'utf-8');
+      await statusAfter('setUrl', T('held-done.json'), (x) => x.url === T('held-done.json'));
+      const outAt = sc.out.length;
+      cmd('start');
+      const holding = await waitFor(() => sc.out.slice(outAt).includes('stub: holding the poll'), 4000);
+      await kick();
+      await rm(holdFile, { force: true });
+      const stopped = await waitFor(() => sc.out.slice(outAt).includes('polling auto-stopped'), 4000);
+      const whileDown = await stored();
+      await reconnect();
+      const delivered = await waitFor(async () => (await stored())?.tournament?.name === 'Held Done Cup', 8000, 100);
+      check('ZIP-09: a push made while the sidecar is disconnected (a poll of a completed event ending after /mock/kick, so polling stops) is delivered when it connects again',
+        !!holding && !!stopped && whileDown?.tournament?.name !== 'Held Done Cup' && !!delivered,
+        JSON.stringify({ holding: !!holding, stopped: !!stopped, storedWhileDown: whileDown?.tournament?.name ?? null, delivered: !!delivered }));
+    }
+
+    // The socket's close settles the send in flight at once (sendQueue.close() in the close
+    // handler): a push with no reply yet (the mock holds it 3 s) when /mock/kick closes the
+    // connection is "dropped" there and then, so it is owed, not left to its 800 ms release
+    // and 5 s wait to end "timed out". It is made good when the sidecar connects again.
+    {
+      const mockAt = mockOutTotal;
+      let held = null, droppedMs = null, timedOut = null;
+      await mockGet(`/mock/delay?name=${enc('Ticker Push')}&ms=3000`);
+      try {
+        cmd('setCapsText', '@InFlightAtClose');
+        held = await waitFor(() => mockOutSince(mockAt).includes('Ticker Push: the reply is held'), 3000, 20);
+        kickedAt = sc.out.length;
+        const t0 = Date.now();
+        await mockGet('/mock/kick');
+        const dropped = await waitFor(() => sc.out.slice(kickedAt).includes('Ticker Push dropped:'), 1500, 20);
+        droppedMs = dropped ? Date.now() - t0 : null;
+      } finally {
+        await mockGet(`/mock/delay?name=${enc('Ticker Push')}&ms=0`);
+      }
+      await waitFor(async () => (await stats()).clients === 0, 3000, 50);
+      await reconnect();
+      const paid = await waitFor(async () => (await stored())?.caps?.text === '@InFlightAtClose', 8000, 100);
+      timedOut = sc.out.slice(kickedAt).includes('Ticker Push timed out');
+      check('a push in flight with no reply when the socket closes is settled at once, "dropped" (owed), within 400 ms of the close, not at a timer; it is made good when the sidecar connects again',
+        !!held && droppedMs !== null && droppedMs < 400 && !timedOut && !!paid, JSON.stringify({ held: !!held, droppedMs, timedOut, paid: !!paid }));
+      await statusAfter('setCapsText', '', (x) => x.caps?.text === '');
+    }
+
+    // Row 4.3 after a restart with polling off: nothing is held, so a change with a URL set
+    // runs one fetch, and no blank payload goes over the strip Streamer.bot stored.
+    {
+      await fixture('restart.json', threeMatches('Restart Cup'));
+      await start({ ...baseCfg, tournamentUrl: T('restart.json') });
+      let at = mark();
+      cmd('setCapsText', '@AfterRestart');
+      const u = await since(at, (d) => isUpdate(d) && d.caps?.text === '@AfterRestart', 3000);
+      await settle();
+      let blanks = updatesSince(at).filter((d) => !hasResults(d));
+      check('row 4.3: after a restart with polling off and nothing held, a cap change with a URL set runs one fetch and pushes its results with the new caps; no blank payload is pushed over the stored strip',
+        u?.tournament?.name === 'Restart Cup' && hasResults(u) && blanks.length === 0,
+        JSON.stringify({ pushed: u && { name: u.tournament?.name, matches: u.matches?.length }, blanks: blanks.length }));
+      await start({ ...baseCfg, tournamentUrl: T('restart.json') });
+      at = mark();
+      cmd('setTopN', '1');
+      const u2 = await since(at, (d) => isUpdate(d) && d.tournament?.name === 'Restart Cup' && d.matches?.length === 2, 3000);
+      await settle();
+      blanks = updatesSince(at).filter((d) => !hasResults(d));
+      check('row 4.3: after a restart with polling off and nothing held, setTopN with a URL set runs one fetch and pushes the filtered results; no blank payload',
+        !!u2 && blanks.length === 0, JSON.stringify({ pushed: u2?.matches?.length ?? null, blanks: blanks.length }));
+      // R3 (the owner's ruling of 2026-11-25: as documented): with a message on and polling
+      // off, connecting after a restart pushes the blank payload with the message, and from
+      // then on the blank is the current payload: a cap change pushes it with the new caps
+      // and fetches nothing, and an option change still runs one fetch, which brings the
+      // results back.
+      {
+        const atStart = mark();
+        await start({ ...baseCfg, tournamentUrl: T('restart.json'), message: { enabled: true, text: 'R3 line' } });
+        const onConnect = await since(atStart, (d) => isUpdate(d) && d.message?.lines?.[0] === 'R3 line', 3000);
+        at = mark();
+        cmd('setCapsText', '@R3');
+        const capsUp = await since(at, (d) => isUpdate(d) && d.caps?.text === '@R3', 3000);
+        await sleep(600); // past the gap, for a fetch the cap change might have asked for
+        const afterCaps = await settle();
+        const capsPushed = updatesSince(at);
+        at = mark();
+        cmd('setTopN', '1');
+        const fetched = await since(at, (d) => isUpdate(d) && d.tournament?.name === 'Restart Cup', 3000);
+        check('R3: with a message on and polling off, connecting after a restart pushes the blank payload (no results, the URL set) with the message; a cap change then pushes that blank with the new caps and fetches nothing (lastPollAt stays null); an option change still runs one fetch, which brings the results back under the message',
+          !!onConnect && !hasResults(onConnect) && onConnect.tournament?.url === T('restart.json')
+            && !!capsUp && !hasResults(capsUp) && capsUp.message?.lines?.[0] === 'R3 line' && capsPushed.every((d) => !hasResults(d)) && afterCaps?.lastPollAt === null
+            && hasResults(fetched) && fetched?.message?.lines?.[0] === 'R3 line' && fetched?.matches?.length === 2,
+          JSON.stringify({ onConnect: onConnect && { results: hasResults(onConnect), url: onConnect.tournament?.url }, capsUp: capsUp && { results: hasResults(capsUp), message: capsUp.message ?? null },
+            lastPollAt: afterCaps ? afterCaps.lastPollAt : 'no status', fetched: fetched && { matches: fetched.matches?.length, message: fetched.message ?? null } }));
+      }
+      await start({ ...baseCfg });
+      at = mark();
+      const s = await statusAfter('setTopN', '2', (x) => x.topN === 2);
+      await sleep(400);
+      const after = await settle();
+      check('row 4.3: with no URL set, setTopN saves the setting and sends only a status: no fetch, nothing pushed',
+        !!s && updatesSince(at).length === 0 && after?.lastPollAt === null, JSON.stringify({ pushed: updatesSince(at).length, lastPollAt: after?.lastPollAt }));
+    }
+
+    // ZIP-09 while connected, with no command at all (an OBS-only setup, no dock open): an
+    // owed push is retried by itself after the retry wait, shortened here to 0.6 s by its
+    // override (30 s otherwise).
+    {
+      await start({ ...baseCfg }, { ZIPPER_PUSH_RETRY_MS: '600' });
+      let refused = null;
+      await mockGet(`/mock/missing?name=${enc('Ticker Push')}&on=1`);
+      try { refused = await statusAfter('setCapsText', '@Retried', (x) => x.caps?.text === '@Retried' && x.actionNotice === 'Ticker Push not found'); }
+      finally { await mockGet(`/mock/missing?name=${enc('Ticker Push')}&on=0`); }
+      const storedBefore = await stored();
+      const retried = await waitFor(async () => (await stored())?.caps?.text === '@Retried', 4000, 100);
+      check('ZIP-09 while connected: with no command sent, a push refused while Ticker Push was missing is pushed again by itself once the action answers (the retry wait, 30 s, shortened to 0.6 s here)',
+        !!refused && storedBefore?.caps?.text !== '@Retried' && !!retried, JSON.stringify({ refused: !!refused, storedBefore: storedBefore?.caps?.text, retried: !!retried }));
+    }
+  } finally {
+    await rm(holdFile, { force: true });
+    if (sc) await sc.stop();
+    try { client.ws.close(); } catch {}
+    await rm(cfgPath, { force: true });
+  }
+}
+
 // ── 7. Milestone announcements (SE mock + real sidecar) ──────────────────────
 
 let seServer = null;
@@ -2774,21 +4367,31 @@ async function testMilestones() {
   console.log('\n[7] milestones (real sidecar, mock StreamElements)');
   const { createServer } = await import('node:http');
 
-  // Tiny StreamElements sessions mock with a mutable follower counter. It answers
-  // only once the sidecar is connected to the mock bus, so an announcement from the
-  // first poll could not be lost for want of a connection.
+  // Tiny StreamElements sessions mock with mutable counters (seData is the session's
+  // data block). It answers only once the sidecar is connected to the mock bus, so an
+  // announcement from the first poll could not be lost for want of a connection.
   let followers = 250;
+  const seData = () => ({ 'follower-total': { count: followers }, ...seSubs });
+  let seSubs = { 'subscriber-total': { count: 30 } };
   let seOpen = false;
   // The switch that makes it stop answering (row 3.2): a request that arrives while it
   // is on is accepted and never answered.
   let seStall = false;
   const seStalled = [];
+  // A gate: while set, a request waits for it to open, and seHeld counts the requests
+  // that reached it. The reconnect check opens it once the bus is down.
+  let seGate = null;
+  let seHeld = 0;
+  const seArrivals = []; // when each request reached the gate (Date.now())
+  let seAnswered = 0; // requests answered, so a check can wait for a number of polls
   seServer = createServer(async (req, res) => {
     if (req.url?.startsWith('/kappa/v2/sessions/')) {
       if (seStall) { seStalled.push(res); return; }
       await waitFor(() => seOpen, 8000);
+      if (seGate) { seHeld++; seArrivals.push(Date.now()); await seGate.opened; }
       res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ data: { 'follower-total': { count: followers } } }));
+      res.end(JSON.stringify({ data: seData() }));
+      seAnswered++;
     } else {
       res.writeHead(404); res.end();
     }
@@ -2804,10 +4407,10 @@ async function testMilestones() {
   await writeFile(cfgPath, JSON.stringify({
     tournamentUrl: null, autoStart: false,
     streamElements: { jwtToken: jwt, pollSeconds: 5 },
-    milestones: { followers: 100 },
+    milestones: { followers: 100, subs: 25 },
   }), 'utf-8');
 
-  const client = await busClient();
+  let client = await busClient();
   const before = (await stats()).announceCount;
 
   // The 10-second request limit is shortened to 2 s (its override) for the check below
@@ -2819,7 +4422,7 @@ async function testMilestones() {
     ZIPPER_SE_BASE: `http://127.0.0.1:${SE_PORT}`,
     ZIPPER_REQUEST_TIMEOUT_MS: String(SE_LIMIT_MS),
   });
-  const since = sinceOn(client, sc);
+  let since = sinceOn(client, sc);
 
   // Only this sidecar's status has se.configured (the section 6 sidecar has stopped).
   const seStatus = await since(0, (d) => isStatus(d) && parseStatus(d).se?.configured === true, 5000);
@@ -2863,6 +4466,177 @@ async function testMilestones() {
     check('StreamElements: once the server answers again, the next StreamElements poll runs and clears the error',
       !!recovered, JSON.stringify({ recovered: !!recovered }));
     for (const r of seStalled) { try { r.destroy(); } catch {} }
+  }
+
+  // ZIP-11: two milestones crossed in one poll, with the mock's bleed mode on (two runs of
+  // one action close together both see the later one's arguments). The sidecar sends the
+  // second only once the first has run, so both texts show. Bleed mode is turned off again
+  // however the check ends.
+  {
+    const at = client.events.length;
+    let got = null;
+    try {
+      await mockGet('/mock/bleed?on=1');
+      followers = 412;
+      seSubs = { 'subscriber-total': { count: 52 } };
+      got = await waitFor(() => { const a = client.events.slice(at).filter((d) => d.type === 'ticker:announce'); return a.length >= 2 ? a : null; }, 12000, 50);
+      await sleep(300); // a third, if any, would be in by now
+    } finally {
+      await mockGet('/mock/bleed?on=0');
+    }
+    const texts = client.events.slice(at).filter((d) => d.type === 'ticker:announce').map((d) => d.text);
+    const saved = await savedConfig(cfgPath, (c) => c.milestoneState?.followers === 400 && c.milestoneState?.subs === 50);
+    check('ZIP-11: two milestones crossed in one poll, with the mock\'s bleed mode on, show both texts (the sidecar sends one at a time, the next once the first has run)',
+      !!got && texts.length === 2 && texts.some((t) => /^400 followers/.test(t)) && texts.some((t) => /^50 subs/.test(t)),
+      JSON.stringify({ texts }));
+    check('milestones: both thresholds are saved once their announcements were queued',
+      saved?.milestoneState?.followers === 400 && saved?.milestoneState?.subs === 50, JSON.stringify(saved?.milestoneState));
+  }
+
+  // ZIP-16: the subs reader switching keys (subscriber-total missing, subscriber-count
+  // there) records the new value silently, as a first sighting, and does not announce it.
+  {
+    const at = client.events.length;
+    const before = (await stats()).announceCount;
+    seSubs = { 'subscriber-count': { count: 210 } };
+    const saved = await savedConfig(cfgPath, (c) => c.milestoneState?.subs === 200, 12000);
+    await sleep(300);
+    const announced = client.events.slice(at).filter((d) => d.type === 'ticker:announce').map((d) => d.text);
+    check('ZIP-16: the subs counter read from another StreamElements key (subscriber-count instead of subscriber-total) is recorded silently as a first sighting: no "200 subs" announcement',
+      saved?.milestoneState?.subs === 200 && saved?.milestoneKeys?.subs === 'subscriber-count' && announced.length === 0 && (await stats()).announceCount === before,
+      JSON.stringify({ subs: saved?.milestoneState?.subs, key: saved?.milestoneKeys?.subs, announced }));
+  }
+
+  // ZIP-16: an announcement that cannot be sent (the bus is down at the crossing) leaves
+  // the threshold where it was; it is announced, and saved, only after the reconnect.
+  {
+    let opened = null;
+    seGate = { opened: new Promise((r) => { opened = r; }) };
+    try {
+      const heldBefore = seHeld;
+      const announcedBefore = (await stats()).announceCount;
+      followers = 512;
+      const waiting = await waitFor(() => seHeld > heldBefore, 8000, 50); // the poll that will cross 500 is at the gate
+      await mockGet('/mock/kick');
+      const down = await waitFor(async () => (await stats()).clients === 0, 3000, 50);
+      seGate = null;
+      opened();
+      await sleep(800); // that poll ends, with the bus down
+      const whileDown = await readJsonFile(cfgPath);
+      const countWhileDown = (await stats()).announceCount;
+      client = await busClient();
+      since = sinceOn(client, sc);
+      const ann = await since(0, (d) => d.type === 'ticker:announce' && /^500 followers/.test(d.text), 12000);
+      const saved = await savedConfig(cfgPath, (c) => c.milestoneState?.followers === 500);
+      check('ZIP-16: with the bus down at the crossing, the threshold is not saved; the announcement comes after the reconnect, and the threshold is saved only then',
+        !!waiting && !!down && whileDown?.milestoneState?.followers === 400 && countWhileDown === announcedBefore && !!ann && saved?.milestoneState?.followers === 500,
+        JSON.stringify({ atGate: !!waiting, down: !!down, savedWhileDown: whileDown?.milestoneState?.followers, announcedWhileDown: countWhileDown - announcedBefore, announcedAfter: !!ann, savedAfter: saved?.milestoneState?.followers }));
+    } finally {
+      seGate = null;
+      if (opened) opened();
+    }
+  }
+
+  // ZIP-16: an announcement that keeps failing (Ticker Announce missing) is announced again
+  // by every poll until it is queued, but logged once: one "crossed" line and one "was
+  // refused" line, however many polls it takes, then one line when it is queued at last.
+  {
+    const outAt = sc.out.length;
+    const crossed = (from) => sc.out.slice(from).split(/\r?\n/).filter((l) => l.includes('milestone: followers crossed 600')).length;
+    const failedLines = (from) => sc.out.slice(from).split(/\r?\n/).filter((l) => l.includes('followers announcement for 600 was refused')).length;
+    let polls = null, ann = null;
+    await mockGet(`/mock/missing?name=${enc('Ticker Announce')}&on=1`);
+    try {
+      followers = 612;
+      const first = await waitFor(() => failedLines(outAt) >= 1, 12000, 50);
+      const n0 = seAnswered;
+      // Two more polls, each announcing 600 again and refused again.
+      polls = first ? await waitFor(() => seAnswered >= n0 + 2, 14000, 50) : null;
+      await sleep(500); // the second of those polls has had its refusal
+    } finally {
+      await mockGet(`/mock/missing?name=${enc('Ticker Announce')}&on=0`);
+    }
+    const whileRefused = { crossed: crossed(outAt), refused: failedLines(outAt) };
+    const at = client.events.length;
+    ann = await since(at, (d) => d.type === 'ticker:announce' && /^600 followers/.test(d.text), 12000);
+    const saved = await savedConfig(cfgPath, (c) => c.milestoneState?.followers === 600);
+    check('ZIP-16: a milestone announcement refused on poll after poll (Ticker Announce missing) is logged once, not on every poll: one "crossed 600" line and one "was refused" line over three polls; once the action answers it is announced, and saved',
+      !!polls && whileRefused.crossed === 1 && whileRefused.refused === 1 && !!ann && saved?.milestoneState?.followers === 600,
+      JSON.stringify({ polls: !!polls, ...whileRefused, announced: !!ann, saved: saved?.milestoneState?.followers }));
+  }
+
+  // R2 (the owner's ruling of 2026-11-25): an announcement whose reply comes late (the
+  // mock's delay switch holds it 1.5 s, after the 800 ms release, inside the 5 s) is
+  // queued: its threshold is saved, and the next poll does not announce it again.
+  {
+    const outAt = sc.out.length;
+    const mockAt = mockOutTotal;
+    const at = client.events.length;
+    let held = null, ann = null;
+    await mockGet(`/mock/delay?name=${enc('Ticker Announce')}&ms=1500`);
+    try {
+      followers = 712;
+      held = await waitFor(() => mockOutSince(mockAt).includes('Ticker Announce: the reply is held'), 12000, 50);
+      ann = await since(at, (d) => d.type === 'ticker:announce' && /^700 followers/.test(d.text), 6000);
+    } finally {
+      await mockGet(`/mock/delay?name=${enc('Ticker Announce')}&ms=0`);
+    }
+    const saved = await savedConfig(cfgPath, (c) => c.milestoneState?.followers === 700, 4000);
+    const n0 = seAnswered;
+    const nextPoll = await waitFor(() => seAnswered >= n0 + 1, 12000, 50);
+    await sleep(800); // an announcement from that poll, if any, is in by now
+    const times = client.events.slice(at).filter((d) => d.type === 'ticker:announce' && /^700 followers/.test(d.text)).length;
+    const notQueued = sc.out.slice(outAt).split(/\r?\n/).filter((l) => /followers announcement for 700 was/.test(l));
+    check('R2: a milestone announcement whose reply comes 1.5 s late (after the 800 ms release, inside the 5 s) is queued: its threshold is saved, and the next poll does not announce it again',
+      !!held && !!ann && saved?.milestoneState?.followers === 700 && !!nextPoll && times === 1 && notQueued.length === 0,
+      JSON.stringify({ held: !!held, announced: times, saved: saved?.milestoneState?.followers, nextPoll: !!nextPoll, logged: notQueued }));
+  }
+
+  // R2: an announcement with no reply within 5 s (the mock holds it 6 s) is "timed out": its
+  // threshold stays where it was (row 4.5, MILESTONE_ADVANCES_ON_TIMEOUT: a repeat is
+  // possible, a loss is not), the log says so once, and the next poll announces it again,
+  // which is queued and saved.
+  {
+    const outAt = sc.out.length;
+    const mockAt = mockOutTotal;
+    const at = client.events.length;
+    const timedOutLine = (l) => l.includes('followers announcement for 800 was timed out');
+    let held = null;
+    await mockGet(`/mock/delay?name=${enc('Ticker Announce')}&ms=6000`);
+    try {
+      followers = 812;
+      held = await waitFor(() => mockOutSince(mockAt).includes('Ticker Announce: the reply is held'), 12000, 50);
+    } finally {
+      await mockGet(`/mock/delay?name=${enc('Ticker Announce')}&ms=0`); // the next poll's announcement is answered at once
+    }
+    const logged = held ? await waitFor(() => sc.out.slice(outAt).split(/\r?\n/).some(timedOutLine), 7000, 50) : null;
+    const savedAtTimeout = await readJsonFile(cfgPath);
+    const again = await waitFor(() => client.events.slice(at).filter((d) => d.type === 'ticker:announce' && /^800 followers/.test(d.text)).length >= 2, 16000, 50);
+    const saved = await savedConfig(cfgPath, (c) => c.milestoneState?.followers === 800, 4000);
+    const lines = sc.out.slice(outAt).split(/\r?\n/).filter(timedOutLine).length;
+    check('R2: a milestone announcement with no reply within 5 s (held 6 s) is "timed out": the log says so once, its threshold is not saved then (it stays 700), and the next poll announces it again, which is queued and saved (row 4.5: a repeat is possible, a loss is not)',
+      !!held && !!logged && lines === 1 && savedAtTimeout?.milestoneState?.followers === 700 && !!again && saved?.milestoneState?.followers === 800,
+      JSON.stringify({ held: !!held, logged: !!logged, lines, savedAtTimeout: savedAtTimeout?.milestoneState?.followers, announcedTwice: !!again, saved: saved?.milestoneState?.followers }));
+  }
+
+  // ZIP-16: the StreamElements polls are chained: the next is timed from the end of the
+  // last, so they never overlap. A request held at the gate fails at this sidecar's 2 s
+  // request limit; the next one then comes 5 s (pollSeconds) after that, about 7 s after
+  // the held one began, and about 12 s after the wait below begins (its first request
+  // comes up to 5 s in). On a fixed 5-second interval it would come 5 s after.
+  {
+    let opened = null;
+    const n0 = seArrivals.length;
+    seGate = { opened: new Promise((r) => { opened = r; }) };
+    try {
+      const two = await waitFor(() => seArrivals.length >= n0 + 2, 20000, 50);
+      const apartMs = two ? seArrivals[n0 + 1] - seArrivals[n0] : null;
+      check('ZIP-16: StreamElements polls are chained, never on a fixed interval: after a poll held until its 2 s request limit, the next request comes 5 s after it ended (about 7 s after it began), not 5 s after it began',
+        !!two && apartMs >= 6500, JSON.stringify({ apartMs }));
+    } finally {
+      seGate = null;
+      if (opened) opened();
+    }
   }
 
   await sc.stop();
@@ -2974,6 +4748,7 @@ try {
   await testNormalizers();
   testDetection();
   await testFetchWrapper();
+  await testSidecarBlocks();
   await startMock();
   await testPanelCore();
   await testMock();
