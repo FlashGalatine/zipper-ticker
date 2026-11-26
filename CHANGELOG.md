@@ -10,6 +10,75 @@ traceability.
 
 ## [Unreleased]
 
+## [1.0.26] — 2026-11-26
+
+Copy the `zipper-shared` folder, then reload the control dock and refresh the
+OBS overlay source. Copy the whole folder. No sidecar restart and nothing to
+re-paste. If the dock then says "An older copy of panel-core.js is loaded",
+reload it again, and if the line stays, restart OBS. Check the address of the
+dock and of the overlay source: a `?sbport=` that is empty or is not a port
+from 1 to 65535 used to fall back to 8080 and now connects to nothing.
+
+### Fixed
+
+- **What you type on the control page stays.** Before, the status that arrives
+  every few seconds could put the old value back while you typed. Now a box you
+  have changed is marked and left alone until the sidecar confirms the value
+  you applied. Press Esc in a box to get the current value back.
+- **The red banner says what is wrong.** Before, every failure read as "the
+  sidecar is not running". Now it tells apart: Streamer.bot offline, an action
+  that is missing (named), an action Streamer.bot refused, an action that
+  failed, an action that did not answer, and the sidecar being silent.
+- **Announce no longer sends twice.** A second click on **Send** while the
+  first is on its way sends nothing, and the box clears only when that
+  announcement comes back.
+- **Clicks made as the connection drops are counted.** The page says how many
+  were not sent, and that one in flight may not have run.
+- **Reconnects are paced.** A Streamer.bot that accepts a connection and drops
+  it again no longer gets a new attempt every 2 seconds for good: the waits
+  grow to 15 seconds, with a random part so pages do not all return at once.
+- **Clicks no longer overlap.** The page sends one request at a time, so its
+  own status check and a click cannot run with each other's values on an
+  install without the blocking queue.
+- A score in the preview's in-progress row is shown as text, whatever it holds.
+
+### Changed
+
+- **A bad `?sbport=` connects to nothing.** The control page says "The port in
+  this page's address was refused"; the overlay stays blank. Fix the number
+  and reload.
+- The control page says when `panel-core.js` did not load at all (its dot is
+  red, not green), and when OBS or the browser kept an older copy of it.
+- The control page says when an action is in Streamer.bot's Default queue and
+  points to setup step 1.
+- A key typed into a box stays shown as typed and marked as an edit until Esc
+  or a reload, because the status carries its label and never matches it.
+
+### Development
+
+- `panel-core.js` raises `sb:connection`, `sb:action-queued`,
+  `sb:action-error` and `sb:action-timeout`; `__ZIPPER_DO_ACTION` returns the
+  request id or false; `window.__ZIPPER_PANEL_CORE` is `{ api: 2 }` and
+  `window.__ZIPPER_SB_PORT_REFUSED` is true or false. Its header comments
+  match what it does.
+- The suite's own panel-core client is closed once its sections are done. Left
+  connected, it could add a push to a later section's count (about one run in
+  six).
+- `npm run verify` 506 checks (was 471), `npm run verify:render` 107 (was 46),
+  `npm run verify:cs` 19.
+
+### Not checked
+
+- Nothing was run against a real Streamer.bot or in a real OBS dock. The
+  older-copy case used the previous release's file in a test browser, not a
+  real OBS cache.
+- The status request the page sends right after it subscribes: that
+  Streamer.bot 1.0.7 always handles the Subscribe first was not measured.
+- The overlay with a refused `?sbport=` has no check of its own.
+- The copy of the older `panel-core.js` in the NFC Broadcast kit is unchanged
+  until the next release.
+- The suites ran on Node 22, not Node 20.
+
 ## [1.0.24] — 2026-11-26
 
 Copy `zipper-sidecar.mjs`, the `platforms` folder and the `zipper-shared`
@@ -441,7 +510,8 @@ Initial release — scrolling tournament-results ticker for Streamer.bot.
 Live-validated keyless against real start.gg and Challonge brackets across
 pre-start, mid-event and completed states.
 
-[Unreleased]: https://github.com/FlashGalatine/zipper-ticker/compare/v1.0.24...main
+[Unreleased]: https://github.com/FlashGalatine/zipper-ticker/compare/v1.0.26...main
+[1.0.26]: https://github.com/FlashGalatine/zipper-ticker/compare/v1.0.24...v1.0.26
 [1.0.24]: https://github.com/FlashGalatine/zipper-ticker/compare/v1.0.22...v1.0.24
 [1.0.22]: https://github.com/FlashGalatine/zipper-ticker/compare/v1.0.20...v1.0.22
 [1.0.20]: https://github.com/FlashGalatine/zipper-ticker/compare/v1.0.18...v1.0.20
