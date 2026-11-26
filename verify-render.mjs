@@ -110,9 +110,13 @@ async function closePage(p) {
   await p.page.close();
 }
 
+// The mock gets the shell's environment without the API keys a developer may have set
+// (in any casing: Windows matches environment names without regard to case).
+const mockEnv = Object.fromEntries(Object.entries(process.env).filter(([k]) => !['CHALLONGE_API_KEY', 'STARTGG_API_KEY'].includes(k.toUpperCase())));
+
 try {
   mock = spawn(process.execPath, [resolve(__dirname, 'mock-sb-server.mjs')], {
-    env: { ...process.env, SB_HTTP_PORT: String(HTTP_PORT), SB_WS_PORT: String(WS_PORT), MOCK_EXIT_WITH_PARENT: '1', MOCK_ARG_BLEED: '' },
+    env: { ...mockEnv, SB_HTTP_PORT: String(HTTP_PORT), SB_WS_PORT: String(WS_PORT), MOCK_EXIT_WITH_PARENT: '1', MOCK_ARG_BLEED: '' },
     stdio: ['pipe', 'pipe', 'pipe'],
   });
   let mockOut = '';
@@ -400,6 +404,22 @@ try {
     const text = await page.locator('#status').textContent();
     const errs = await page.locator('#status .err').allTextContents();
     check('control: the status line shows the sidecar\'s actionNotice ("Ticker Push not found") as an error line', errs.includes(notice), text);
+  }
+  // …and its configWarning (row 5.1: a config.json that did not load, a refused key, a
+  // hand edit while the sidecar ran), as text, on an error line of its own.
+  {
+    const warning = 'config.json is not valid JSON (line 4); the sidecar runs on its defaults and saves nothing until the file is fixed and the sidecar restarted';
+    await sendStatus({
+      type: 'ticker:status', polling: false, url: null, platform: null, lastPollAt: null, lastError: '',
+      commandNotice: '', actionNotice: '', configWarning: warning, intervalMs: 30000, maxItems: 20, topN: 0,
+      caps: { text: '', logo: '' }, message: { enabled: false, text: '' },
+      auto: { enabled: true, eventState: null, startAt: null, waitingUntil: null, stopped: null },
+      se: { configured: false, lastPollAt: null, lastError: '' },
+    });
+    await page.waitForFunction((t) => document.getElementById('status').textContent.includes(t), warning, { timeout: 5000 }).catch(() => {});
+    const text = await page.locator('#status').textContent();
+    const errs = await page.locator('#status .err').allTextContents();
+    check('control: the status line shows the sidecar\'s configWarning as an error line of its own', errs.includes(warning), text);
   }
   await closePage(p);
 } catch (err) {

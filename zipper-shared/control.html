@@ -234,7 +234,8 @@
 
   // ticker:status rides the command relay as command "__status" (docs/PROTOCOL.md).
   // Its lastError is a failed poll; its commandNotice an unknown or refused command;
-  // its actionNotice an action the sidecar sends to that answered "not found" or with another error.
+  // its actionNotice an action the sidecar sends to that answered "not found" or with another error;
+  // its configWarning a config.json that did not load, a refused key, a dropped logo, a failed save, or saves stopped after a hand edit.
   window.addEventListener('ticker:command', (e) => {
     const d = e.detail || {};
     if (d.command !== '__status') return;
@@ -269,6 +270,7 @@
       (s.lastError ? `<br><span class="err">${esc(s.lastError)}</span>` : '') +
       (s.commandNotice ? `<br><span class="err">${esc(s.commandNotice)}</span>` : '') +
       (s.actionNotice ? `<br><span class="err">${esc(s.actionNotice)}</span>` : '') +
+      (s.configWarning ? `<br><span class="err">${esc(s.configWarning)}</span>` : '') +
       (s.se?.lastError ? `<br><span class="err">SE: ${esc(s.se.lastError)}</span>` : '');
   });
 

@@ -2,8 +2,9 @@
 //   1. Platform normalizer tests against recorded fixtures (pure functions).
 //   2. Platform detection/parseId routing.
 //   2b. The fetch wrapper (platforms/guarded-fetch.js), in-process against a local
-//      server on an OS-assigned port: its timeout, size cap, Retry-After and error
-//      wording; each adapter's wiring to it (signal, 429, User-Agent) against a
+//      server on an OS-assigned port: its timeout (shortened only with ZIPPER_ALLOW_STUB),
+//      size cap, Retry-After and error wording; each adapter's wiring to it (signal,
+//      429, User-Agent) against a
 //      stand-in for fetch; and a static check that no bare fetch( is left in the
 //      sidecar or an adapter.
 //   2c. Two blocks of the sidecar, in-process: its send queue (one DoAction in
@@ -32,8 +33,9 @@
 //      there, and lower-cased), every range on the command path and the config path,
 //      and which commands it accepts: stub: URLs only with ZIPPER_ALLOW_STUB=1 and
 //      only inside the repo, the logo rule, the __status guard in any casing, and
-//      refusals reported in commandNotice; ZIPPER_PUSH_RETRY_MS ignored without
-//      ZIPPER_ALLOW_STUB.
+//      refusals reported in commandNotice; ZIPPER_PUSH_RETRY_MS and the poll loop's
+//      three test settings ignored without ZIPPER_ALLOW_STUB (the limits it logs as it
+//      starts, and the 15 s gap in nextPollAt).
 //   6h. The poll loop (ZIP-02, ZIP-06, ZIP-13): a URL changed mid-poll, a stale
 //      failure, a result, failure or 429 that comes back after setUrl (a hold that
 //      ignores the abort), the poll's deadline, the backoff, Retry-After, the minimum gap
@@ -52,6 +54,31 @@
 //      newest push's outcome counts, and only its reply for the notice), and a push owed:
 //      paid across a reconnect (/mock/kick), on a status command, and by itself after the
 //      retry wait; a push in flight when the socket closes is settled at once.
+//   6j. Config safety, keys and the log file (ZIP-05, ZIP-21): a config.json that does
+//      not parse, cannot be read, holds no object, is saved as UTF-16, is empty or is not
+//      valid UTF-8 (an ANSI file with an accented letter; one of plain ASCII still loads) is
+//      never written over (configWarning says why, in fixed words); a byte-order mark; the
+//      example copied only when the file is missing (and not beside a whole
+//      config.json.tmp); the temp file a crash left (removed once config.json loads, and
+//      only by a sidecar that holds the guard port, which tools/guard-error-preload.cjs
+//      takes away; kept while config.json is refused, and named when whole), a burst of
+//      saves; a save that fails, and (Windows only) one onto a config.json another program
+//      holds or locks (a failed write in place keeps the temp file, which a restart then
+//      names); keys from the environment
+//      used but never saved; keys that are not printable ASCII (a lone surrogate
+//      included) refused, and not replaced by the environment's; every key, from
+//      config.json or the environment, redacted from lastError, the status, the pushed
+//      payload's URL, the caps text, logo and message text in the status and in every
+//      pushed payload (config.json keeping what was typed, and the change check working on
+//      it), and the log, a command's value before its cut (the Challonge key
+//      through the real adapter, with tools/fake-fetch-preload.cjs in place of fetch, so
+//      nothing leaves the machine); the crash handlers, installed first
+//      (tools/crash-preload.cjs); the log file, who trims it, and a second launch's one
+//      line; a hand edit, or a deleted config.json, while the sidecar runs;
+//      ZIPPER_SE_BASE honoured only with ZIPPER_ALLOW_STUB; and the poll loop's test
+//      settings ignored without it (a request that never answers is still waited for).
+//      Each sidecar there has its own
+//      folder in the system temp folder, removed afterwards.
 //   7. Milestone announcements: a real sidecar against a mock StreamElements, and a
 //      StreamElements request that never answers; two milestones in one poll under
 //      the mock's bleed mode, a switch of the subs key, the bus down at a crossing,
@@ -63,17 +90,20 @@
 // Uses off-default ports (HTTP 7476 / WS 8082 / sidecar guards 7497, 7492 and 7487 /
 // StreamElements mock 7477) so it can run next to a live Streamer.bot or sidecar,
 // and stops with one line, testing nothing, when anything already answers on them.
-// The stub fixtures and the test sidecars' config files are written to .verify-tmp/
-// inside the repo (gitignored), which the suite clears when it starts and removes when
-// it ends. Every child process is stopped when the suite ends.
+// The stub fixtures and the test sidecars' config files (and their logs) are written to
+// .verify-tmp/ inside the repo (gitignored), which the suite clears when it starts and
+// removes when it ends; section 6j's sidecars use folders in the system temp folder,
+// removed the same way. Every child process is stopped when the suite ends, and none is
+// given the CHALLONGE_API_KEY or STARTGG_API_KEY of the shell it runs from.
 // Run: npm run verify
 
 import { spawn, spawnSync } from 'node:child_process';
-import { readFile, writeFile, rm, mkdir } from 'node:fs/promises';
-import { existsSync, rmSync, mkdirSync, writeFileSync, readFileSync, readdirSync } from 'node:fs';
+import { readFile, writeFile, rm, mkdir, mkdtemp } from 'node:fs/promises';
+import { existsSync, rmSync, mkdirSync, writeFileSync, readFileSync, readdirSync, statSync, appendFileSync } from 'node:fs';
 import { resolve, dirname, join, sep, basename, win32 } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { connect } from 'node:net';
+import { tmpdir } from 'node:os';
 import WebSocket from 'ws';
 
 import { detectPlatform, PLATFORMS } from './platforms/index.js';
@@ -109,6 +139,14 @@ function check(name, ok, detail) {
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const loadFixture = async (f) => JSON.parse(await readFile(FIX(f), 'utf-8'));
+// A copy of an environment without the API keys a developer may have set (in any casing:
+// Windows matches environment names without regard to case). Every process this suite
+// starts gets one, so no real key reaches a test process.
+function withoutKeys(env) {
+  const out = { ...env };
+  for (const k of Object.keys(out)) if (k.toUpperCase() === 'CHALLONGE_API_KEY' || k.toUpperCase() === 'STARTGG_API_KEY') delete out[k];
+  return out;
+}
 
 // Polls a condition until it gives something truthy, or the time is up. Returns what
 // it gave, or null: the caller's check then fails with its own line.
@@ -301,19 +339,38 @@ async function testFetchWrapper() {
     mod.USER_AGENT === `Zipper/${pkgVersion}` && mod.BROWSER_USER_AGENT === `Mozilla/5.0 (compatible; Zipper/${pkgVersion})`,
     JSON.stringify({ USER_AGENT: mod.USER_AGENT, BROWSER_USER_AGENT: mod.BROWSER_USER_AGENT }));
 
-  // The override of the 10 seconds, as the sidecar reads it: it can only shorten it.
+  // The override of the 10 seconds, as the sidecar reads it: it can only shorten it, and
+  // only with ZIPPER_ALLOW_STUB=1 (the owner's ruling of 2026-11-26). This process sets
+  // ZIPPER_ALLOW_STUB itself for the checks that shorten it, and puts back what it had after
+  // each (no test sidecar inherits it: startSidecar removes it unless asked).
   const envBefore = process.env.ZIPPER_REQUEST_TIMEOUT_MS;
+  const allowBefore = process.env.ZIPPER_ALLOW_STUB;
   const setLimit = (v) => { if (v === undefined) delete process.env.ZIPPER_REQUEST_TIMEOUT_MS; else process.env.ZIPPER_REQUEST_TIMEOUT_MS = v; };
+  const setAllow = (v) => { if (v === undefined) delete process.env.ZIPPER_ALLOW_STUB; else process.env.ZIPPER_ALLOW_STUB = v; };
   {
+    setAllow('1');
     const got = [];
     for (const [v, want] of [[undefined, 10000], ['999999', 10000], ['1', 50], ['abc', 10000], ['300', 300]]) {
       setLimit(v);
       const ms = mod.requestTimeoutMs();
       if (ms !== want) got.push(`${v} → ${ms}, wanted ${want}`);
     }
-    check('ZIPPER_REQUEST_TIMEOUT_MS is clamped to 50–10000 ms (a test can only shorten the 10 seconds); unset or not a number gives 10000',
+    check('ZIPPER_REQUEST_TIMEOUT_MS (with ZIPPER_ALLOW_STUB=1) is clamped to 50–10000 ms (a test can only shorten the 10 seconds); unset or not a number gives 10000',
       got.length === 0, got.join('; '));
+    // R1: without ZIPPER_ALLOW_STUB=1 (unset, or any other value) it is ignored.
+    const ignored = [];
+    for (const allow of [undefined, '0', 'true', '']) {
+      setAllow(allow);
+      for (const v of ['300', '1']) {
+        setLimit(v);
+        const ms = mod.requestTimeoutMs();
+        if (ms !== 10000) ignored.push(`ZIPPER_ALLOW_STUB ${allow === undefined ? 'unset' : JSON.stringify(allow)}, ZIPPER_REQUEST_TIMEOUT_MS ${v} → ${ms}`);
+      }
+    }
+    check('R1: ZIPPER_REQUEST_TIMEOUT_MS works only with ZIPPER_ALLOW_STUB=1: without it (unset, "0", "true" or empty) a short value still gives the full 10000 ms',
+      ignored.length === 0, ignored.join('; '));
     setLimit(undefined); // the checks below run on the 10 seconds unless they shorten it
+    setAllow(allowBefore);
   }
 
   const { createServer } = await import('node:http');
@@ -386,6 +443,7 @@ async function testFetchWrapper() {
     }
 
     setLimit('300');
+    setAllow('1');
     {
       const { err, ms } = await attempt('/never?api_key=SECRET-CANARY&x=1');
       const msg = err?.message || '';
@@ -398,7 +456,18 @@ async function testFetchWrapper() {
       check('wrapper: the timer stays armed until the body has been read, so a body that trickles in times out the same way',
         err?.message === `${host} took longer than 0.3 s to answer` && ms < 3000, JSON.stringify({ message: err?.message, ms }));
     }
+    // R1: without ZIPPER_ALLOW_STUB the 0.3 s asked for is not taken: a server that never
+    // answers is still waited for at 1 s, when the poll's signal ends the request.
+    setAllow(undefined);
+    {
+      const ac = new AbortController();
+      setTimeout(() => ac.abort(new Error('test: stopped at 1 s')), 1000);
+      const { err, ms } = await attempt('/never', { signal: ac.signal });
+      check('R1: without ZIPPER_ALLOW_STUB the wrapper does not take ZIPPER_REQUEST_TIMEOUT_MS (0.3 s asked for): a server that never answers is still waited for at 1 s, when the poll\'s signal ends the request',
+        err?.message === `${host}: test: stopped at 1 s` && ms >= 900, JSON.stringify({ message: err?.message, ms }));
+    }
     setLimit(undefined);
+    setAllow(allowBefore);
 
     const capText = `${host} sent more than ${CAP / 1048576} MB`;
     {
@@ -489,6 +558,7 @@ async function testFetchWrapper() {
     }
   } finally {
     setLimit(envBefore);
+    setAllow(allowBefore);
     for (const r of held) { try { r.destroy(); } catch {} }
     for (const s of sockets) { try { s.destroy(); } catch {} }
     await new Promise((r) => server.close(r));
@@ -518,8 +588,10 @@ async function testFetchWrapper() {
       });
     };
     // An adapter that does not pass the poll's signal leaves its request to end at the
-    // wrapper's own limit, shortened here so that shows as a timeout message, quickly.
+    // wrapper's own limit, shortened here so that shows as a timeout message, quickly
+    // (with ZIPPER_ALLOW_STUB=1, which the shortening needs; both put back after).
     process.env.ZIPPER_REQUEST_TIMEOUT_MS = '1500';
+    setAllow('1');
     const SG_URL = 'https://www.start.gg/tournament/sol9/event/sf6-singles';
     const cases = [
       // [label, platform, id, config, original URL, host, User-Agent (undefined: not checked)]
@@ -556,6 +628,7 @@ async function testFetchWrapper() {
     } finally {
       globalThis.fetch = realFetch;
       if (limitBefore === undefined) delete process.env.ZIPPER_REQUEST_TIMEOUT_MS; else process.env.ZIPPER_REQUEST_TIMEOUT_MS = limitBefore;
+      setAllow(allowBefore);
     }
     check('adapters, in-process with a stand-in for fetch (no network): start.gg and Challonge (both paths each) and Matcherino pass the poll\'s signal to their request (an abort ends it at once, with the host and the reason), throw a 429 with its status and Retry-After, and send their User-Agent',
       wrong.length === 0, wrong.join('; '));
@@ -1020,9 +1093,10 @@ const mockOutSince = (mark) => mockOut.slice(Math.max(0, mockOut.length - (mockO
 async function startMock() {
   // stdin is a pipe the mock watches (MOCK_EXIT_WITH_PARENT): if this process is
   // killed outright, the pipe closes and the mock exits by itself. MOCK_ARG_BLEED is
-  // cleared so a value in the shell cannot switch bleed mode on for the whole run.
+  // cleared so a value in the shell cannot switch bleed mode on for the whole run. The
+  // API keys a developer may have set are not passed on (withoutKeys).
   mockProc = track(spawn(process.execPath, [resolve(__dirname, 'mock-sb-server.mjs')], {
-    env: { ...process.env, SB_HTTP_PORT: String(HTTP_PORT), SB_WS_PORT: String(WS_PORT), MOCK_EXIT_WITH_PARENT: '1', MOCK_ARG_BLEED: '' },
+    env: { ...withoutKeys(process.env), SB_HTTP_PORT: String(HTTP_PORT), SB_WS_PORT: String(WS_PORT), MOCK_EXIT_WITH_PARENT: '1', MOCK_ARG_BLEED: '' },
     stdio: ['pipe', 'pipe', 'pipe'],
   }));
   mockProc.stdout.on('data', (d) => { const s = String(d); mockOutTotal += s.length; mockOut = (mockOut + s).slice(-20000); });
@@ -1576,9 +1650,13 @@ const sidecars = [];
 // are removed the same way, so only the values a test passes apply.
 // If it exits before the suite stops it, the run fails at once with a line, and its
 // stdout and stderr are printed.
-// nodeArgs go before the script (section 6h preloads tools/clock-step-preload.cjs).
-const SHELL_ENV_DROPPED = ['ZIPPER_ALLOW_STUB', 'ZIPPER_REQUEST_TIMEOUT_MS', 'ZIPPER_POLL_DEADLINE_MS', 'ZIPPER_MIN_POLL_GAP_MS', 'ZIPPER_PUSH_RETRY_MS', 'ZIPPER_TEST_CLOCK_STEP_FILE'];
-function startSidecar(label, env, { allowStub = true, nodeArgs = [] } = {}) {
+// nodeArgs go before the script (sections 6h and 6j preload tools/*-preload.cjs).
+// The API keys a developer may have set (CHALLONGE_API_KEY, STARTGG_API_KEY) are removed
+// too, so no test sidecar ever holds a real key; a check that needs one passes a fake.
+// With expectExit, the sidecar is meant to end by itself (a crash, a second launch).
+const SHELL_ENV_DROPPED = ['ZIPPER_ALLOW_STUB', 'ZIPPER_REQUEST_TIMEOUT_MS', 'ZIPPER_POLL_DEADLINE_MS', 'ZIPPER_MIN_POLL_GAP_MS', 'ZIPPER_PUSH_RETRY_MS', 'ZIPPER_TEST_CLOCK_STEP_FILE',
+  'ZIPPER_SE_BASE', 'ZIPPER_TEST_FAKE_FETCH_FILE', 'ZIPPER_TEST_CRASH_FILE', 'ZIPPER_TEST_CRASH_AT', 'CHALLONGE_API_KEY', 'STARTGG_API_KEY'];
+function startSidecar(label, env, { allowStub = true, nodeArgs = [], expectExit = false } = {}) {
   const sc = { label, out: '', err: '', stopping: false, exited: false, code: null };
   const base = { ...process.env };
   for (const k of Object.keys(base)) if (SHELL_ENV_DROPPED.includes(k.toUpperCase())) delete base[k];
@@ -1592,7 +1670,7 @@ function startSidecar(label, env, { allowStub = true, nodeArgs = [] } = {}) {
   sc.proc.on('exit', (code) => {
     sc.exited = true;
     sc.code = code;
-    if (!sc.stopping) {
+    if (!sc.stopping && !expectExit) {
       check(`${label} kept running until the suite stopped it`, false, `it exited by itself with code ${code}`);
       console.log(`----- ${label}: stdout -----\n${sc.out}----- ${label}: stderr -----\n${sc.err}----- end of ${label} -----`);
     }
@@ -1633,6 +1711,16 @@ async function savedConfig(path, pred, timeoutMs = 4000) {
   let last = null;
   const hit = await waitFor(async () => { last = await readJsonFile(path); return last && pred(last) ? last : null; }, timeoutMs, 50);
   return hit || last;
+}
+// Waits (up to 4 s) until a sidecar's config file shows what its last status said: polling
+// (saved as autoStart), the interval and the URL. The sidecar saves after a command's status
+// has gone out (a temp file, flushed, then renamed: row 5.1), so a test that stops it and
+// starts another on the same file waits for this first, or the next one can start from the
+// file as it was before the last command (polling an old URL by itself).
+async function settledConfig(client, path) {
+  const last = client.events.filter(isStatus).map(parseStatus).pop();
+  if (!last) return null;
+  return savedConfig(path, (c) => c.autoStart === last.polling && c.pollIntervalMs === last.intervalMs && (c.tournamentUrl ?? null) === (last.url ?? null), 4000);
 }
 
 // ── 6. Sidecar E2E ────────────────────────────────────────────────────────────
@@ -1903,6 +1991,7 @@ async function testSidecar() {
   await testStubAtTheRead(client);
   await testPollLoop(client);
   await testPushes();
+  await testConfigSafety();
 
   client.ws.close();
   await rm(cfgPath, { force: true });
@@ -2130,13 +2219,19 @@ async function testEveryCommand(client, sc, since, mark, cmd, { lower = false } 
     // the lower-cased pass the URL and autoSchedule on are), so without this a refused
     // name could pass as taken.
     const hit = await since(at, (d) => pred(d) && (!isStatus(d) || parseStatus(d).commandNotice === ''));
-    const logged = await waitFor(() => sc.out.slice(outAt).includes(`command: ${as}`), 2000);
+    // Every command is logged but `status`, the probe a control page sends every 10 s
+    // (row 5.2: it would write about 8,640 lines a day per open page into the log file).
+    const probe = name === 'status';
+    const logged = probe
+      ? (await sleep(300), new RegExp(`command: ${as}(\\s|$)`, 'm').test(sc.out.slice(outAt)))
+      : await waitFor(() => sc.out.slice(outAt).includes(`command: ${as}`), 2000);
     const unknown = sc.out.slice(outAt).includes(`unknown command "${as}"`);
     if (statusOf(hit)?.lastPollAt) lastPollAt = statusOf(hit).lastPollAt;
     else { const last = client.events.filter(isStatus).pop(); if (last) lastPollAt = parseStatus(last).lastPollAt; }
-    check(`${tag}: ${as} is followed by its status or update, and the sidecar does not call it unknown`,
-      !!hit && !!logged && !unknown,
-      [!hit && 'no status or update showing it took effect', unknown && 'the sidecar logged it as an unknown command', !logged && 'the sidecar did not log it']
+    check(`${tag}: ${as} is followed by its status or update, and the sidecar does not call it unknown${probe ? '; as the status probe it is not logged (row 5.2)' : ''}`,
+      !!hit && (probe ? !logged : !!logged) && !unknown,
+      [!hit && 'no status or update showing it took effect', unknown && 'the sidecar logged it as an unknown command',
+        !probe && !logged && 'the sidecar did not log it', probe && logged && 'the sidecar logged the status probe']
         .filter(Boolean).join('; '));
   }
   check(`${tag}: each name in the table was sent`, tableNames.every((n) => sent.has(n)), tableNames.filter((n) => !sent.has(n)).join(', '));
@@ -2246,8 +2341,31 @@ const MSG = {
   // A stub fixture's stubFail (section 6h): a poll that fails as a site answering 429 would.
   stub429: 'stub: the test file answered as HTTP 429',
 };
+// The line a sidecar logs as it starts, naming the limits in effect (R1, the owner's ruling
+// of 2026-11-26): without ZIPPER_ALLOW_STUB, always the full ones.
+const FULL_LIMITS_LINE = 'limits: 10 s per request, 45 s per poll, 15 s between polls, 30 s before an owed push is retried';
+const limitsLineOf = (out) => (/limits: [^\r\n]*/.exec(out) || [''])[0];
 // An in-progress fixture inside the repo, which every sidecar here may read.
 const SAFE_STUB = 'stub:platforms/fixtures/stub-result.json';
+// The sidecar's configWarning sentences (row 5.1 to 5.4, and a saved logo dropped as
+// config.json loads). Fixed: none quotes the file or a key.
+const CONFIG_LOAD_TAIL = '; the sidecar runs on its defaults and saves nothing until the file is fixed and the sidecar restarted';
+const CONFIG_MSG = {
+  notJson: (line) => `config.json is not valid JSON${line ? ` (line ${line})` : ''}${CONFIG_LOAD_TAIL}`,
+  unreadable: `config.json could not be read${CONFIG_LOAD_TAIL}`,
+  notObject: `config.json does not hold a JSON object${CONFIG_LOAD_TAIL}`,
+  // R2 and R3 (the owner's ruling of 2026-11-26), and the choice for a missing config.json
+  // beside a whole config.json.tmp.
+  utf16: `config.json is saved as UTF-16; save it as UTF-8${CONFIG_LOAD_TAIL}`,
+  empty: `config.json is empty${CONFIG_LOAD_TAIL}`,
+  // R5 (the owner's ruling of 2026-11-26): bytes that are not valid UTF-8.
+  notUtf8: `config.json is not saved as UTF-8; save it as UTF-8${CONFIG_LOAD_TAIL}`,
+  missing: `config.json is missing${CONFIG_LOAD_TAIL}`,
+  tmpWhole: 'a whole copy of the settings is in config.json.tmp',
+  badKey: (where) => `${where} contains a space, a line break or another character that cannot be part of a key, so it is not used. Paste it again.`,
+  handEdit: 'config.json was edited while the sidecar was running, so the sidecar no longer saves it; restart the sidecar to load the edit (changes made since then last only until the restart)',
+  logo: 'config.json: the saved logo was dropped (it must be an http(s) URL or a path on the overlay\'s server)',
+};
 
 async function testAccepts(client, sc, since, mark, cmd, cfgPath) {
   console.log('\n[6f] which commands the sidecar accepts: names in any case, __status, stub: URLs, the logo, an empty URL; refusals in commandNotice');
@@ -2700,8 +2818,13 @@ async function testStubAtTheRead(client) {
     const cfgPath = join(TMP_DIR, 'config-nostub.json');
     await writeFile(cfgPath, JSON.stringify({ tournamentUrl: SAFE_STUB, autoStart: true, pollIntervalMs: 15000, caps: { text: '', logo: '' } }), 'utf-8');
     const at = client.events.length;
-    // ZIPPER_PUSH_RETRY_MS asks for 60 ms: without ZIPPER_ALLOW_STUB it must not be honoured.
-    const sc = startSidecar('no-stub sidecar [6g]', { ZIPPER_CONFIG: cfgPath, ZIPPER_GUARD_PORT: String(NOSTUB_GUARD_PORT), ZIPPER_PUSH_RETRY_MS: '60' }, { allowStub: false });
+    // ZIPPER_PUSH_RETRY_MS asks for 60 ms, and the poll loop's three test settings for 0.3 s
+    // per request, 0.3 s per poll and 0.2 s between polls: without ZIPPER_ALLOW_STUB none of
+    // them may be honoured (R1, the owner's ruling of 2026-11-26, for the three).
+    const sc = startSidecar('no-stub sidecar [6g]', {
+      ZIPPER_CONFIG: cfgPath, ZIPPER_GUARD_PORT: String(NOSTUB_GUARD_PORT), ZIPPER_PUSH_RETRY_MS: '60',
+      ZIPPER_REQUEST_TIMEOUT_MS: '300', ZIPPER_POLL_DEADLINE_MS: '300', ZIPPER_MIN_POLL_GAP_MS: '200',
+    }, { allowStub: false });
     const since = sinceOn(client, sc);
     const polled = await since(at, (d) => isStatus(d) && !!parseStatus(d).lastPollAt, 6000);
     const p = polled && parseStatus(polled);
@@ -2712,6 +2835,25 @@ async function testStubAtTheRead(client) {
       p?.lastError === MSG.stubOff && p?.url === SAFE_STUB && p?.platform === null && !read,
       JSON.stringify({ lastError: p?.lastError, url: p?.url, platform: p?.platform, eventState: p?.auto?.eventState, read }));
     stubOffSeen = p?.lastError ?? null;
+    // R1: the limits it logs as it starts are the full ones, not those asked for. The line
+    // only reports the limits: the checks that watch them used are the gap below and 6j's
+    // poll whose request never answers (a break where they are used leaves this line full).
+    check(`R1: without ZIPPER_ALLOW_STUB the poll loop's test settings are ignored: the sidecar logs the full limits as it starts ("${FULL_LIMITS_LINE}"), not the 0.3 s, 0.3 s, 0.2 s and 60 ms asked for`,
+      limitsLineOf(sc.out) === FULL_LIMITS_LINE, JSON.stringify(limitsLineOf(sc.out)));
+    // R1: the minimum gap is the full 15 s. A pollNow sent just after the first poll is armed
+    // for 15 s after that poll (nextPollAt), and no poll runs meanwhile; with the 0.2 s asked
+    // for it would run at once.
+    {
+      const atNow = client.events.length;
+      client.ws.send(JSON.stringify({ request: 'DoAction', id: 'n', action: { name: 'Ticker Command' }, args: { command: 'pollNow', value: '' } }));
+      const r = await since(atNow, (d) => isStatus(d) && !!parseStatus(d).nextPollAt, 4000);
+      const rs = r && parseStatus(r);
+      const gapMs = rs && p?.lastPollAt ? Date.parse(rs.nextPollAt) - Date.parse(p.lastPollAt) : NaN;
+      await sleep(600);
+      const polledAgain = client.events.slice(atNow).filter(isStatus).map(parseStatus).some((x) => !!x.lastPollAt && x.lastPollAt !== p?.lastPollAt);
+      check('R1: without ZIPPER_ALLOW_STUB, ZIPPER_MIN_POLL_GAP_MS (0.2 s asked for) is ignored: a pollNow sent just after the first poll is armed for the full 15 s after it (nextPollAt), and no poll runs within 0.6 s',
+        gapMs >= 14500 && gapMs <= 15500 && rs?.lastPollAt === p?.lastPollAt && !polledAgain, JSON.stringify({ gapMs, polledAgain }));
+    }
     const at2 = client.events.length;
     const other = 'stub:./platforms/fixtures/stub-result.json';
     client.ws.send(JSON.stringify({ request: 'DoAction', id: 'n', action: { name: 'Ticker Command' }, args: { command: 'setUrl', value: other } }));
@@ -2767,6 +2909,16 @@ async function testStubAtTheRead(client) {
     check('a saved logo that fails the rule is dropped to "" in memory with one log line, and written out on the next save; the text stays',
       p?.caps?.logo === '' && p?.caps?.text === '@Saved' && dropped === 1 && saved?.autoSchedule === false && saved?.caps?.logo === '' && saved?.caps?.text === '@Saved',
       JSON.stringify({ statusCaps: p?.caps, logLines: dropped, savedCaps: saved?.caps }));
+    // Carried from Sprint 2: the reason is also in the status (configWarning), where the
+    // control page shows it, and it stays after the save that wrote the logo out (only a
+    // restart clears a load warning).
+    const atLater = client.events.length;
+    client.ws.send(JSON.stringify({ request: 'DoAction', id: 'o', action: { name: 'Ticker Command' }, args: { command: 'status', value: '' } }));
+    const later = await since(atLater, isStatus, 4000);
+    const laterWarning = later ? parseStatus(later).configWarning : undefined;
+    check('the reason a saved logo was dropped as config.json loaded is in configWarning, not only in the log, and stays there after the save that wrote the logo out',
+      p?.configWarning === CONFIG_MSG.logo && laterWarning === CONFIG_MSG.logo,
+      JSON.stringify({ atLoad: p?.configWarning, afterSave: laterWarning }));
     await sc.stop();
     await rm(cfgPath, { force: true });
   }
@@ -2813,9 +2965,10 @@ async function testPollLoop(client) {
   let sc = startSidecar('poll-loop sidecar [6h]', env);
   let since = sinceOn(client, sc);
   // Stops this sidecar and starts another on the same config file, so no Retry-After hold
-  // is left. Polling was stopped and saved as off, so the new one waits to be told.
-  // Resolves with the status it sends once it has connected.
+  // is left. Polling was stopped and saved as off (waited for: settledConfig), so the new
+  // one waits to be told. Resolves with the status it sends once it has connected.
   const restart = async (label = `poll-loop sidecar [6h] #${++runs}`, extraEnv = {}, opts = {}) => {
+    await settledConfig(client, cfgPath);
     await sc.stop();
     const at = client.events.length;
     sc = startSidecar(label, { ...env, ...extraEnv }, opts);
@@ -2839,6 +2992,11 @@ async function testPollLoop(client) {
       const first = statusOf(await since(at0, (d) => !!statusOf(d)?.lastPollAt, 6000));
       check('a first poll after a start that fails still shows its platform in the status (platformName is set on a failure too)',
         first?.platform === 'roundone' && /Round\.one/.test(first?.lastError || ''), JSON.stringify({ platform: first?.platform, lastError: first?.lastError }));
+      // R1, the other side: with ZIPPER_ALLOW_STUB=1 the test settings apply, and the line the
+      // sidecar logs as it starts names the limits it was given.
+      const wantLimits = 'limits: 10 s per request, 4 s per poll, 1.5 s between polls, 30 s before an owed push is retried (ZIPPER_ALLOW_STUB=1: the test settings apply)';
+      check('R1: with ZIPPER_ALLOW_STUB=1 the poll loop\'s test settings apply: this sidecar logs the limits it was given as it starts (4 s per poll, 1.5 s between polls; the two not set here stay 10 s and 30 s)',
+        limitsLineOf(sc.out) === wantLimits, JSON.stringify(limitsLineOf(sc.out)));
       await stopNow();
     }
 
@@ -3090,7 +3248,10 @@ async function testPollLoop(client) {
       const tDeadline = Date.now();
       await release('hold-s'); // so the poll that pollNow asked for can finish
       const upd = await since(at, (d) => isUpdate(d) && d.tournament?.name === 'Stalled Cup', 6000);
-      const good = await closed(at, deadline?.lastPollAt ?? set?.lastPollAt, (s) => s.lastError === '', 6000);
+      // The status that closes the second poll: a poll time other than the held poll's and
+      // the one from before it, which pollNow's own reply still carries (without this the
+      // reply matched at once, and the count below could be read before that status came).
+      const good = await closed(at, deadline?.lastPollAt ?? set?.lastPollAt, (s) => s.lastError === '' && s.lastPollAt !== set?.lastPollAt, 6000);
       check(`the poll's deadline (shortened to ${POLL_LOOP_DEADLINE_MS / 1000} s) aborts a held stub delay: the poll fails with "the poll took longer than ${POLL_LOOP_DEADLINE_MS / 1000} s and was stopped" while the hold file still exists`,
         !!holding && !!deadline && tDeadline - tHold < POLL_LOOP_DEADLINE_MS + 2000, JSON.stringify({ holding: !!holding, deadline: deadline?.lastError ?? null, afterMs: tDeadline - tHold }));
       check(`a pollNow sent while a poll is held replies at once with its own status (within ${REPLY_MS / 1000} s, before the held poll ends, nextPollAt null), and is kept: a second poll runs after the held one ends, with no further command`,
@@ -3519,6 +3680,8 @@ async function testPushes() {
   let sc = null;
   let since = null;
   let runs = 0;
+  // Every restart here writes its own config file (cfg) once the sidecar before has been
+  // stopped, so none depends on that sidecar's last save (6h's restarts do: settledConfig).
   const start = async (cfg, extraEnv = {}) => {
     if (sc) await sc.stop();
     if (cfg) await writeFile(cfgPath, JSON.stringify(cfg), 'utf-8');
@@ -4360,6 +4523,1212 @@ async function testPushes() {
   }
 }
 
+// ── 6j. Config safety, keys and the log file (ZIP-05, ZIP-21; rows 5.1 to 5.4) ──
+// Each sidecar here has a folder of its own, made with mkdtemp in the system temp folder
+// and removed afterwards, which holds only its config.json and its log file (config.log
+// beside it, and config.old.log once trimmed). The stub fixtures stay inside the repo
+// (decision 2), and so do the files the preloads read (in .verify-tmp/). The keys are
+// fake: every test sidecar starts without the CHALLONGE_API_KEY and STARTGG_API_KEY a
+// developer may have set (startSidecar), and a check that needs one passes a fake value.
+// A sidecar that would make a request runs with tools/fake-fetch-preload.cjs, which
+// replaces fetch in that process: nothing leaves the machine, and no name is looked up.
+
+const PRELOAD_FAKE_FETCH = resolve(__dirname, 'tools', 'fake-fetch-preload.cjs');
+const PRELOAD_CRASH = resolve(__dirname, 'tools', 'crash-preload.cjs');
+const PRELOAD_GUARD_ERROR = resolve(__dirname, 'tools', 'guard-error-preload.cjs');
+// Fake keys, each long enough to be redacted (8 characters or more). They share no piece
+// of 8 characters with each other or with anything else a sidecar prints (the folders here
+// are named zipper-verify-XXXXXX, so a key spelled "...verify-B..." once matched one).
+const FAKE = { challonge: 'chl-Q7Zk2Lm9Xa41-fake', startgg: 'sgg-W3Rt8Np5Yb62-fake' };
+// The size past which the sidecar trims its log (row 5.2, "about 1 MB").
+const LOG_TRIM_BYTES = 1024 * 1024;
+const tempBoxes = new Set();
+process.on('exit', () => { for (const d of tempBoxes) { try { rmSync(d, { recursive: true, force: true }); } catch {} } });
+
+async function testConfigSafety() {
+  console.log('\n[6j] config safety, keys and the log file (ZIP-05, ZIP-21; rows 5.1 to 5.4)');
+  const client = await busClient();
+  const statusOf = (d) => (isStatus(d) ? parseStatus(d) : null);
+  // A folder for one sidecar. body is the config file's text, an object to write as
+  // JSON, or null for no file at all.
+  const box = async (body) => {
+    const dir = await mkdtemp(join(tmpdir(), 'zipper-verify-'));
+    tempBoxes.add(dir);
+    const cfg = join(dir, 'config.json');
+    if (body != null) writeFileSync(cfg, typeof body === 'string' ? body : JSON.stringify(body, null, 2));
+    return {
+      dir, cfg, log: join(dir, 'config.log'), oldLog: join(dir, 'config.old.log'), tmp: `${cfg}.tmp`,
+      remove: () => { tempBoxes.delete(dir); try { rmSync(dir, { recursive: true, force: true }); } catch {} },
+    };
+  };
+  // Starts a sidecar on a folder and waits for its first status.
+  const startIn = async (label, b, { env = {}, allowStub = true, preload = [], expectExit = false, guard = GUARD_PORT } = {}) => {
+    const at = client.events.length;
+    const sc = startSidecar(label, { ZIPPER_CONFIG: b.cfg, ZIPPER_GUARD_PORT: String(guard), ZIPPER_MIN_POLL_GAP_MS: '200', ...env },
+      { allowStub, expectExit, nodeArgs: preload.flatMap((p) => ['--require', p]) });
+    const since = sinceOn(client, sc);
+    const first = statusOf(await since(at, isStatus, 8000));
+    const cmd = (command, value) => client.ws.send(JSON.stringify({ request: 'DoAction', id: 'j', action: { name: 'Ticker Command' }, args: { command, value: value ?? '' } }));
+    const after = async (command, value, pred = () => true, timeoutMs = 4000) => {
+      const a = client.events.length;
+      cmd(command, value);
+      return statusOf(await since(a, (d) => !!statusOf(d) && pred(statusOf(d)), timeoutMs));
+    };
+    // Every status this sidecar sent, as the bus carried it (its JSON text).
+    const statuses = () => client.events.slice(at).filter(isStatus).map((d) => String(d.value));
+    return { sc, since, at, first, cmd, after, statuses };
+  };
+  const bytes = (p) => { try { return readFileSync(p); } catch { return null; } };
+  const same = (a, b) => !!a && !!b && Buffer.compare(a, b) === 0;
+  const logOf = (b) => { try { return readFileSync(b.log, 'utf-8'); } catch { return ''; } };
+  const sizeOf = (p) => { try { return statSync(p).size; } catch { return -1; } };
+  const mtimeOf = (p) => { try { return statSync(p).mtimeMs; } catch { return null; } };
+  // A sidecar whose config.json did not load logs this once, from the first save a command
+  // asks for: the positive sign that the save ran and refused (a save that went ahead would
+  // never log it). True once it is in the log file.
+  const REFUSED_SAVE_LINE = 'config.json is not saved while it does not load';
+  const refusedSaveIn = async (b) => !!(await waitFor(() => logOf(b).includes(REFUSED_SAVE_LINE), 4000, 50));
+  const goodCfg = (extra = {}) => ({ tournamentUrl: null, autoStart: false, autoSchedule: true, pollIntervalMs: 15000, maxItems: 20, topN: 0, caps: { text: '', logo: '' }, ...extra });
+  // Whether any piece of `secret`, n characters long, appears in `text`; pieceAt says where
+  // the first one is, with the text around it, for a check's detail (the keys are fake).
+  const anyPiece = (text, secret, n) => { for (let i = 0; i + n <= secret.length; i++) if (text.includes(secret.slice(i, i + n))) return true; return false; };
+  const pieceAt = (text, secret, n) => {
+    for (let i = 0; i + n <= secret.length; i++) {
+      const at = text.indexOf(secret.slice(i, i + n));
+      if (at >= 0) return text.slice(Math.max(0, at - 40), at + n + 40);
+    }
+    return null;
+  };
+
+  // Row 5.1 (ZIP-05): a config.json with a trailing comma is never written over. The
+  // sidecar runs on its defaults, saves nothing, and says why in configWarning, with the
+  // line. Open choice: a key from the environment is not used either while it is broken.
+  {
+    const raw = '{\r\n  "tournamentUrl": null,\r\n  "caps": { "text": "@Kept", "logo": "" },\r\n}\r\n';
+    const b = await box(raw);
+    const modeFile = join(TMP_DIR, 'fetch-mode-6j-a');
+    writeFileSync(modeFile, 'fail');
+    const s = await startIn('broken-config sidecar [6j]', b, { env: { CHALLONGE_API_KEY: FAKE.challonge, ZIPPER_TEST_FAKE_FETCH_FILE: modeFile }, preload: [PRELOAD_FAKE_FETCH] });
+    const want = CONFIG_MSG.notJson(4);
+    check('row 5.1: a config.json with a trailing comma: the status carries "config.json is not valid JSON (line 4)" in configWarning, and the sidecar runs on its defaults (the file\'s caps text is not used)',
+      s.first?.configWarning === want && s.first?.caps?.text === '', JSON.stringify({ configWarning: s.first?.configWarning, caps: s.first?.caps }));
+    const changed = await s.after('setCapsText', '@AfterBroken', (st) => st.caps?.text === '@AfterBroken');
+    // The save the command asked for ran and refused (its one log line), so the bytes below
+    // are compared after it, not after a guess at how long a save takes.
+    const refusedSave = await refusedSaveIn(b);
+    check('row 5.1 (ZIP-05): it survives a command byte-identical: the save it asked for refuses ("config.json is not saved while it does not load"), nothing is saved over it and config.example.json is not copied over it; no temp file is left',
+      !!changed && refusedSave && same(bytes(b.cfg), Buffer.from(raw)) && !existsSync(b.tmp),
+      JSON.stringify({ applied: !!changed, refusedSave, identical: same(bytes(b.cfg), Buffer.from(raw)), tmp: existsSync(b.tmp) }));
+    await s.after('setUrl', SAFE_STUB, (st) => st.url === SAFE_STUB);
+    const polled = await s.after('start', '', (st) => !!st.lastPollAt && st.lastError === '', 6000);
+    await s.after('stop', '', (st) => st.polling === false);
+    await sleep(500);
+    check('row 5.1: after setUrl and a good stub poll it is still byte-identical, and the warning is still in the status (a good poll and setUrl clear lastError, never configWarning)',
+      polled?.configWarning === want && same(bytes(b.cfg), Buffer.from(raw)),
+      JSON.stringify({ polled: !!polled, configWarning: polled?.configWarning, identical: same(bytes(b.cfg), Buffer.from(raw)) }));
+    // The fake fetch answers both Challonge paths, and the error names the host it was asked.
+    const chl = 'https://challonge.com/zvcup';
+    await s.after('setUrl', chl, (st) => st.url === chl);
+    const failed = await s.after('pollNow', '', (st) => !!st.lastError, 6000);
+    await s.after('stop', '', (st) => st.polling === false);
+    check('row 5.1, open choice: with config.json broken, a key from the environment is not used either: a Challonge URL polls the keyless page (challonge.com), not the API with CHALLONGE_API_KEY (api.challonge.com)',
+      failed?.lastError === 'challonge.com: the request failed (ZIPPER_FAKE_FETCH)', JSON.stringify({ lastError: failed?.lastError }));
+    // A key from the environment is redacted from the first line on, even though it is not
+    // used while config.json is broken.
+    await s.after('setInterval', `x ${FAKE.challonge} y`);
+    await sleep(200);
+    const log = logOf(b);
+    const out = s.sc.out;
+    check('row 5.1 (Sprint 4, d): the log line for a broken config.json is the fixed sentence, in the log file and on the console; V8\'s own message, which quotes the file beside the error, is never logged',
+      log.includes(want) && out.includes(want) && !/Expected double-quoted|in JSON at position|Unexpected token/.test(log + out),
+      JSON.stringify({ inLog: log.includes(want), onConsole: out.includes(want) }));
+    check('row 5.3: with config.json broken, a key from the environment is still redacted in the log ("[Challonge key]")',
+      log.includes('command: setInterval x [Challonge key] y') && !log.includes(FAKE.challonge) && !out.includes(FAKE.challonge),
+      JSON.stringify({ redacted: log.includes('command: setInterval x [Challonge key] y'), inLog: log.includes(FAKE.challonge) }));
+    await s.sc.stop();
+    b.remove();
+  }
+
+  // Row 5.1: the other files that are never written over: one that parses to something
+  // other than an object, and one with a key pasted without its quotes (V8's message then
+  // quotes the key; the sidecar's never does).
+  {
+    const UNQUOTED = 'QZXQZXQZXQZX9876';
+    const cases = [
+      ['holding null', 'null', CONFIG_MSG.notObject],
+      ['holding a list', '[{ "tournamentUrl": null }]', CONFIG_MSG.notObject],
+      ['holding a number', '42', CONFIG_MSG.notObject],
+      ['with a key pasted without quotes', `{\n  "startggApiKey": ${UNQUOTED},\n  "maxItems": 5\n}\n`, CONFIG_MSG.notJson(0)],
+    ];
+    for (const [what, raw, want] of cases) {
+      const b = await box(raw);
+      const s = await startIn(`config ${what} [6j]`, b);
+      const changed = await s.after('setCapsText', '@AfterBad', (st) => st.caps?.text === '@AfterBad');
+      const refusedSave = await refusedSaveIn(b);
+      const keyed = raw.includes(UNQUOTED);
+      const leak = keyed && anyPiece(s.statuses().join('\n') + logOf(b) + s.sc.out, UNQUOTED, 5);
+      check(`row 5.1: a config.json ${what} survives a command byte-identical (its save refuses), with "${want.split(';')[0]}" in configWarning${keyed ? '; no piece of the unquoted key (5 characters or more) is in a status, the log file or the console' : ''}`,
+        s.first?.configWarning === want && !!changed && refusedSave && same(bytes(b.cfg), Buffer.from(raw)) && !existsSync(b.tmp) && !leak,
+        JSON.stringify({ configWarning: s.first?.configWarning, refusedSave, identical: same(bytes(b.cfg), Buffer.from(raw)), leak }));
+      await s.sc.stop();
+      b.remove();
+    }
+  }
+
+  // Row 5.1: a config.json that cannot be read (here a folder of that name) is never
+  // written over either.
+  {
+    const b = await box(null);
+    mkdirSync(b.cfg);
+    const s = await startIn('config.json that cannot be read [6j]', b);
+    const changed = await s.after('setCapsText', '@AfterUnreadable', (st) => st.caps?.text === '@AfterUnreadable');
+    // The save refused (its log line). A save that went ahead could not write onto the
+    // folder either, but it would add "could not be saved" to configWarning, so the status
+    // after it must still hold the one sentence.
+    const refusedSave = await refusedSaveIn(b);
+    const later = await s.after('status');
+    let still = false;
+    try { still = statSync(b.cfg).isDirectory() && readdirSync(b.cfg).length === 0; } catch {}
+    check('row 5.1: a config.json that cannot be read (a folder of that name here) gives "config.json could not be read" in configWarning; a command\'s save refuses, so it saves nothing, copies no example over it, and adds no other warning',
+      s.first?.configWarning === CONFIG_MSG.unreadable && !!changed && refusedSave && later?.configWarning === CONFIG_MSG.unreadable && still && !existsSync(b.tmp),
+      JSON.stringify({ configWarning: s.first?.configWarning, refusedSave, later: later?.configWarning, still }));
+    const log = logOf(b);
+    check('row 5.1: the log says why config.json could not be read, by the system\'s code only (here "(EISDIR)" or the like, never the message, which quotes the path); the status keeps the fixed sentence',
+      /config\.json could not be read \(E[A-Z]+\); the sidecar runs on its defaults/.test(log) && !/could not be read \(E/.test(later?.configWarning ?? ''),
+      (/.*could not be read.*/.exec(log) || ['(no line)'])[0]);
+    await s.sc.stop();
+    b.remove();
+  }
+
+  // Row 5.1: a UTF-8 byte-order mark (Notepad's "UTF-8 with BOM", Windows PowerShell's
+  // Out-File -Encoding utf8) is stripped, and a config.json that is missing is seeded from
+  // config.example.json (and only a missing one). (Windows PowerShell's plain Out-File and
+  // ">" write UTF-16, which is refused with a sentence of its own: R2, below.)
+  {
+    const b = await box('\uFEFF' + JSON.stringify(goodCfg({ caps: { text: '@Bom', logo: '' } })));
+    const s = await startIn('config.json with a byte-order mark [6j]', b);
+    check('row 5.1: a config.json that starts with a byte-order mark loads (the mark is stripped): no warning, and its caps text is used',
+      s.first?.configWarning === '' && s.first?.caps?.text === '@Bom', JSON.stringify({ configWarning: s.first?.configWarning, caps: s.first?.caps }));
+    await s.sc.stop();
+    b.remove();
+  }
+  {
+    const b = await box(null);
+    const s = await startIn('no config.json [6j]', b);
+    check('row 5.1: a missing config.json is seeded from config.example.json, with no warning (the broken files above were left as they were)',
+      s.first?.configWarning === '' && same(bytes(b.cfg), bytes(resolve(__dirname, 'config.example.json'))),
+      JSON.stringify({ configWarning: s.first?.configWarning, seeded: existsSync(b.cfg) }));
+    await s.sc.stop();
+    b.remove();
+  }
+
+  // R2 (the owner's ruling of 2026-11-26): a config.json saved as UTF-16 (with a byte-order
+  // mark either way round, or plainly without one) or empty (no bytes, or only white space
+  // after a UTF-8 byte-order mark) gets a sentence of its own, not "not valid JSON", and is
+  // still never written over. The UTF-16 files hold a fake key, of which no piece may reach a
+  // status, the log or the console, read as it is or with the NULs of UTF-16 taken out.
+  // Two cases also hold a config.json.tmp (R3): a whole one, kept and named after the load
+  // sentence; and one that parses to a list, not an object, kept and not named.
+  {
+    const KEY16 = 'Zq7Utf16Wv93Xk';
+    const json = JSON.stringify(goodCfg({ startggApiKey: KEY16, caps: { text: '@Utf16', logo: '' } }), null, 2);
+    const le = Buffer.from(json, 'utf16le');
+    const be = Buffer.from(json, 'utf16le').swap16();
+    const wholeTmp = JSON.stringify(goodCfg({ caps: { text: '@WholeTmp', logo: '' } }), null, 2);
+    const listTmp = '[{ "tournamentUrl": null }]';
+    const cases = [
+      // [what, the file's bytes, the warning wanted, config.json.tmp's text or null]
+      ['saved as UTF-16 LE with its byte-order mark (FF FE), beside a whole config.json.tmp', Buffer.concat([Buffer.from([0xff, 0xfe]), le]), `${CONFIG_MSG.utf16} · ${CONFIG_MSG.tmpWhole}`, wholeTmp],
+      ['saved as UTF-16 BE with its byte-order mark (FE FF)', Buffer.concat([Buffer.from([0xfe, 0xff]), be]), CONFIG_MSG.utf16, null],
+      ['saved as UTF-16 LE without a byte-order mark', le, CONFIG_MSG.utf16, null],
+      ['saved as UTF-16 BE without a byte-order mark', be, CONFIG_MSG.utf16, null],
+      ['of zero bytes, beside a config.json.tmp that holds a list (not whole)', Buffer.alloc(0), CONFIG_MSG.empty, listTmp],
+      ['holding a UTF-8 byte-order mark and white space only', Buffer.from('﻿ \r\n\t\r\n', 'utf-8'), CONFIG_MSG.empty, null],
+    ];
+    for (const [what, raw, want, tmpText] of cases) {
+      const b = await box(null);
+      writeFileSync(b.cfg, raw);
+      if (tmpText !== null) writeFileSync(b.tmp, tmpText);
+      const tmpTime = mtimeOf(b.tmp);
+      const s = await startIn(`config.json ${what.split(',')[0]} [6j]`, b);
+      const changed = await s.after('setCapsText', '@AfterR2', (st) => st.caps?.text === '@AfterR2');
+      const refusedSave = await refusedSaveIn(b);
+      const log = logOf(b);
+      const seen = s.statuses().join('\n') + log + s.sc.out;
+      const leak = anyPiece(seen, KEY16, 5) || anyPiece(seen.replace(/\u0000/g, ''), KEY16, 5);
+      const tmpKept = tmpText === null ? !existsSync(b.tmp) : same(bytes(b.tmp), Buffer.from(tmpText)) && mtimeOf(b.tmp) === tmpTime;
+      check(`R2: a config.json ${what}: "${want.split(CONFIG_LOAD_TAIL)[0]}…"${want.includes(CONFIG_MSG.tmpWhole) ? ` with "${CONFIG_MSG.tmpWhole}" after it` : ''} in configWarning and the log (not "not valid JSON"), the sidecar on its defaults; it survives a command byte-identical (its save refuses)${tmpText === null ? '' : ', and config.json.tmp is kept untouched (same bytes, same modified time)'}; no piece of the file's text is in a status, the log or the console`,
+        s.first?.configWarning === want && s.first?.caps?.text === '' && log.includes(want.split(' · ')[0]) && !/not valid JSON/.test(log)
+          && !!changed && refusedSave && same(bytes(b.cfg), raw) && tmpKept && !leak,
+        JSON.stringify({ configWarning: s.first?.configWarning, caps: s.first?.caps?.text, refusedSave, identical: same(bytes(b.cfg), raw), tmpKept, leak }));
+      await s.sc.stop();
+      b.remove();
+    }
+  }
+
+  // R3 (the owner's ruling of 2026-11-26): config.json.tmp, which a crash between a save's
+  // write and its rename can leave, is removed at start only once config.json has loaded.
+  // Beside a config.json that is refused it is kept untouched, and named in configWarning
+  // when it is whole (parses to an object); a sidecar that refused config.json saves
+  // nothing, so it never writes the temp file either. Every way of refusing config.json
+  // (not valid JSON, cannot be read, not an object, empty, UTF-16 in R2 above, and not
+  // UTF-8 in R5 below) is tried beside a whole temp file. Each file holds a fake key, of which no piece may reach
+  // a status, the log or the console.
+  {
+    const KEY_CFG = 'Zq7Cfg42Wv81Xk';
+    const KEY_TMP = 'Zq7Tmp58Wv26Xk';
+    const cutTmp = '{\r\n  "tournamentUrl": "https://challonge.com/zv';
+    const wholeTmp = JSON.stringify(goodCfg({ startggApiKey: KEY_TMP, caps: { text: '@FromTmp', logo: '' } }), null, 2);
+    // config.json as a folder of that name: a file that cannot be read.
+    const FOLDER = Symbol('a folder named config.json');
+    const emptyFolder = (p) => { try { return statSync(p).isDirectory() && readdirSync(p).length === 0; } catch { return false; } };
+    const refused = [
+      // [what, config.json's text (or FOLDER), the warning wanted, config.json.tmp's text]
+      ['not valid JSON (a trailing comma), beside a whole config.json.tmp', `{\r\n  "startggApiKey": "${KEY_CFG}",\r\n  "maxItems": 5,\r\n}\r\n`, `${CONFIG_MSG.notJson(4)} · ${CONFIG_MSG.tmpWhole}`, wholeTmp],
+      ['holding null, beside a config.json.tmp cut short (not whole)', 'null', CONFIG_MSG.notObject, cutTmp],
+      ['holding null, beside a whole config.json.tmp', 'null', `${CONFIG_MSG.notObject} · ${CONFIG_MSG.tmpWhole}`, wholeTmp],
+      ['of zero bytes, beside a whole config.json.tmp', '', `${CONFIG_MSG.empty} · ${CONFIG_MSG.tmpWhole}`, wholeTmp],
+      ['that cannot be read (a folder of that name), beside a whole config.json.tmp', FOLDER, `${CONFIG_MSG.unreadable} · ${CONFIG_MSG.tmpWhole}`, wholeTmp],
+    ];
+    for (const [what, raw, want, tmpText] of refused) {
+      const b = await box(raw === FOLDER ? null : raw);
+      if (raw === FOLDER) mkdirSync(b.cfg);
+      writeFileSync(b.tmp, tmpText);
+      const tmpTime = mtimeOf(b.tmp);
+      const s = await startIn(`config.json ${what.split(',')[0]} [6j]`, b);
+      const changed = await s.after('setCapsText', '@AfterR3', (st) => st.caps?.text === '@AfterR3');
+      const refusedSave = await refusedSaveIn(b);
+      const seen = s.statuses().join('\n') + logOf(b) + s.sc.out;
+      const leak = anyPiece(seen, KEY_CFG, 5) || anyPiece(seen, KEY_TMP, 5);
+      const tmpKept = same(bytes(b.tmp), Buffer.from(tmpText)) && mtimeOf(b.tmp) === tmpTime;
+      const identical = raw === FOLDER ? emptyFolder(b.cfg) : same(bytes(b.cfg), Buffer.from(raw));
+      check(`R3: a config.json ${what}: config.json.tmp is kept untouched (same bytes, same modified time) through the start and a command's refused save, config.json is ${raw === FOLDER ? 'still an empty folder' : 'byte-identical'}, and configWarning is "${want.split(CONFIG_LOAD_TAIL)[0]}…"${want.includes(CONFIG_MSG.tmpWhole) ? ` with "${CONFIG_MSG.tmpWhole}" after it` : ' only (nothing about the temp file)'}; no piece of either file's key is in a status, the log or the console`,
+        s.first?.configWarning === want && !!changed && refusedSave && identical && tmpKept && !leak,
+        JSON.stringify({ configWarning: s.first?.configWarning, refusedSave, identical, tmpKept, leak }));
+      await s.sc.stop();
+      b.remove();
+    }
+
+    // A choice (the ruling covers a refused config.json): a config.json that is MISSING
+    // beside a whole config.json.tmp is treated as refused. The example is not copied in,
+    // nothing is saved, the temp file is kept, and configWarning says both.
+    {
+      const b = await box(null);
+      writeFileSync(b.tmp, wholeTmp);
+      const tmpTime = mtimeOf(b.tmp);
+      const s = await startIn('no config.json, a whole config.json.tmp [6j]', b);
+      const changed = await s.after('setCapsText', '@AfterMissing', (st) => st.caps?.text === '@AfterMissing');
+      const refusedSave = await refusedSaveIn(b);
+      const seen = s.statuses().join('\n') + logOf(b) + s.sc.out;
+      const tmpKept = same(bytes(b.tmp), Buffer.from(wholeTmp)) && mtimeOf(b.tmp) === tmpTime;
+      check(`R3 (a choice): config.json missing beside a whole config.json.tmp: config.example.json is not copied in and nothing is saved (a command's save refuses, config.json stays missing); the temp file is kept untouched; configWarning is "config.json is missing; …" with "${CONFIG_MSG.tmpWhole}" after it, and the sidecar runs on its defaults; no piece of the temp file's key is in a status, the log or the console`,
+        s.first?.configWarning === `${CONFIG_MSG.missing} · ${CONFIG_MSG.tmpWhole}` && s.first?.caps?.text === '' && !!changed && refusedSave && !existsSync(b.cfg) && tmpKept && !anyPiece(seen, KEY_TMP, 5),
+        JSON.stringify({ configWarning: s.first?.configWarning, caps: s.first?.caps?.text, refusedSave, cfg: existsSync(b.cfg), tmpKept }));
+      await s.sc.stop();
+      b.remove();
+    }
+    // ...and beside one that is not whole, config.json is seeded from the example as usual,
+    // and the temp file is removed once it has loaded.
+    {
+      const b = await box(null);
+      writeFileSync(b.tmp, cutTmp);
+      const s = await startIn('no config.json, a config.json.tmp cut short [6j]', b);
+      check('R3: config.json missing beside a config.json.tmp that is not whole (cut short): config.json is seeded from config.example.json as usual, with no warning, and the temp file is removed once it has loaded',
+        s.first?.configWarning === '' && same(bytes(b.cfg), bytes(resolve(__dirname, 'config.example.json'))) && !existsSync(b.tmp),
+        JSON.stringify({ configWarning: s.first?.configWarning, seeded: existsSync(b.cfg), tmp: existsSync(b.tmp) }));
+      await s.sc.stop();
+      b.remove();
+    }
+    // The recovery step the README and PROTOCOL give for a refused config.json beside a whole
+    // copy: config.json.tmp cannot be renamed to config.json while the broken file is still
+    // there (Windows refuses, a file of that name exists), so each says to delete (or rename)
+    // the broken one first.
+    {
+      const flat = (p) => readFileSync(resolve(__dirname, p), 'utf-8').replace(/\s+/g, ' ');
+      const readmeOk = flat('README.md').includes('delete or rename the broken `config.json`, rename `config.json.tmp` to `config.json`, then restart');
+      const protocolOk = flat(join('docs', 'PROTOCOL.md')).includes('delete the broken one and rename `config.json.tmp` to `config.json`');
+      check('docs (R3): the README and PROTOCOL say to delete (or rename) the broken config.json before renaming config.json.tmp to config.json, since a rename onto a file that is still there fails',
+        readmeOk && protocolOk, JSON.stringify({ readmeOk, protocolOk }));
+    }
+  }
+
+  // R5 (the owner's ruling of 2026-11-26): a config.json whose bytes are not valid UTF-8 is
+  // refused with a sentence of its own, and never written over. Here it is saved as ANSI
+  // (Windows-1252), with an "é" in the caps text: the one byte E9, which a lenient read would
+  // turn into U+FFFD and the next save would write back for good. config.json.tmp is
+  // handled as for every other refusal (R3): a whole one is kept untouched and named. The
+  // file holds a fake key, of which no piece may reach a status, the log or the console.
+  {
+    const KEY_ANSI = 'Zq7Ansi63Wv47Xk';
+    const ansi = Buffer.from(JSON.stringify(goodCfg({ startggApiKey: KEY_ANSI, maxItems: 7, caps: { text: '@Café', logo: '' } }), null, 2), 'latin1');
+    const oneHighByte = ansi.filter((x) => x >= 0x80).length === 1 && ansi.includes(0xe9);
+    const wholeTmp = JSON.stringify(goodCfg({ caps: { text: '@WholeTmp', logo: '' } }), null, 2);
+    for (const [what, tmpText, want] of [
+      ['saved as ANSI with an "é" (byte E9) in the caps text', null, CONFIG_MSG.notUtf8],
+      ['saved as ANSI with an "é" (byte E9) in the caps text, beside a whole config.json.tmp', wholeTmp, `${CONFIG_MSG.notUtf8} · ${CONFIG_MSG.tmpWhole}`],
+    ]) {
+      const b = await box(null);
+      writeFileSync(b.cfg, ansi);
+      if (tmpText !== null) writeFileSync(b.tmp, tmpText);
+      const tmpTime = mtimeOf(b.tmp);
+      const s = await startIn(`config.json ${tmpText === null ? 'saved as ANSI' : 'saved as ANSI, beside a whole temp file'} [6j]`, b);
+      const changed = await s.after('setCapsText', '@AfterR5', (st) => st.caps?.text === '@AfterR5');
+      const refusedSave = await refusedSaveIn(b);
+      const log = logOf(b);
+      const leak = anyPiece(s.statuses().join('\n') + log + s.sc.out, KEY_ANSI, 5);
+      const tmpKept = tmpText === null ? !existsSync(b.tmp) : same(bytes(b.tmp), Buffer.from(tmpText)) && mtimeOf(b.tmp) === tmpTime;
+      check(`R5: a config.json ${what}: "config.json is not saved as UTF-8; save it as UTF-8…"${tmpText === null ? '' : ` with "${CONFIG_MSG.tmpWhole}" after it`} in configWarning, and the sentence in the log file and on the console (not "not valid JSON"); the sidecar runs on its defaults (caps text "", maxItems 20); a command's save refuses and the file stays byte-identical${tmpText === null ? ', with no temp file left' : ', and config.json.tmp is kept untouched (same bytes, same modified time)'}; no piece of its fake key (5 characters or more) is in a status, the log or the console`,
+        oneHighByte && s.first?.configWarning === want && s.first?.caps?.text === '' && s.first?.maxItems === 20
+          && log.includes(CONFIG_MSG.notUtf8) && s.sc.out.includes(CONFIG_MSG.notUtf8) && !/not valid JSON/.test(log)
+          && !!changed && refusedSave && same(bytes(b.cfg), ansi) && tmpKept && !leak,
+        JSON.stringify({ oneHighByte, configWarning: s.first?.configWarning, caps: s.first?.caps?.text, maxItems: s.first?.maxItems, inLog: log.includes(CONFIG_MSG.notUtf8), onConsole: s.sc.out.includes(CONFIG_MSG.notUtf8), refusedSave, identical: same(bytes(b.cfg), ansi), tmpKept, leak }));
+      await s.sc.stop();
+      b.remove();
+    }
+    // A file of plain ASCII saved as ANSI is valid UTF-8, so it still loads (one saved as
+    // UTF-16 is refused, R2 above); so does one saved as UTF-8 (with its byte-order mark)
+    // with an accented letter in it.
+    const asciiOnly = Buffer.from(JSON.stringify(goodCfg({ maxItems: 7, caps: { text: '@PlainAscii', logo: '' } }), null, 2), 'latin1');
+    const utf8Accent = Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from(JSON.stringify(goodCfg({ maxItems: 7, caps: { text: '@Café', logo: '' } }), null, 2), 'utf-8')]);
+    for (const [what, raw, text, shapeOk] of [
+      ['saved as ANSI with plain ASCII only', asciiOnly, '@PlainAscii', asciiOnly.every((x) => x < 0x80)],
+      ['saved as UTF-8 with a byte-order mark and an "é" (bytes C3 A9)', utf8Accent, '@Café', utf8Accent.includes(Buffer.from([0xc3, 0xa9]))],
+    ]) {
+      const b = await box(null);
+      writeFileSync(b.cfg, raw);
+      const s = await startIn(`config.json ${what.split(' with')[0]} [6j]`, b);
+      check(`R5: a config.json ${what} loads: no warning, and its settings are used (caps text "${text}", maxItems 7)`,
+        shapeOk && s.first?.configWarning === '' && s.first?.caps?.text === text && s.first?.maxItems === 7,
+        JSON.stringify({ shapeOk, configWarning: s.first?.configWarning, caps: s.first?.caps?.text, maxItems: s.first?.maxItems }));
+      await s.sc.stop();
+      b.remove();
+    }
+    // The owner's ruling: a file of NULs alone keeps the label it had. NUL is valid UTF-8, and
+    // such a file is not taken for UTF-16, so it is still "not valid JSON" (V8 gives no
+    // position for it, so no line).
+    {
+      const raw = Buffer.alloc(16, 0);
+      const b = await box(null);
+      writeFileSync(b.cfg, raw);
+      const s = await startIn('config.json of NULs alone [6j]', b);
+      check('R5 (the owner\'s ruling: no change): a config.json of NULs alone keeps its label, "config.json is not valid JSON…" (not UTF-8, not UTF-16), and stays byte-identical',
+        s.first?.configWarning === CONFIG_MSG.notJson(0) && same(bytes(b.cfg), raw),
+        JSON.stringify({ configWarning: s.first?.configWarning, identical: same(bytes(b.cfg), raw) }));
+      await s.sc.stop();
+      b.remove();
+    }
+    // The decode keeps a UTF-8 byte-order mark in the text (ignoreBOM), so the strip after it
+    // removes one mark, as before R5. A file that starts with two marks is still "not valid
+    // JSON" (V8 gives no position for it, so no line). Were the decoder to strip a mark of
+    // its own, the second would be stripped too, and the file would load.
+    {
+      const raw = Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf, 0xef, 0xbb, 0xbf]), Buffer.from(JSON.stringify(goodCfg({ maxItems: 7, caps: { text: '@TwoBoms', logo: '' } }), null, 2), 'utf-8')]);
+      const b = await box(null);
+      writeFileSync(b.cfg, raw);
+      const s = await startIn('config.json with two byte-order marks [6j]', b);
+      check('R5: a config.json that starts with two UTF-8 byte-order marks is refused as before R5, "config.json is not valid JSON…" (only one mark is stripped), the sidecar on its defaults (caps text "", maxItems 20); it stays byte-identical',
+        s.first?.configWarning === CONFIG_MSG.notJson(0) && s.first?.caps?.text === '' && s.first?.maxItems === 20 && same(bytes(b.cfg), raw),
+        JSON.stringify({ configWarning: s.first?.configWarning, caps: s.first?.caps?.text, maxItems: s.first?.maxItems, identical: same(bytes(b.cfg), raw) }));
+      await s.sc.stop();
+      b.remove();
+    }
+    // The README and PROTOCOL say which file of plain ASCII loads: one saved as ANSI. One
+    // saved as UTF-16 (Windows PowerShell's ">") is refused (R2, above), so neither says
+    // such a file loads "whatever it was saved as".
+    {
+      const flat = (p) => readFileSync(resolve(__dirname, p), 'utf-8').replace(/\s+/g, ' ');
+      const readme = flat('README.md');
+      const protocol = flat(join('docs', 'PROTOCOL.md'));
+      const readmeOk = readme.includes('A file of plain ASCII saved as ANSI loads.') && !readme.includes('whatever it was saved as');
+      const protocolOk = protocol.includes('a file of plain ASCII saved as ANSI is valid UTF-8, so it loads') && !protocol.includes('whatever it was saved as');
+      check('docs (R5): the README and PROTOCOL say a file of plain ASCII saved as ANSI loads, not that it loads "whatever it was saved as" (one saved as UTF-16 is refused)',
+        readmeOk && protocolOk, JSON.stringify({ readmeOk, protocolOk }));
+    }
+  }
+
+  // Rows 5.1 to 5.3 on one sidecar: the temp file a crash left, a burst of saves, keys
+  // from the environment (used, never saved), the Challonge key through the real adapter
+  // and the fetch wrapper (decision 9), and the log file.
+  {
+    const b = await box(goodCfg());
+    writeFileSync(b.tmp, 'left behind by a crash');
+    const modeFile = join(TMP_DIR, 'fetch-mode-6j-c');
+    writeFileSync(modeFile, 'fail');
+    const s = await startIn('writes and keys sidecar [6j]', b, {
+      env: { CHALLONGE_API_KEY: FAKE.challonge, STARTGG_API_KEY: FAKE.startgg, ZIPPER_TEST_FAKE_FETCH_FILE: modeFile, ZIPPER_REQUEST_TIMEOUT_MS: '500' },
+      preload: [PRELOAD_FAKE_FETCH],
+    });
+    check('row 5.1: a temp file left by a crash (config.json.tmp) is removed when the sidecar starts; a good config.json gives configWarning ""',
+      !!s.first && !existsSync(b.tmp) && s.first.configWarning === '', JSON.stringify({ tmp: existsSync(b.tmp), configWarning: s.first?.configWarning }));
+    const atBurst = client.events.length;
+    for (let i = 1; i <= 25; i++) s.cmd('setCapsText', `burst ${i}`);
+    const lastSeen = await s.since(atBurst, (d) => statusOf(d)?.caps?.text === 'burst 25', 8000);
+    const savedBurst = await savedConfig(b.cfg, (c) => c.caps?.text === 'burst 25', 6000);
+    await sleep(500);
+    const settled = await s.after('status');
+    let parsedNow = null;
+    try { parsedNow = JSON.parse(readFileSync(b.cfg, 'utf-8')); } catch {}
+    check('row 5.1: 25 commands in a burst, each saving: config.json ends whole, holding the last one, written one save at a time (no temp file left, no warning)',
+      !!lastSeen && savedBurst?.caps?.text === 'burst 25' && parsedNow?.caps?.text === 'burst 25' && !existsSync(b.tmp) && settled?.configWarning === '',
+      JSON.stringify({ seen: !!lastSeen, saved: savedBurst?.caps?.text, now: parsedNow?.caps?.text, tmp: existsSync(b.tmp), configWarning: settled?.configWarning }));
+    const fileText = readFileSync(b.cfg, 'utf-8');
+    check('row 5.2 (ZIP-21): keys from the environment are kept out of config.json: after a save it holds neither value, and both keys are null',
+      !fileText.includes(FAKE.challonge) && !fileText.includes(FAKE.startgg) && parsedNow?.challongeApiKey === null && parsedNow?.startggApiKey === null,
+      JSON.stringify({ challongeInFile: fileText.includes(FAKE.challonge), startggInFile: fileText.includes(FAKE.startgg), challongeApiKey: parsedNow?.challongeApiKey === null ? null : '(set)', startggApiKey: parsedNow?.startggApiKey === null ? null : '(set)' }));
+    // R3: a normal save still makes and replaces config.json.tmp. One found there when a save
+    // runs (here a stale one, put there while the sidecar runs) is written over and renamed
+    // into config.json, so the setting is saved, no warning is added, and no temp file is left.
+    writeFileSync(b.tmp, 'a stale temp file');
+    const afterStale = await s.after('setCapsText', '@AfterStaleTmp', (x) => x.caps?.text === '@AfterStaleTmp');
+    const savedStale = await savedConfig(b.cfg, (c) => c.caps?.text === '@AfterStaleTmp', 4000);
+    await sleep(200);
+    const staleWarning = (await s.after('status'))?.configWarning;
+    check('R3: a temp file that is there when a save runs (a stale one here) is written over and renamed into config.json: the setting is saved, no warning is added, and no temp file is left',
+      !!afterStale && savedStale?.caps?.text === '@AfterStaleTmp' && !existsSync(b.tmp) && staleWarning === '',
+      JSON.stringify({ saved: savedStale?.caps?.text, tmp: existsSync(b.tmp), configWarning: staleWarning }));
+
+    // The fake fetch fails the request quoting its whole address, stalls it past the
+    // request limit (0.5 s here), declares a body over the size cap, and answers 401 with
+    // a body that quotes the key, whole or cut by the adapter at 200 characters.
+    const chl = 'https://challonge.com/zvcup';
+    await s.after('setUrl', chl, (st) => st.url === chl);
+    const modes = [
+      ['fail', 'api.challonge.com: the request failed (ZIPPER_FAKE_FETCH)'],
+      ['hang', 'api.challonge.com took longer than 0.5 s to answer'],
+      ['big', 'api.challonge.com sent more than 16 MB'],
+      ['echo401', 'Challonge API 401: invalid api_key [Challonge key] for this tournament'],
+      ['cut401', `Challonge API 401: ${'y'.repeat(190)}[Challonge key]`],
+    ];
+    const got = {};
+    for (const [mode, want] of modes) {
+      writeFileSync(modeFile, mode);
+      const st = await s.after('pollNow', '', (x) => x.lastError === want, 6000);
+      got[mode] = st ? 'as wanted' : (client.events.slice(s.at).filter(isStatus).map(parseStatus).pop()?.lastError ?? null);
+    }
+    await s.after('stop', '', (st) => st.polling === false);
+    check('row 5.3, the key grep (decision 9): with a Challonge key from the environment the API is asked (api.challonge.com), and its failures reach lastError in fixed words naming the host only: a request that fails (its own error quoting the whole address), one past the request limit, one over the size cap',
+      ['fail', 'hang', 'big'].every((m) => got[m] === 'as wanted'), JSON.stringify(got));
+    check('row 5.3: a site\'s answer that quotes the key reaches lastError with the key redacted ("[Challonge key]"), whole, or cut in two by the adapter\'s 200 characters',
+      got.echo401 === 'as wanted' && got.cut401 === 'as wanted', JSON.stringify({ echo401: got.echo401, cut401: got.cut401 }));
+
+    // Row 5.2: the log file. Row 5.3: keys redacted in it.
+    for (let i = 0; i < 3; i++) await s.after('status');
+    await s.after('setInterval', `x ${FAKE.challonge} y`);
+    await s.after('setInterval', `x ${'p'.repeat(100)}${FAKE.challonge}`); // the line's cut to 120 falls inside the key
+    // ...and leaves only 5 of its characters, too few for a match on a cut key's start
+    // (8 or more): the value must be redacted before it is cut, never after.
+    await s.after('setInterval', `x ${'p'.repeat(113)}${FAKE.challonge}`);
+    const named = await s.after(FAKE.startgg, 'v', (st) => /unknown command/.test(st.commandNotice || ''));
+    await sleep(200);
+    const log = logOf(b);
+    const everything = s.statuses().join('\n') + log + s.sc.out;
+    // The command lines, where a piece of 4 characters of the key is looked for.
+    const commandLines = (log + s.sc.out).split(/\r?\n/).filter((l) => l.includes('[zipper] command: ')).join('\n');
+    check('row 5.2: the sidecar writes its log to a file beside config.json, named after it (config.log), as well as to the console',
+      /\[zipper\] command: setCapsText burst 25/.test(log) && /\[zipper\] command: setCapsText burst 25/.test(s.sc.out), JSON.stringify({ logBytes: log.length }));
+    check('row 5.2: the status probe (`status`, which each open control page sends every 10 s) is not logged',
+      !/command: status(\s|$)/m.test(log + s.sc.out), (/.*command: status.*/.exec(log) || [''])[0]);
+    check('row 5.3 (Sprint 4, c): a key in a command\'s value is redacted in its log line ("[Challonge key]"), also where the line\'s cut to 120 characters falls inside the key',
+      log.includes('command: setInterval x [Challonge key] y') && !anyPiece(log + s.sc.out, FAKE.challonge, 8),
+      JSON.stringify({ redacted: log.includes('command: setInterval x [Challonge key] y'), piece: anyPiece(log + s.sc.out, FAKE.challonge, 8) }));
+    check('row 5.3: a command\'s value is redacted before its cut to 120 characters: where the cut would leave 5 characters of the key, the line ends in a cut label ("[Chal"), and no piece of the key (4 characters or more) is in any command line, in the log file or on the console',
+      log.includes(`command: setInterval x ${'p'.repeat(113)}[Chal\n`) && !anyPiece(commandLines, FAKE.challonge, 4),
+      JSON.stringify({ line: (/.*setInterval x p{113}.*/.exec(log) || ['(no line)'])[0].slice(-30), piece: pieceAt(commandLines, FAKE.challonge, 4) }));
+    check('row 5.3: a key sent as a command\'s name is redacted in commandNotice ("[start.gg key]") and in the log',
+      named?.commandNotice === 'unknown command "[start.gg key]" — ignored' && !log.includes(FAKE.startgg), JSON.stringify({ commandNotice: named?.commandNotice }));
+    check('row 5.3, the key grep: no piece of the Challonge or start.gg key (8 characters or more) is in any status the sidecar sent, in its log file or on its console',
+      !anyPiece(everything, FAKE.challonge, 8) && !anyPiece(everything, FAKE.startgg, 8),
+      JSON.stringify({ challonge: pieceAt(everything, FAKE.challonge, 8), startgg: pieceAt(everything, FAKE.startgg, 8) }));
+    await s.sc.stop();
+    b.remove();
+  }
+
+  // Row 5.2: crash handlers, installed first, log and exit non-zero; the line reaches the
+  // file before the exit. The crash comes from a preload, from outside every try.
+  for (const [how, kind] of [['throw', 'an uncaught exception'], ['reject', 'an unhandled promise rejection']]) {
+    const b = await box(goodCfg());
+    const crashFile = join(TMP_DIR, `crash-6j-${how}`);
+    rmSync(crashFile, { force: true });
+    const s = await startIn(`crash sidecar (${how}) [6j]`, b, { env: { ZIPPER_TEST_CRASH_FILE: crashFile, STARTGG_API_KEY: FAKE.startgg }, preload: [PRELOAD_CRASH], expectExit: true });
+    writeFileSync(crashFile, `${how}:zipverify crash with ${FAKE.startgg} in it`);
+    await waitFor(() => s.sc.exited, 6000);
+    const log = logOf(b);
+    check(`row 5.2 (ZIP-21): ${kind} is logged to the file ("crash: ${kind}", its key redacted) and the sidecar exits non-zero`,
+      !!s.first && s.sc.code === 1 && log.includes(`crash: ${kind}`) && log.includes('zipverify crash with [start.gg key] in it') && !log.includes(FAKE.startgg),
+      JSON.stringify({ code: s.sc.code, logged: log.includes(`crash: ${kind}`), redacted: log.includes('[start.gg key]') }));
+    // A sidecar that did not crash is stopped here, so it cannot hold the guard port and the
+    // bus for the checks after this one (a no-op once it has exited).
+    await s.sc.stop();
+    rmSync(crashFile, { force: true });
+    b.remove();
+  }
+  // ...installed first, before the guard and the config: a crash in the guard port's own
+  // callback, while main() waits for it, is logged too. The sidecar never connects, so no
+  // status is waited for.
+  {
+    const b = await box(goodCfg());
+    const sc = startSidecar('crash in the guard sidecar [6j]', { ZIPPER_CONFIG: b.cfg, ZIPPER_GUARD_PORT: String(GUARD_PORT), ZIPPER_TEST_CRASH_AT: 'guard' },
+      { expectExit: true, nodeArgs: ['--require', PRELOAD_CRASH] });
+    await waitFor(() => sc.exited, 8000);
+    const log = logOf(b);
+    check('row 5.2: the crash handlers are installed first in main(), before the guard port and the config: an exception thrown in the guard port\'s callback is logged to the file ("crash: an uncaught exception") and the sidecar exits non-zero',
+      sc.code === 1 && log.includes('crash: an uncaught exception') && log.includes('zipverify crash in the guard port'),
+      JSON.stringify({ exited: sc.exited, code: sc.code, logged: log.includes('crash: an uncaught exception') }));
+    await sc.stop();
+    b.remove();
+  }
+
+  // Row 5.2: who trims the log. The instance that holds the guard port trims it at start
+  // and again while it runs, once it passes about 1 MB; a second launch only adds its one
+  // line, the guard port's, and touches neither the log's size nor the temp file.
+  {
+    const b = await box(goodCfg());
+    const filler = 'filler line for the trim check, nothing else\n'.repeat(Math.ceil((LOG_TRIM_BYTES * 1.1) / 46));
+    writeFileSync(b.log, filler);
+    const s = await startIn('log-trim sidecar [6j]', b);
+    const atStart = { log: sizeOf(b.log), old: sizeOf(b.oldLog) };
+    check('row 5.2: the sidecar holding the guard port trims its log at start when it is over 1 MB: the old lines go to config.old.log and config.log starts again',
+      !!s.first && atStart.log >= 0 && atStart.log < 100000 && atStart.old >= LOG_TRIM_BYTES, JSON.stringify(atStart));
+    appendFileSync(b.log, filler);
+    const before = { log: sizeOf(b.log), old: sizeOf(b.oldLog) };
+    writeFileSync(b.tmp, 'the running sidecar\'s temp file');
+    const second = startSidecar('second launch [6j]', { ZIPPER_CONFIG: b.cfg, ZIPPER_GUARD_PORT: String(GUARD_PORT) }, { expectExit: true });
+    await waitFor(() => second.exited, 8000);
+    const added = (bytes(b.log) || Buffer.alloc(0)).subarray(Math.max(0, before.log)).toString('utf-8').split(/\r?\n/).filter(Boolean);
+    check('row 5.2: a second launch while one runs exits (code 0) with one clear line in the log, the guard port\'s; it trims nothing and leaves the running one\'s temp file alone',
+      second.code === 0 && added.length === 1 && /already running/.test(added[0]) && sizeOf(b.oldLog) === before.old && existsSync(b.tmp),
+      JSON.stringify({ code: second.code, added, old: [before.old, sizeOf(b.oldLog)], tmp: existsSync(b.tmp) }));
+    await second.stop(); // one that did not exit is not left on the bus (a no-op once it has)
+    rmSync(b.tmp, { force: true });
+    await s.after('zvUnknownCommand', '', (st) => /zvUnknownCommand/.test(st.commandNotice || ''));
+    await sleep(200);
+    // The old log is replaced: it now holds the filler added after the start, and the
+    // second launch's line, which came after the first trim.
+    let oldText = '';
+    try { oldText = readFileSync(b.oldLog, 'utf-8'); } catch {}
+    const running = { log: sizeOf(b.log), old: sizeOf(b.oldLog), secondLaunchLineMoved: /already running/.test(oldText) };
+    check('row 5.2: the running sidecar trims its log again while it runs, once the log passes 1 MB (config.old.log is replaced)',
+      running.log >= 0 && running.log < 100000 && running.old >= LOG_TRIM_BYTES && running.secondLaunchLineMoved, JSON.stringify(running));
+    await s.sc.stop();
+    b.remove();
+  }
+
+  // R3: a sidecar whose guard port cannot be opened (any error but EADDRINUSE; here EACCES
+  // from tools/guard-error-preload.cjs, as a port Windows has reserved gives) goes on
+  // without the guard, so it may share its folder with a running sidecar whose save is
+  // writing config.json.tmp: it leaves that file alone, even with config.json loaded. Only
+  // a sidecar that holds the guard port removes it at start (the check above, with a crash's
+  // temp file).
+  {
+    const b = await box(goodCfg());
+    const tmpText = 'a running sidecar\'s temp file';
+    writeFileSync(b.tmp, tmpText);
+    const tmpTime = mtimeOf(b.tmp);
+    const s = await startIn('no guard port sidecar [6j]', b, { env: { ZIPPER_TEST_GUARD_ERROR: 'EACCES' }, preload: [PRELOAD_GUARD_ERROR] });
+    const noGuard = /guard port error: listen EACCES[^\r\n]*continuing without the single-instance guard/.test(logOf(b));
+    const tmpKept = same(bytes(b.tmp), Buffer.from(tmpText)) && mtimeOf(b.tmp) === tmpTime;
+    check('R3: a sidecar whose guard port cannot be opened (EACCES here) goes on without the single-instance guard (its log says so) and loads config.json (no warning), but leaves config.json.tmp alone (same bytes, same modified time): only one that holds the guard port removes it at start',
+      noGuard && s.first?.configWarning === '' && tmpKept, JSON.stringify({ noGuard, configWarning: s.first?.configWarning, tmpKept }));
+    await s.sc.stop();
+    b.remove();
+  }
+
+  // Row 5.3: refused keys. A start.gg key with a line break and a JWT with a NUL, each
+  // escaped in config.json, and a Challonge key with a space from the environment. The
+  // file is first saved once by the sidecar itself (placeholder keys), so a later save
+  // of the same settings must write the very same bytes.
+  {
+    const sgPlace = 'sgg-placeholder-0000000000';
+    const jwtPlace = 'jwt-placeholder-0000000000';
+    const BAD = {
+      startgg: 'sgg-zipverify-bad-DDDD\nsgg-zipverify-tail-4444',
+      jwt: 'jwt-zipverify-bad-EEEE\u0000jwt-zipverify-tail-5555',
+      envChallonge: 'chl-zipverify-env-FFFF chl-zipverify-tail-6666',
+    };
+    const pieces = ['sgg-zipverify-bad-DDDD', 'sgg-zipverify-tail-4444', 'jwt-zipverify-bad-EEEE', 'jwt-zipverify-tail-5555', 'chl-zipverify-env-FFFF', 'chl-zipverify-tail-6666'];
+    const b = await box(goodCfg({ pollIntervalMs: 1, startggApiKey: sgPlace, streamElements: { jwtToken: jwtPlace, pollSeconds: 60 } }));
+    const s1 = await startIn('bad keys sidecar, first run [6j]', b);
+    await s1.after('setAutoSchedule', 'on');
+    const canon = await savedConfig(b.cfg, (c) => c.pollIntervalMs === 15000 && c.startggApiKey === sgPlace, 4000);
+    await sleep(300);
+    await s1.sc.stop();
+    const canonText = readFileSync(b.cfg, 'utf-8');
+    const badText = canonText.replace(JSON.stringify(sgPlace), JSON.stringify(BAD.startgg)).replace(JSON.stringify(jwtPlace), JSON.stringify(BAD.jwt));
+    writeFileSync(b.cfg, badText);
+    const s = await startIn('bad keys sidecar [6j]', b, { env: { CHALLONGE_API_KEY: BAD.envChallonge } });
+    const wants = [
+      CONFIG_MSG.badKey('startggApiKey in config.json'),
+      CONFIG_MSG.badKey('streamElements.jwtToken in config.json'),
+      CONFIG_MSG.badKey('CHALLONGE_API_KEY (environment variable)'),
+    ];
+    const hasAll = (w) => typeof w === 'string' && wants.every((x) => w.includes(x));
+    check('row 5.3: a start.gg key with a line break and a JWT with a NUL (both escaped in config.json), and a Challonge key with a space from the environment, are refused: configWarning names each by its field and quotes none',
+      canon?.pollIntervalMs === 15000 && canon?.startggApiKey === sgPlace && badText !== canonText && hasAll(s.first?.configWarning),
+      JSON.stringify({ canon: !!canon, configWarning: s.first?.configWarning }));
+    // The save really ran: config.json is a new file (its modified time moved) holding the
+    // very same bytes, not the old file left alone.
+    const m0 = mtimeOf(b.cfg);
+    const saved1 = await s.after('setAutoSchedule', 'on');
+    const rewritten = !!(await waitFor(() => { const m = mtimeOf(b.cfg); return m !== null && m !== m0; }, 4000, 20));
+    await sleep(100);
+    check('row 5.3: a refused key changes nothing on disk: the command\'s save rewrites config.json (its modified time moves) with the very same bytes',
+      !!saved1 && rewritten && readFileSync(b.cfg, 'utf-8') === badText, JSON.stringify({ rewritten, identical: readFileSync(b.cfg, 'utf-8') === badText }));
+    await s.after('setUrl', SAFE_STUB, (st) => st.url === SAFE_STUB);
+    const polled = await s.after('start', '', (st) => !!st.lastPollAt && st.lastError === '', 6000);
+    await s.after('stop', '', (st) => st.polling === false);
+    // Each printable run of a refused key is redacted too (here sent as a command's value).
+    await s.after('setInterval', 'x sgg-zipverify-bad-DDDD y chl-zipverify-env-FFFF z');
+    // Read from a file the sidecar rewrote since: setUrl saves the URL.
+    const kept = await savedConfig(b.cfg, (c) => c.tournamentUrl === SAFE_STUB && c.autoStart === false, 4000);
+    await sleep(100);
+    const fileNow = readFileSync(b.cfg, 'utf-8');
+    const log = logOf(b);
+    const seen = s.statuses().join('\n') + log + s.sc.out;
+    const leaked = pieces.filter((p) => seen.includes(p));
+    check('row 5.3: the warning is still in the status after a good stub poll; after the saves that followed (setUrl\'s among them) the refused keys stay in config.json as they were (a save never deletes them), the environment\'s is never written there, and no piece of any of them is in a status, the log file or the console',
+      hasAll(polled?.configWarning) && kept?.tournamentUrl === SAFE_STUB && kept?.startggApiKey === BAD.startgg && kept?.streamElements?.jwtToken === BAD.jwt
+        && !fileNow.includes('chl-zipverify') && leaked.length === 0,
+      JSON.stringify({ polled: !!polled, warning: hasAll(polled?.configWarning), savedUrl: kept?.tournamentUrl === SAFE_STUB, keptStartgg: kept?.startggApiKey === BAD.startgg, keptJwt: kept?.streamElements?.jwtToken === BAD.jwt, envInFile: fileNow.includes('chl-zipverify'), leaked }));
+    check('row 5.3: each printable run of a refused key is redacted ("[start.gg key]", "[Challonge key]"), here in a command\'s log line',
+      log.includes('command: setInterval x [start.gg key] y [Challonge key] z'), (/.*command: setInterval x.*/.exec(log) || ['(no line)'])[0]);
+    await s.sc.stop();
+    b.remove();
+  }
+
+  // Row 5.4 (decision 11, a): a hand edit made while the sidecar runs is not written over.
+  {
+    const b = await box(goodCfg({ pollIntervalMs: 1 }));
+    const s = await startIn('hand-edit sidecar [6j]', b);
+    await s.after('setAutoSchedule', 'on');
+    const own = await savedConfig(b.cfg, (c) => c.pollIntervalMs === 15000, 4000);
+    await sleep(300);
+    let edited = null;
+    try { edited = JSON.parse(readFileSync(b.cfg, 'utf-8')); } catch {}
+    edited = { ...(edited || {}), milestones: { ...(edited?.milestones || {}), followers: 100 } };
+    const handText = JSON.stringify(edited, null, 2) + '\n';
+    writeFileSync(b.cfg, handText);
+    // The command's own status goes before its save has looked at the file; the save that
+    // finds the hand edit sends another, with the warning.
+    const st = await s.after('setCapsText', '@AfterHandEdit', (x) => x.caps?.text === '@AfterHandEdit' && x.configWarning === CONFIG_MSG.handEdit);
+    await sleep(500);
+    const st2 = await s.after('setCapsText', '@AgainAfterHandEdit', (x) => x.caps?.text === '@AgainAfterHandEdit');
+    await sleep(500);
+    check('row 5.4: a milestone added to config.json by hand while the sidecar runs survives the next commands (the file keeps the hand edit, byte for byte), and the status carries the configWarning',
+      !!own && st?.configWarning === CONFIG_MSG.handEdit && st2?.configWarning === CONFIG_MSG.handEdit && readFileSync(b.cfg, 'utf-8') === handText,
+      JSON.stringify({ ownSave: !!own, configWarning: st?.configWarning, kept: readFileSync(b.cfg, 'utf-8') === handText }));
+    await s.sc.stop();
+    b.remove();
+  }
+
+  // Row 5.4: a config.json deleted while the sidecar runs counts as a hand edit too: it is
+  // not made again from what the sidecar holds. Row 5.3: a key refused in config.json is
+  // not replaced by the environment's (the fake fetch tells which Challonge host is asked:
+  // the keyless page, challonge.com, or the API with a key, api.challonge.com).
+  {
+    const b = await box(goodCfg({ pollIntervalMs: 1, challongeApiKey: 'chl bad key with spaces' }));
+    const modeFile = join(TMP_DIR, 'fetch-mode-6j-d');
+    writeFileSync(modeFile, 'fail');
+    const s = await startIn('deleted config and refused key sidecar [6j]', b, {
+      env: { CHALLONGE_API_KEY: FAKE.challonge, ZIPPER_TEST_FAKE_FETCH_FILE: modeFile }, preload: [PRELOAD_FAKE_FETCH],
+    });
+    const chl = 'https://challonge.com/zvcup';
+    await s.after('setUrl', chl, (st) => st.url === chl);
+    const failed = await s.after('pollNow', '', (st) => !!st.lastError, 6000);
+    check('row 5.3: a key refused in config.json is not replaced by the environment\'s: configWarning names the field, and a Challonge URL polls the keyless page (challonge.com), not the API (api.challonge.com) with CHALLONGE_API_KEY',
+      s.first?.configWarning === CONFIG_MSG.badKey('challongeApiKey in config.json') && failed?.lastError === 'challonge.com: the request failed (ZIPPER_FAKE_FETCH)',
+      JSON.stringify({ configWarning: s.first?.configWarning, lastError: failed?.lastError }));
+    const own = await savedConfig(b.cfg, (c) => c.tournamentUrl === chl, 4000);
+    await sleep(300);
+    rmSync(b.cfg, { force: true });
+    const st = await s.after('setCapsText', '@AfterDelete', (x) => x.caps?.text === '@AfterDelete' && x.configWarning?.includes(CONFIG_MSG.handEdit));
+    await sleep(500);
+    check('row 5.4: a config.json deleted while the sidecar runs is not made again by the next save: the save stops and configWarning says the file was edited',
+      own?.tournamentUrl === chl && !!st && !existsSync(b.cfg) && !existsSync(b.tmp),
+      JSON.stringify({ ownSave: !!own, configWarning: st?.configWarning ?? null, remade: existsSync(b.cfg) }));
+    await s.sc.stop();
+    b.remove();
+  }
+
+  // Row 5.3 with the keys in config.json (the README's normal setup), not the environment:
+  // the Challonge key reaches the real adapter and the fake fetch, which echoes it back in a
+  // 401, as given and as the request's address encodes it; the StreamElements token, sent
+  // inside a command's value; and a tournament URL with the key pasted into it, which the
+  // status and the pushed payload carry to every client of the bus. The Challonge key
+  // holds characters a URL encodes (+ / =), so its encoded form differs from it.
+  {
+    // Neither shares a piece of 8 characters with the folder names (zipper-verify-XXXXXX).
+    const cfgKey = 'chl+Cfg/R4Tp7Vw2Qy83=fake';
+    const cfgJwt = `x.${Buffer.from(JSON.stringify({ channel: 'zvcfgchan' })).toString('base64url')}.zv-cfg-token-GGGG7777`;
+    const b = await box(goodCfg({ challongeApiKey: cfgKey, streamElements: { jwtToken: cfgJwt, pollSeconds: 3600 }, milestones: { followers: 100, subs: 0, tips: 0, cheers: 0 } }));
+    const modeFile = join(TMP_DIR, 'fetch-mode-6j-e');
+    writeFileSync(modeFile, 'fail');
+    const s = await startIn('keys in config.json sidecar [6j]', b, { env: { ZIPPER_TEST_FAKE_FETCH_FILE: modeFile }, preload: [PRELOAD_FAKE_FETCH] });
+    const chl = 'https://challonge.com/zvcup';
+    await s.after('setUrl', chl, (st) => st.url === chl);
+    const got = {};
+    for (const [mode, want] of [
+      ['echo401', 'Challonge API 401: invalid api_key [Challonge key] for this tournament'],
+      ['echo401raw', 'Challonge API 401: invalid request ?include_participants=1&include_matches=1&api_key=[Challonge key]'],
+    ]) {
+      writeFileSync(modeFile, mode);
+      const st = await s.after('pollNow', '', (x) => x.lastError === want, 6000);
+      got[mode] = st ? 'as wanted' : (client.events.slice(s.at).filter(isStatus).map(parseStatus).pop()?.lastError ?? null);
+    }
+    await s.after('stop', '', (st) => st.polling === false);
+    check('row 5.3: a Challonge key from config.json is redacted from lastError ("[Challonge key]"), as a site quotes it back and as the request\'s address encodes it',
+      got.echo401 === 'as wanted' && got.echo401raw === 'as wanted', JSON.stringify(got));
+    await s.after('setInterval', `x ${cfgJwt} y`);
+    const atUrl = client.events.length;
+    const keyedUrl = `https://challonge.com/zvcup2?api_key=${cfgKey}`;
+    const shownKeyedUrl = 'https://challonge.com/zvcup2?api_key=[Challonge key]';
+    const urlSet = await s.after('setUrl', keyedUrl, (st) => st.url === shownKeyedUrl);
+    const blank = await s.since(atUrl, (d) => isUpdate(d) && /zvcup2/.test(d.tournament?.url || ''), 4000);
+    // ...and in the payload a good poll of it pushes (the fake fetch answers with a
+    // recorded Challonge API response).
+    writeFileSync(modeFile, `json:${FIX('challonge-api-tournament.json')}`);
+    const atPoll = client.events.length;
+    s.cmd('pollNow');
+    const polledUpd = await s.since(atPoll, (d) => isUpdate(d) && d.tournament?.name === 'BLKO Weekly #42', 6000);
+    await sleep(200);
+    const log = logOf(b);
+    check('row 5.3: a StreamElements token from config.json is redacted in the log ("[StreamElements token]"), here in a command\'s value',
+      log.includes('command: setInterval x [StreamElements token] y'), (/.*command: setInterval x.*/.exec(log) || ['(no line)'])[0]);
+    check('row 5.3: a key pasted into the tournament URL is redacted where the bus carries it: in the status\'s url, in setUrl\'s blank payload and in a polled payload (tournament.url: "[Challonge key]")',
+      urlSet?.url === shownKeyedUrl && blank?.tournament?.url === shownKeyedUrl && polledUpd?.tournament?.url === shownKeyedUrl,
+      JSON.stringify({ statusUrl: urlSet?.url ?? null, blankUrl: blank?.tournament?.url ?? null, polledUrl: polledUpd?.tournament?.url ?? null }));
+    const updates = client.events.slice(s.at).filter(isUpdate).map((d) => JSON.stringify(d)).join('\n');
+    const everything = s.statuses().join('\n') + updates + log + s.sc.out;
+    const encoded = encodeURIComponent(cfgKey);
+    check('row 5.3, the key grep: no piece of the Challonge key from config.json (as given or encoded) or of its StreamElements token (8 characters or more) is in any status or pushed payload, its log file or its console',
+      !anyPiece(everything, cfgKey, 8) && !anyPiece(everything, encoded, 8) && !anyPiece(everything, cfgJwt, 8),
+      JSON.stringify({ key: pieceAt(everything, cfgKey, 8), encoded: pieceAt(everything, encoded, 8), jwt: pieceAt(everything, cfgJwt, 8) }));
+    await s.sc.stop();
+    b.remove();
+  }
+
+  // R6 (the owner's ruling of 2026-11-26): a known key typed into the caps text, the caps
+  // logo or the message text is replaced by its label in the status and in every
+  // ticker:update the sidecar pushes, however the payload is made: a command's push,
+  // setUrl's blank, a poll, and the message pushed on connect after a restart. config.json
+  // keeps what was typed. The change check works on what was typed, so a poll that brings
+  // nothing new is not pushed again (no push loop) and one that brings a change is pushed (no
+  // push missed). The Challonge key is in config.json and holds characters a URL encodes
+  // (+ / =), so the logo can carry it encoded; the start.gg key comes from the environment of
+  // this test's own sidecar. Both are fake, and nothing here makes a request (no tournament
+  // URL but a stub; the fake fetch is loaded all the same).
+  {
+    const KEY_C = 'Zq7+Cap/31Wv58=Xk';
+    const KEY_E = 'Zq7Env64Wv17Xk';
+    const LC = '[Challonge key]';
+    const LE = '[start.gg key]';
+    const modeFile = join(TMP_DIR, 'fetch-mode-6j-r6');
+    writeFileSync(modeFile, 'fail');
+    const env = { STARTGG_API_KEY: KEY_E, ZIPPER_TEST_FAKE_FETCH_FILE: modeFile };
+    const b = await box(goodCfg({ challongeApiKey: KEY_C, message: { enabled: true, text: '' } }));
+    const s = await startIn('keys typed into the caps and message sidecar [6j]', b, { env, preload: [PRELOAD_FAKE_FETCH] });
+    const updAfter = (at, pred, timeoutMs = 4000) => s.since(at, (d) => isUpdate(d) && pred(d), timeoutMs);
+    const sameList = (a, b2) => JSON.stringify(a) === JSON.stringify(b2);
+    // Each command, with the status and the pushed update that follow it.
+    const sendBoth = async (command, value, statusPred, updPred) => {
+      const at = client.events.length;
+      const st = await s.after(command, value, statusPred);
+      const upd = await updAfter(at, updPred);
+      return { st, upd };
+    };
+
+    // Text with no key in it is sent as typed.
+    const plainCaps = '@NoKeyHere 100%';
+    const plainLogo = '/zipper-overlay/assets/plain-logo.png';
+    const plainMsg = 'Bracket at 8pm\nNo key here';
+    const p1 = await sendBoth('setCapsText', plainCaps, (st) => st.caps?.text === plainCaps, (d) => d.caps?.text === plainCaps);
+    const p2 = await sendBoth('setCapsLogo', plainLogo, (st) => st.caps?.logo === plainLogo, (d) => d.caps?.logo === plainLogo);
+    const p3 = await sendBoth('setMessageText', plainMsg, (st) => st.message?.text === plainMsg, (d) => sameList(d.message?.lines, ['Bracket at 8pm', 'No key here']));
+    check('R6: a caps text, a logo and a message text with no key in them are sent as typed, in the status and in the pushed ticker:update',
+      !!(p1.st && p1.upd && p2.st && p2.upd && p3.st && p3.upd), JSON.stringify({ capsText: [!!p1.st, !!p1.upd], logo: [!!p2.st, !!p2.upd], message: [!!p3.st, !!p3.upd] }));
+
+    // The same three with the keys in them.
+    const keyedCaps = `@Caps ${KEY_C} / ${KEY_E}`;
+    const shownCaps = `@Caps ${LC} / ${LE}`;
+    const keyedLogo = `https://127.0.0.1/logo.png?k=${encodeURIComponent(KEY_C)}&e=${KEY_E}`;
+    const shownLogo = `https://127.0.0.1/logo.png?k=${LC}&e=${LE}`;
+    const keyedMsg = `Line one ${KEY_E}\n${KEY_C} line two\nNo key here`;
+    const shownMsg = `Line one ${LE}\n${LC} line two\nNo key here`;
+    const shownLines = [`Line one ${LE}`, `${LC} line two`, 'No key here'];
+    const k1 = await sendBoth('setCapsText', keyedCaps, (st) => st.caps?.text === shownCaps, (d) => d.caps?.text === shownCaps);
+    check('R6: setCapsText with the Challonge key (from config.json) and the start.gg key (from the environment) in it: the status\'s caps.text and the pushed caps.text carry the labels ("@Caps [Challonge key] / [start.gg key]")',
+      !!k1.st && !!k1.upd, JSON.stringify({ status: !!k1.st, update: !!k1.upd }));
+    const k2 = await sendBoth('setCapsLogo', keyedLogo, (st) => st.caps?.logo === shownLogo, (d) => d.caps?.logo === shownLogo);
+    check('R6: setCapsLogo with a logo URL that carries the Challonge key as a URL encodes it and the start.gg key as typed: the status\'s caps.logo and the pushed caps.logo carry the labels; the caps text keeps its labels',
+      !!k2.st && !!k2.upd && k2.st.caps?.text === shownCaps && k2.upd.caps?.text === shownCaps, JSON.stringify({ status: !!k2.st, update: !!k2.upd }));
+    const k3 = await sendBoth('setMessageText', keyedMsg, (st) => st.message?.text === shownMsg, (d) => sameList(d.message?.lines, shownLines));
+    check('R6: setMessageText with both keys in it: the status\'s message.text and the pushed message.lines carry the labels; the line with no key is unchanged',
+      !!k3.st && !!k3.upd, JSON.stringify({ status: !!k3.st, update: !!k3.upd, lines: k3.upd ? null : client.events.slice(s.at).filter(isUpdate).pop()?.message?.lines?.length ?? null }));
+    const typed = await savedConfig(b.cfg, (c) => c.caps?.text === keyedCaps && c.caps?.logo === keyedLogo && c.message?.text === keyedMsg, 4000);
+    check('R6: config.json keeps what was typed, keys and all (the caps text, the logo and the message text); the Challonge key stays in challongeApiKey, and the start.gg key from the environment is not saved',
+      typed?.caps?.text === keyedCaps && typed?.caps?.logo === keyedLogo && typed?.message?.text === keyedMsg && typed?.challongeApiKey === KEY_C && typed?.startggApiKey === null,
+      JSON.stringify({ capsText: typed?.caps?.text === keyedCaps, logo: typed?.caps?.logo === keyedLogo, message: typed?.message?.text === keyedMsg, challongeApiKey: typed?.challongeApiKey === KEY_C, startggApiKey: typed?.startggApiKey ?? null }));
+
+    // setUrl's blank and a poll's payload carry the labels too; the change check.
+    const fixFile = join(TMP_DIR, 'r6-keys.json');
+    const fixUrl = `stub:${TMP_REL}/r6-keys.json`;
+    const fixture = (score) => JSON.stringify({ tournamentName: 'Key Cup', state: 'in_progress', standings: [],
+      matches: [{ id: 'k1', round: 'Round 1', state: 'in_progress', p1: { name: 'Flash', score }, p2: { name: 'Rival', score: 0 }, winner: 0, order: 1 }] });
+    const shownAll = (d) => !!d && d.caps?.text === shownCaps && d.caps?.logo === shownLogo && sameList(d.message?.lines, shownLines);
+    writeFileSync(fixFile, fixture(0));
+    let at = client.events.length;
+    await s.after('setUrl', fixUrl, (st) => st.url === fixUrl);
+    const blankUpd = await updAfter(at, (d) => d.tournament?.url === fixUrl && d.matches.length === 0);
+    at = client.events.length;
+    const firstPoll = await s.after('start', '', (st) => !!st.lastPollAt && st.lastError === '', 6000);
+    const polledUpd = await updAfter(at, (d) => d.tournament?.name === 'Key Cup');
+    check('R6: setUrl\'s blank payload and a polled payload carry the labels in the caps and the message lines too',
+      shownAll(blankUpd) && !!firstPoll && shownAll(polledUpd), JSON.stringify({ blank: shownAll(blankUpd), polled: shownAll(polledUpd) }));
+    at = client.events.length;
+    const samePoll = await s.after('pollNow', '', (st) => !!st.lastPollAt && st.lastPollAt !== firstPoll?.lastPollAt, 6000);
+    await sleep(300);
+    const pushedAgain = client.events.slice(at).filter(isUpdate).length;
+    check('R6: no push loop: with keys in the caps and the message, a poll that brings nothing new is not pushed again (the change check works on what was typed, as kept)',
+      !!samePoll && pushedAgain === 0, JSON.stringify({ polled: !!samePoll, pushes: pushedAgain }));
+    writeFileSync(fixFile, fixture(1));
+    at = client.events.length;
+    const changedPoll = await s.after('pollNow', '', (st) => !!st.lastPollAt && st.lastPollAt !== samePoll?.lastPollAt, 6000);
+    const changedUpd = await updAfter(at, (d) => d.matches?.[0]?.p1?.score === 1);
+    check('R6: no push missed: a poll that brings a change is pushed, with the labels in the caps and the message lines',
+      !!changedPoll && shownAll(changedUpd), JSON.stringify({ polled: !!changedPoll, pushed: !!changedUpd, labels: shownAll(changedUpd) }));
+    await s.after('stop', '', (st) => st.polling === false);
+    await savedConfig(b.cfg, (c) => c.autoStart === false && c.tournamentUrl === fixUrl, 4000);
+    await s.sc.stop();
+
+    // A restart on the same config.json: with polling off and the message on, the message
+    // is pushed on connect, from the typed text config.json kept, with the labels.
+    const r = await startIn('keys typed into the caps and message sidecar, restarted [6j]', b, { env, preload: [PRELOAD_FAKE_FETCH] });
+    const onConnect = await r.since(r.at, (d) => isUpdate(d) && !!d.message, 6000);
+    check('R6: after a restart, the status and the payload pushed on connect carry the labels, from the typed text config.json kept',
+      shownAll(onConnect) && r.first?.caps?.text === shownCaps && r.first?.caps?.logo === shownLogo && r.first?.message?.text === shownMsg,
+      JSON.stringify({ pushed: !!onConnect, labels: shownAll(onConnect), status: r.first?.caps?.text === shownCaps && r.first?.message?.text === shownMsg }));
+    await sleep(200);
+
+    // The key grep, over both runs: every status and pushed payload, the log file and the
+    // console.
+    const encoded = encodeURIComponent(KEY_C);
+    const statusesAll = client.events.slice(s.at).filter(isStatus).map((d) => String(d.value)).join('\n');
+    const updatesAll = client.events.slice(s.at).filter(isUpdate).map((d) => JSON.stringify(d)).join('\n');
+    const everything = statusesAll + updatesAll + logOf(b) + s.sc.out + r.sc.out;
+    check('R6, the key grep: no piece of either key (5 characters or more), as typed or as a URL encodes it, is in any status or pushed ticker:update of either run, the log file or the console',
+      !anyPiece(everything, KEY_C, 5) && !anyPiece(everything, encoded, 5) && !anyPiece(everything, KEY_E, 5),
+      JSON.stringify({ challonge: pieceAt(everything, KEY_C, 5), encoded: pieceAt(everything, encoded, 5), startgg: pieceAt(everything, KEY_E, 5) }));
+    await r.sc.stop();
+    b.remove();
+  }
+
+  // R6, a key with a double quote or a backslash in it (checkKey takes any printable ASCII):
+  // setCaps and setMessage carry their value as JSON, as the control page sends them
+  // (JSON.stringify({ text, ... })), so the key arrives in the value escaped, as \" and \\.
+  // The log line of each command is redacted in that form too; the status and the push carry
+  // the label, from the parsed text. One key is in config.json, the other comes from the
+  // environment of this test's own sidecar. Both are fake, and nothing here makes a request.
+  {
+    const KEY_Q = 'Zq7"Quo\\52Wv\\Xk';
+    const KEY_S = 'Zq7Sl\\h83"Wv19Xk';
+    const LC = '[Challonge key]';
+    const LE = '[start.gg key]';
+    const modeFile = join(TMP_DIR, 'fetch-mode-6j-r6-json');
+    writeFileSync(modeFile, 'fail');
+    const b = await box(goodCfg({ challongeApiKey: KEY_Q }));
+    const s = await startIn('keys with a quote and a backslash sidecar [6j]', b, {
+      env: { STARTGG_API_KEY: KEY_S, ZIPPER_TEST_FAKE_FETCH_FILE: modeFile }, preload: [PRELOAD_FAKE_FETCH],
+    });
+    const typedCaps = `@Q ${KEY_Q} / ${KEY_S}`;
+    const typedMsg = `M ${KEY_Q}\nN ${KEY_S}`;
+    const shownCapsText = `@Q ${LC} / ${LE}`;
+    const shownMsgText = `M ${LC}\nN ${LE}`;
+    const shownLines = JSON.stringify([`M ${LC}`, `N ${LE}`]);
+    let at = client.events.length;
+    const capsSt = await s.after('setCaps', JSON.stringify({ text: typedCaps, logo: '' }), (st) => st.caps?.text === shownCapsText);
+    const capsUpd = await s.since(at, (d) => isUpdate(d) && d.caps?.text === shownCapsText, 4000);
+    at = client.events.length;
+    const msgSt = await s.after('setMessage', JSON.stringify({ text: typedMsg, enabled: true }), (st) => st.message?.text === shownMsgText && st.message?.enabled === true);
+    const msgUpd = await s.since(at, (d) => isUpdate(d) && JSON.stringify(d.message?.lines) === shownLines, 4000);
+    const typed = await savedConfig(b.cfg, (c) => c.caps?.text === typedCaps && c.message?.text === typedMsg, 4000);
+    // savedConfig returns the last file it read when the wait runs out, so compare.
+    const typedKept = typed?.caps?.text === typedCaps && typed?.message?.text === typedMsg;
+    check('R6: a key with a double quote or a backslash in it (the Challonge key from config.json, the start.gg key from the environment), sent in setCaps and setMessage as JSON escapes it (as the control page sends them): the status and the pushed ticker:update carry the labels, and config.json keeps what was typed',
+      !!capsSt && !!capsUpd && !!msgSt && !!msgUpd && typedKept,
+      JSON.stringify({ capsStatus: !!capsSt, capsUpdate: !!capsUpd, messageStatus: !!msgSt, messageUpdate: !!msgUpd, typedKept }));
+    await sleep(200);
+    const log = logOf(b);
+    const capsLine = `command: setCaps {"text":"@Q ${LC} / ${LE}","logo":""}`;
+    const msgLine = `command: setMessage {"text":"M ${LC}\\nN ${LE}","enabled":true}`;
+    const updates = client.events.slice(s.at).filter(isUpdate).map((d) => JSON.stringify(d)).join('\n');
+    const everything = s.statuses().join('\n') + updates + log + s.sc.out;
+    const forms = [KEY_Q, KEY_S, JSON.stringify(KEY_Q).slice(1, -1), JSON.stringify(KEY_S).slice(1, -1)];
+    const leaks = forms.map((k) => pieceAt(everything, k, 5)).filter((x) => x !== null);
+    check('R6 (the log): the log line of each of those commands carries the labels where the escaped keys were (command: setCaps {"text":"@Q [Challonge key] / [start.gg key]","logo":""}), in the log file and on the console; no piece of either key (5 characters or more), as typed or as JSON escapes it, is in a status, a pushed ticker:update, the log file or the console',
+      log.includes(capsLine) && log.includes(msgLine) && s.sc.out.includes(capsLine) && s.sc.out.includes(msgLine) && leaks.length === 0,
+      JSON.stringify({ capsLine: log.includes(capsLine), msgLine: log.includes(msgLine), onConsole: s.sc.out.includes(capsLine) && s.sc.out.includes(msgLine), leaks }));
+    await s.sc.stop();
+    b.remove();
+  }
+
+  // PROTOCOL on what R6 does not cover: the command that sets the caps, the message or the
+  // URL is broadcast to every client of the bus as it was sent (the sidecar changes only its
+  // status and its pushes), and the logo is cut at 500 characters, like the caps text and
+  // the message, so a key the cut falls inside can keep its first 1 to 7 characters.
+  {
+    const protocol = readFileSync(resolve(__dirname, 'docs', 'PROTOCOL.md'), 'utf-8').replace(/\s+/g, ' ');
+    const broadcast = protocol.includes('Streamer.bot broadcasts each `ticker:command` to every client of the bus as it was sent, so a key typed into the caps, the message or the URL still crosses the bus once');
+    check('docs (R6): PROTOCOL says the command that sets the caps, the message or the URL is broadcast to every client of the bus as it was sent, so a key typed there still crosses the bus once',
+      broadcast, JSON.stringify({ broadcast }));
+    const logoCut = protocol.includes('A caps text cut at 120 characters, a logo cut at 500, or a message cut at 1000, can keep the first 1 to 7 characters of a key');
+    check('docs (R6): PROTOCOL names the logo, cut at 500 characters, beside the caps text and the message, as a text whose cut can keep the first 1 to 7 characters of a key',
+      logoCut, JSON.stringify({ logoCut }));
+  }
+
+  // Row 5.1: a save that fails (here config.json.tmp is a folder, so the temp file cannot be
+  // written) says so in configWarning, after any load warning (a saved logo dropped); the
+  // next good save clears it, and only it.
+  {
+    const b = await box(goodCfg({ caps: { text: '', logo: 'javascript:alert(1)' } }));
+    const s = await startIn('failed write sidecar [6j]', b);
+    mkdirSync(b.tmp);
+    const failedSave = await s.after('setCapsText', '@WriteFails', (x) => x.caps?.text === '@WriteFails' && /config\.json could not be saved/.test(x.configWarning || ''));
+    rmSync(b.tmp, { recursive: true, force: true });
+    const savedAgain = await s.after('setCapsText', '@WriteWorks', (x) => x.caps?.text === '@WriteWorks' && !/could not be saved/.test(x.configWarning || ''));
+    const onDisk = await savedConfig(b.cfg, (c) => c.caps?.text === '@WriteWorks', 4000);
+    const head = `${CONFIG_MSG.logo} · config.json could not be saved (`;
+    const tail = '); the sidecar tries again on the next change';
+    const w = failedSave?.configWarning ?? '';
+    const failedOk = w.startsWith(head) && w.endsWith(tail) && /^E[A-Z]+$/.test(w.slice(head.length, w.length - tail.length));
+    check('row 5.1: a save that fails puts "config.json could not be saved (CODE); ..." in configWarning, pushed with a status, after the load warning already there',
+      s.first?.configWarning === CONFIG_MSG.logo && failedOk, JSON.stringify({ first: s.first?.configWarning, failed: failedSave?.configWarning ?? null }));
+    check('row 5.1: the next good save clears that warning, and only it (the saved logo\'s stays until a restart); config.json holds the new setting',
+      savedAgain?.configWarning === CONFIG_MSG.logo && onDisk?.caps?.text === '@WriteWorks', JSON.stringify({ after: savedAgain?.configWarning ?? null, saved: onDisk?.caps?.text }));
+    await s.sc.stop();
+    b.remove();
+  }
+
+  // Row 5.3: a key with a lone UTF-16 surrogate (a \ud800 escape in config.json, which
+  // JSON.parse accepts) is refused like any other bad key; the sidecar does not crash.
+  {
+    const raw = '{\n  "tournamentUrl": null,\n  "pollIntervalMs": 15000,\n  "startggApiKey": "sgg-zipverify-\\ud800-surrogate",\n  "streamElements": { "jwtToken": "jwt-zipverify-\\udc00-surrogate", "pollSeconds": 60 }\n}\n';
+    const b = await box(raw);
+    const s = await startIn('lone surrogate key sidecar [6j]', b);
+    const after = await s.after('setAutoSchedule', 'on');
+    const wants = [CONFIG_MSG.badKey('startggApiKey in config.json'), CONFIG_MSG.badKey('streamElements.jwtToken in config.json')];
+    check('row 5.3: a key holding a lone UTF-16 surrogate (escaped in config.json) is refused with the fixed message in configWarning, and the sidecar keeps running and answering',
+      wants.every((w) => (s.first?.configWarning ?? '').includes(w)) && !!after && !s.sc.exited,
+      JSON.stringify({ first: !!s.first, configWarning: s.first?.configWarning ?? null, exited: s.sc.exited }));
+    await s.sc.stop();
+    b.remove();
+  }
+
+  // Rows 5.1 and 5.4 when another program holds config.json (Windows only: PowerShell holds
+  // it with FileShare ReadWrite and no Delete, so the rename over it fails with EPERM).
+  if (process.platform !== 'win32') console.log('  (skipped: the checks with config.json held by another program run only on Windows)');
+  else await testConfigHeld({ box, startIn, logOf, client, goodCfg });
+
+  // Sprint 4 (a): ZIPPER_SE_BASE is a test hook, honoured only with ZIPPER_ALLOW_STUB=1.
+  // Both sidecars run with the fake fetch, so the one without the variable, which asks the
+  // real StreamElements address, reaches no outside host: its error names the host asked.
+  {
+    // No piece of 8 characters in common with the folder names (zipper-verify-XXXXXX).
+    const jwt = `x.${Buffer.from(JSON.stringify({ channel: 'zvsechan' })).toString('base64url')}.zv-se-token-CCCC3333`;
+    const local = `127.0.0.1:${SE_PORT}`;
+    const got = {};
+    for (const [allowStub, label] of [[false, 'without'], [true, 'with']]) {
+      const b = await box(goodCfg({ streamElements: { jwtToken: jwt, pollSeconds: 3600 }, milestones: { followers: 100, subs: 0, tips: 0, cheers: 0 } }));
+      const s = await startIn(`StreamElements base sidecar, ${label} ZIPPER_ALLOW_STUB [6j]`, b, {
+        allowStub, guard: allowStub ? GUARD_PORT : NOSTUB_GUARD_PORT, env: { ZIPPER_SE_BASE: `http://${local}` }, preload: [PRELOAD_FAKE_FETCH],
+      });
+      const se = await waitFor(async () => { const x = await s.after('status'); return x?.se?.lastError ? x.se : null; }, 6000, 200);
+      await sleep(100);
+      // The key grep for the token this sidecar used (its request carried it, and the fake
+      // fetch's own failure quotes every header): the StreamElements error, every status,
+      // the log file and the console.
+      const where = { seError: se?.lastError ?? '', statuses: s.statuses().join('\n'), log: logOf(b), console: s.sc.out };
+      const holding = Object.keys(where).filter((k) => where[k].includes(jwt) || where[k].includes('zv-se-token') || anyPiece(where[k], jwt, 8));
+      got[label] = { lastError: se?.lastError ?? null, jwtIn: holding };
+      await s.sc.stop();
+      b.remove();
+    }
+    check('Sprint 4 (a): without ZIPPER_ALLOW_STUB, ZIPPER_SE_BASE is ignored: the StreamElements request goes to api.streamelements.com (here to the fake fetch, so nothing leaves the machine); with it, to the base named',
+      got.without?.lastError === 'api.streamelements.com: the request failed (ZIPPER_FAKE_FETCH)' && got.with?.lastError === `${local}: the request failed (ZIPPER_FAKE_FETCH)`,
+      JSON.stringify(got));
+    check('row 5.3, the key grep: the StreamElements token a sidecar used is in neither its StreamElements error, a status, its log file nor its console (no piece of 8 characters or more)',
+      got.without?.jwtIn?.length === 0 && got.with?.jwtIn?.length === 0, JSON.stringify({ without: got.without?.jwtIn, with: got.with?.jwtIn }));
+  }
+
+  // R1 (the owner's ruling of 2026-11-26): without ZIPPER_ALLOW_STUB the poll's deadline and
+  // the request limit are the full 45 s and 10 s, whatever ZIPPER_POLL_DEADLINE_MS and
+  // ZIPPER_REQUEST_TIMEOUT_MS ask for (0.3 s each here). The first poll's request never
+  // answers (the fake fetch's "hang"): 1.5 s on it has neither failed nor ended, where
+  // either setting, honoured, would have failed it at 0.3 s. A setUrl then stops it, which
+  // the log shows, so the poll was indeed in flight. No 10 s or 45 s wait.
+  {
+    const b = await box(goodCfg({ tournamentUrl: 'https://challonge.com/zvhang', autoStart: true }));
+    const modeFile = join(TMP_DIR, 'fetch-mode-6j-limits');
+    writeFileSync(modeFile, 'hang');
+    const s = await startIn('test limits without ZIPPER_ALLOW_STUB [6j]', b, {
+      allowStub: false, guard: NOSTUB_GUARD_PORT, preload: [PRELOAD_FAKE_FETCH],
+      env: { ZIPPER_REQUEST_TIMEOUT_MS: '300', ZIPPER_POLL_DEADLINE_MS: '300', ZIPPER_TEST_FAKE_FETCH_FILE: modeFile },
+    });
+    await sleep(1500);
+    const mid = await s.after('status');
+    const outAt = s.sc.out.length;
+    await s.after('setUrl', 'https://challonge.com/zvhang2', (st) => st.url === 'https://challonge.com/zvhang2');
+    const stopped = await waitFor(() => /a poll of the previous tournament URL (failed|came back) after setUrl/.test(s.sc.out.slice(outAt)), 3000);
+    check('R1: without ZIPPER_ALLOW_STUB, ZIPPER_POLL_DEADLINE_MS and ZIPPER_REQUEST_TIMEOUT_MS (0.3 s each asked for) are ignored: a poll whose request never answers is still in flight after 1.5 s (no lastPollAt, no lastError, nothing timed out in the log), until a setUrl stops it',
+      mid?.polling === true && mid?.lastPollAt === null && mid?.lastError === '' && !/took longer than/.test(logOf(b)) && !!stopped && limitsLineOf(s.sc.out) === FULL_LIMITS_LINE,
+      JSON.stringify({ polling: mid?.polling, lastPollAt: mid?.lastPollAt, lastError: mid?.lastError, stoppedBySetUrl: !!stopped, limits: limitsLineOf(s.sc.out) }));
+    await s.sc.stop();
+    rmSync(modeFile, { force: true });
+    b.remove();
+  }
+
+  client.ws.close();
+}
+
+// Holds a file open in another program, as an editor, an antivirus or OneDrive may (Windows
+// only): a PowerShell process opens it with FileShare ReadWrite and no Delete, so a rename
+// over it fails (EPERM) while a write into it still works. With lock, it also takes a
+// byte-range lock on it, so a write into it fails as well (EBUSY), after the open for it
+// has cut the file to nothing. It lets go once release() is called, or after 20 s.
+function holdFile(path, { lock = false } = {}) {
+  const ready = `${path}.held`;
+  const release = `${path}.release`;
+  rmSync(ready, { force: true });
+  rmSync(release, { force: true });
+  const q = (p) => `'${p.replace(/'/g, "''")}'`;
+  const ps = [
+    `$f = [System.IO.File]::Open(${q(path)}, 'Open', '${lock ? 'ReadWrite' : 'Read'}', 'ReadWrite')`,
+    lock ? '$f.Lock(0, 1048576)' : null,
+    `[System.IO.File]::WriteAllText(${q(ready)}, '')`,
+    `$n = 0; while (-not (Test-Path -LiteralPath ${q(release)}) -and $n -lt 400) { Start-Sleep -Milliseconds 50; $n++ }`,
+    lock ? '$f.Unlock(0, 1048576)' : null,
+    '$f.Close()',
+  ].filter(Boolean).join('; ');
+  const proc = track(spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', ps], { env: withoutKeys(process.env), stdio: 'ignore' }));
+  let exited = false;
+  proc.on('exit', () => { exited = true; });
+  proc.on('error', () => { exited = true; });
+  return {
+    ready: async () => { await waitFor(() => existsSync(ready) || exited, 15000, 25); return existsSync(ready) && !exited; },
+    release: async () => {
+      writeFileSync(release, '');
+      await waitFor(() => exited, 10000, 25);
+      rmSync(ready, { force: true });
+      rmSync(release, { force: true });
+    },
+  };
+}
+
+// Rows 5.1 and 5.4 while another program holds config.json (Windows only, see holdFile).
+async function testConfigHeld({ box, startIn, logOf, client, goodCfg }) {
+  const statusOf = (d) => (isStatus(d) ? parseStatus(d) : null);
+  const sizeOf = (p) => { try { return statSync(p).size; } catch { return -1; } };
+  const bytes = (p) => { try { return readFileSync(p); } catch { return null; } };
+  const same = (a, b) => !!a && !!b && Buffer.compare(a, b) === 0;
+  const mtimeOf = (p) => { try { return statSync(p).mtimeMs; } catch { return null; } };
+  const jsonOf = (buf) => { try { return JSON.parse(buf.toString('utf-8')); } catch { return null; } };
+
+  // The rename over a held config.json fails every time, so the save writes it in place.
+  // A hand edit that lands while that save waits on the held file (after the save first
+  // looked at the file, before its in-place write) is looked for again, and kept.
+  {
+    const b = await box(goodCfg());
+    const s = await startIn('config held sidecar [6j]', b);
+    const h = holdFile(b.cfg);
+    const held = await h.ready();
+    await s.after('setCapsText', '@InPlace', (x) => x.caps?.text === '@InPlace');
+    const inPlace = await savedConfig(b.cfg, (c) => c.caps?.text === '@InPlace', 4000);
+    await waitFor(() => !existsSync(b.tmp), 3000, 25);
+    const settled = await s.after('status');
+    check('row 5.1: while another program holds config.json (every rename over it fails with EPERM), a save writes it in place: it holds the new setting, no temp file is left, and no warning',
+      held && inPlace?.caps?.text === '@InPlace' && !existsSync(b.tmp) && settled?.configWarning === '',
+      JSON.stringify({ held, saved: inPlace?.caps?.text ?? null, tmp: existsSync(b.tmp), configWarning: settled?.configWarning ?? null }));
+    const at = client.events.length;
+    s.cmd('setCapsText', '@HeldEdit');
+    const saving = await waitFor(() => existsSync(b.tmp), 3000, 2); // the save has begun
+    await sleep(150); // past its first look at the file, inside the retries of its rename
+    let edited = null;
+    try { edited = JSON.parse(readFileSync(b.cfg, 'utf-8')); } catch {}
+    const handText = JSON.stringify({ ...(edited || {}), milestones: { followers: 100, subs: 0, tips: 0, cheers: 0 } }, null, 2) + '\n';
+    writeFileSync(b.cfg, handText);
+    const warned = statusOf(await s.since(at, (d) => statusOf(d)?.configWarning === CONFIG_MSG.handEdit, 4000));
+    await waitFor(() => !existsSync(b.tmp), 3000, 25);
+    await sleep(200);
+    check('row 5.4: a hand edit that lands while a save waits on the held file is not written over by its in-place write: config.json keeps the edit byte for byte, and configWarning says it was edited',
+      !!saving && !!warned && readFileSync(b.cfg, 'utf-8') === handText,
+      JSON.stringify({ saving: !!saving, warned: !!warned, kept: readFileSync(b.cfg, 'utf-8') === handText }));
+    await h.release();
+    await s.sc.stop();
+    b.remove();
+  }
+
+  // With a byte-range lock too, the write in place fails (EBUSY) after its open has cut
+  // config.json short. That is the sidecar's own change, not a hand edit: once the lock is
+  // gone, the next save writes the file whole and the warning clears. Until then
+  // config.json.tmp, the one whole copy of the settings, is kept (R3); once a save has
+  // written config.json whole, a save that stops for a hand edit removes its temp file
+  // again.
+  {
+    const b = await box(goodCfg());
+    const s = await startIn('config locked sidecar [6j]', b);
+    const h = holdFile(b.cfg, { lock: true });
+    const held = await h.ready();
+    const failed = await s.after('setCapsText', '@Locked', (x) => /^config\.json could not be saved \(E[A-Z]+\)/.test(x.configWarning || ''), 6000);
+    // The save has ended by the time its warning is out; a save that removed its temp file
+    // would have done so within this wait.
+    await sleep(300);
+    const keptTmp = jsonOf(bytes(b.tmp));
+    const cut = sizeOf(b.cfg);
+    await h.release();
+    const again = await s.after('setCapsText', '@Unlocked', (x) => x.caps?.text === '@Unlocked' && x.configWarning === '', 6000);
+    const onDisk = await savedConfig(b.cfg, (c) => c.caps?.text === '@Unlocked', 4000);
+    const tmpAfterGood = existsSync(b.tmp);
+    check('row 5.1: with config.json locked (the rename fails, and so does the write in place), configWarning says "config.json could not be saved (CODE)"',
+      held && !!failed, JSON.stringify({ held, configWarning: failed?.configWarning ?? null }));
+    check('R3: the failed write in place left config.json cut short, and the save kept config.json.tmp, which holds the new setting whole',
+      !!failed && cut === 0 && keptTmp?.caps?.text === '@Locked', JSON.stringify({ sizeAfterFailedWrite: cut, tmp: keptTmp ? keptTmp.caps?.text : null }));
+    check('row 5.1: the cut-short config.json is not taken for a hand edit: once the lock is gone the next save writes it whole (renaming the temp file into place, so none is left), and configWarning clears',
+      !!again && onDisk?.caps?.text === '@Unlocked' && !tmpAfterGood, JSON.stringify({ after: again?.configWarning ?? null, saved: onDisk?.caps?.text ?? null, tmp: tmpAfterGood, log: (/.*config\.json was edited.*/.exec(logOf(b)) || [''])[0].slice(0, 60) }));
+    // config.json is whole again: a hand edit now stops saving (row 5.4), and the save that
+    // stops removes the temp file it wrote, as any save does while config.json is whole.
+    const handText = JSON.stringify(goodCfg({ caps: { text: '@ByHand', logo: '' } }), null, 2) + '\n';
+    writeFileSync(b.cfg, handText);
+    const stopped = await s.after('setCapsText', '@AfterHandEdit', (x) => (x.configWarning || '').includes(CONFIG_MSG.handEdit), 4000);
+    const tmpGone = await waitFor(() => !existsSync(b.tmp), 2000, 25);
+    check('R3: once a save has written config.json whole again, a save that stops for a hand edit removes its temp file (config.json.tmp is kept only while config.json may be cut short), and the edit is kept',
+      !!stopped && !!tmpGone && readFileSync(b.cfg, 'utf-8') === handText, JSON.stringify({ stopped: !!stopped, tmp: existsSync(b.tmp), kept: readFileSync(b.cfg, 'utf-8') === handText }));
+    await s.sc.stop();
+    b.remove();
+  }
+
+  // R3: the same failed write in place, and then the sidecar stops before any good save (a
+  // crash, the PC turned off): the next start finds config.json empty, refuses it, keeps
+  // config.json.tmp untouched and names it, so the settings can be put back from it.
+  {
+    const b = await box(goodCfg());
+    const s = await startIn('config locked, then stopped sidecar [6j]', b);
+    const h = holdFile(b.cfg, { lock: true });
+    const held = await h.ready();
+    const failed = await s.after('setCapsText', '@LockedThenStopped', (x) => /^config\.json could not be saved \(E[A-Z]+\)/.test(x.configWarning || ''), 6000);
+    await sleep(300);
+    await s.sc.stop();
+    await h.release();
+    const tmpBytes = bytes(b.tmp);
+    const tmpTime = mtimeOf(b.tmp);
+    const cut = sizeOf(b.cfg);
+    const r = await startIn('config cut short, restarted sidecar [6j]', b);
+    const tmpKept = !!tmpBytes && same(bytes(b.tmp), tmpBytes) && mtimeOf(b.tmp) === tmpTime;
+    check('R3: a sidecar stopped after a failed write in place (config.json locked, then cut short) leaves config.json.tmp holding the new setting whole; the next start says "config.json is empty; …" with "a whole copy of the settings is in config.json.tmp" after it, runs on its defaults, and keeps the temp file untouched (same bytes, same modified time)',
+      held && !!failed && cut === 0 && jsonOf(tmpBytes)?.caps?.text === '@LockedThenStopped' && r.first?.configWarning === `${CONFIG_MSG.empty} · ${CONFIG_MSG.tmpWhole}` && r.first?.caps?.text === '' && tmpKept,
+      JSON.stringify({ held, failed: !!failed, sizeAfterFailedWrite: cut, tmp: jsonOf(tmpBytes) ? jsonOf(tmpBytes).caps?.text : null, configWarning: r.first?.configWarning ?? null, tmpKept }));
+    await r.sc.stop();
+    b.remove();
+  }
+}
+
 // ── 7. Milestone announcements (SE mock + real sidecar) ──────────────────────
 
 let seServer = null;
@@ -4673,7 +6042,7 @@ async function testLauncher() {
   const oddDir = join(TMP_DIR, 'launcher copy & (x86)');
   mkdirSync(join(oddDir, 'node_modules'), { recursive: true });
   writeFileSync(join(oddDir, 'start-zipper.bat'), readFileSync(bat));
-  const sandbox = new Set(['path', 'sb_ws_url', 'sb_ws_port', 'zipper_config', 'zipper_guard_port', 'zipper_se_base', 'zipper_allow_stub']);
+  const sandbox = new Set(['path', 'sb_ws_url', 'sb_ws_port', 'zipper_config', 'zipper_guard_port', 'zipper_se_base', 'zipper_allow_stub', 'challonge_api_key', 'startgg_api_key']);
   const runWith = async (version, batPath = bat) => {
     rmSync(dir, { recursive: true, force: true });
     mkdirSync(dir, { recursive: true });

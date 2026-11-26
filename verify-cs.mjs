@@ -33,6 +33,10 @@ const CSC = process.env.CSC || 'C:\\Windows\\Microsoft.NET\\Framework64\\v4.0.30
 const BUILD = join(ROOT, 'tools', 'cs', 'build');
 const STUB = join(ROOT, 'tools', 'cs', 'CphStub.cs');
 const HARNESS = join(ROOT, 'tools', 'cs', 'Harness.cs');
+// The compiler and the compiled programs get the shell's environment without the API keys
+// a developer may have set (in any casing: Windows matches environment names without
+// regard to case). Neither needs them.
+const CHILD_ENV = Object.fromEntries(Object.entries(process.env).filter(([k]) => !['CHALLONGE_API_KEY', 'STARTGG_API_KEY'].includes(k.toUpperCase())));
 
 console.log('Zipper — the C# actions, compiled and run\n');
 if (!existsSync(CSC)) {
@@ -72,7 +76,7 @@ function prepare(file) {
 // em dashes inside string literals.
 function compile(files, target, out, refs = []) {
   const r = spawnSync(CSC, ['/nologo', '/noconfig', '/codepage:65001', '/warnaserror-', `/target:${target}`, `/out:${out}`,
-    ...refs.map((x) => `/r:${x}`), ...files], { encoding: 'utf8' });
+    ...refs.map((x) => `/r:${x}`), ...files], { encoding: 'utf8', env: CHILD_ENV });
   if (r.error) stop('The compiler could not be started: ' + r.error.message);
   return { ok: r.status === 0 && existsSync(out), text: (r.stdout || '') + (r.stderr || '') };
 }
@@ -174,7 +178,7 @@ for (const a of BUS) {
   const out = join(BUILD, a.exe.replace('.exe', '-out.txt'));
   writeFileSync(script, lines.join('\n') + '\n', 'utf8');
 
-  const ran = spawnSync(a.exePath, [script, out], { encoding: 'utf8' });
+  const ran = spawnSync(a.exePath, [script, out], { encoding: 'utf8', env: CHILD_ENV });
   if (ran.error) {
     stop(`The compiled program could not be started: ${ran.error.message}\n(${a.exePath})\n`
       + (existsSync(a.exePath) ? 'The file is still there.' : `The file is gone: an antivirus most likely removed it after it was compiled. Allow the folder ${BUILD} and run again.`));
