@@ -10,6 +10,85 @@ traceability.
 
 ## [Unreleased]
 
+## [1.0.24] — 2026-11-26
+
+Copy `zipper-sidecar.mjs`, the `platforms` folder and the `zipper-shared`
+folder, then stop the sidecar and start it again and reload the dock. Copy them
+together. Nothing to re-paste. After the restart, press **Set** or **Poll now**
+once: Streamer.bot replays the last payload it stored, and one new push replaces
+a copy stored by an older version, which did not hide keys. The sidecar now
+writes a `config.log` (and later a `config.old.log`) beside `config.json`.
+
+### Fixed
+
+- **A mistake in `config.json` no longer wipes it.** Before, a trailing comma or
+  a missing quote made the sidecar start from the example and save that over
+  your file, keys and all. Now the file is left alone: the sidecar runs on its
+  built-in settings, saves nothing, and the control page says what is wrong,
+  for example "config.json is not valid JSON (line 4)". Fix the file and
+  restart the sidecar.
+- **A file saved in the wrong encoding is named, not mangled.** A `config.json`
+  saved as UTF-16 (Windows PowerShell's `>` does that), saved in ANSI with an
+  accented letter in it, or left empty, is refused with its own sentence. A
+  plain-ASCII file loads however it was saved, and so does a UTF-8 file with a
+  byte-order mark.
+- **A crash or power loss during a save no longer leaves half a file.** The
+  sidecar writes a new file and swaps it in. If a save is cut short and
+  `config.json` cannot be read afterwards, the control page says that a whole
+  copy of the settings is in `config.json.tmp`; rename it to `config.json` and
+  restart.
+- **An edit made by hand while the sidecar runs is kept.** Before, the next
+  save overwrote it. Now the sidecar notices the edit at its next save, stops
+  saving until you restart it, and the control page says so.
+- **A key from an environment variable is never written into `config.json`.**
+- **API keys no longer appear in errors, the status or the log.** A key the
+  sidecar knows is replaced by a label such as `[start.gg key]`. This includes a
+  key pasted by mistake into the end-cap text, the logo address or the message,
+  which would otherwise show on the stream.
+- **A crash leaves its reason behind.** The last line of `config.log` says why
+  the sidecar stopped.
+- A key with a space or a line break inside it is not used, and the control
+  page names it.
+
+### Changed
+
+- While `config.json` is refused, keys from the environment variables are not
+  used either. Fix the file and restart.
+- A key in `config.json` wins over the environment variable. A key that an
+  older version copied from the environment into `config.json` stays there and
+  overrides the variable until you remove it from the file.
+- Saving replaces `config.json` with a new file, so a hard or symbolic link to
+  it, or permissions set on the file itself, are not kept.
+- While saving is stopped after a hand edit, reached milestones are not saved,
+  so a restart can announce one again.
+- If `config.json` is missing while a whole `config.json.tmp` is there, the
+  sidecar does not copy the example in; it says "config.json is missing".
+  Rename the copy, or delete it to start from the example, then restart.
+- The control page's boxes show the label where a key was typed. Applying them
+  again saves the label in place of the key.
+
+### Development
+
+- The status gains `configWarning`.
+- `ZIPPER_SE_BASE`, `ZIPPER_REQUEST_TIMEOUT_MS`, `ZIPPER_POLL_DEADLINE_MS` and
+  `ZIPPER_MIN_POLL_GAP_MS` work only with `ZIPPER_ALLOW_STUB=1`. A log line at
+  start names the limits in effect.
+- Test preloads in `tools/`: a crash, a guard-socket error and a fake `fetch`,
+  so no check contacts an outside host.
+- `npm run verify` 471 checks (was 373), `npm run verify:render` 46 (was 45),
+  `npm run verify:cs` 19.
+
+### Not checked
+
+- Nothing was run against a real Streamer.bot or in OBS.
+- The rename retries and the in-place fallback under a real lock by another
+  program (a stand-in held the file), and a file saved as ANSI by a real editor.
+- A clean shutdown while a save is in flight does not wait for it.
+- A site's own error text that an adapter cut off inside a key, or a cap or
+  message text cut at its length limit inside a key, can keep the key's first 1
+  to 7 characters.
+- The suites ran on Node 22, not Node 20.
+
 ## [1.0.22] — 2026-11-26
 
 Copy `zipper-sidecar.mjs`, the `platforms` folder and the `zipper-shared`
@@ -362,7 +441,8 @@ Initial release — scrolling tournament-results ticker for Streamer.bot.
 Live-validated keyless against real start.gg and Challonge brackets across
 pre-start, mid-event and completed states.
 
-[Unreleased]: https://github.com/FlashGalatine/zipper-ticker/compare/v1.0.22...main
+[Unreleased]: https://github.com/FlashGalatine/zipper-ticker/compare/v1.0.24...main
+[1.0.24]: https://github.com/FlashGalatine/zipper-ticker/compare/v1.0.22...v1.0.24
 [1.0.22]: https://github.com/FlashGalatine/zipper-ticker/compare/v1.0.20...v1.0.22
 [1.0.20]: https://github.com/FlashGalatine/zipper-ticker/compare/v1.0.18...v1.0.20
 [1.0.18]: https://github.com/FlashGalatine/zipper-ticker/compare/v1.0.16...v1.0.18

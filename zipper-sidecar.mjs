@@ -45,8 +45,28 @@
 // Retry-After kept. A result that comes back after setUrl changed the URL is
 // thrown away. The status's nextPollAt says when the next poll runs.
 //
-// Config lives in ./config.json (gitignored; seeded from config.example.json on
-// first run). API keys may also come from env: CHALLONGE_API_KEY, STARTGG_API_KEY.
+// Config lives in ./config.json (gitignored; seeded from config.example.json when it is
+// missing, unless config.json.tmp holds a whole copy of the settings: then nothing is
+// copied, and configWarning says so). It is read once, at start: edit it with the sidecar
+// stopped, or restart the sidecar afterwards; a hand edit made while it runs is left as
+// it is, and nothing more is saved until the restart. A config.json that does not parse,
+// cannot be read, holds no JSON object, is saved as UTF-16, is empty or is not valid UTF-8
+// is never written over: the sidecar runs on its built-in defaults with no keys, not even the
+// environment's, and saves nothing (see "Config" below). The status's configWarning says
+// why, and the control page shows it. A config.json.tmp left by a crash, or by a save
+// whose write in place failed, is kept while config.json is refused, and configWarning
+// says when it holds a whole copy of the settings.
+// API keys may also come from env: CHALLONGE_API_KEY, STARTGG_API_KEY, used when
+// config.json has none, and never saved to it. A key that is not printable ASCII (a
+// space or a line break inside it) is not used, and configWarning names it. A key
+// the sidecar knows (8 characters or more) is replaced by a label such as
+// [start.gg key] in the status's errors, notices and url, and in the log. It is
+// replaced in the caps text, the caps logo and the message text too, in the status and
+// in every ticker:update the sidecar pushes. config.json keeps what was typed.
+//
+// Log: every line also goes to config.log beside config.json (named after the config
+// file), which the running sidecar moves to config.old.log once it passes 1 MB. A
+// crash is logged there too, and the sidecar then exits with code 1.
 //
 // Test hook: a tournament URL of the form "stub:<path-to-json>" loads a
 // normalized platform result from that file instead of the network — used by
@@ -63,24 +83,39 @@
 // Env:  SB_WS_URL (default ws://127.0.0.1:8080/) · ZIPPER_GUARD_PORT (7496)
 //       ZIPPER_CONFIG (config file path override)
 //       ZIPPER_ALLOW_STUB=1 (tests only: turns on stub: URLs and, in a stub file, the
-//       test keys stubHoldFile, stubHoldIgnoresAbort and stubFail, and lets
-//       ZIPPER_PUSH_RETRY_MS shorten the 30 s before an owed push is retried)
-//       ZIPPER_REQUEST_TIMEOUT_MS, ZIPPER_POLL_DEADLINE_MS, ZIPPER_MIN_POLL_GAP_MS
-//       (tests only: shorten the 10 s per request, the 45 s per poll and the 15 s between
-//       polls; each is clamped, so it can only shorten its limit)
+//       test keys stubHoldFile, stubHoldIgnoresAbort and stubFail, and lets the test
+//       settings below apply; without it each of them is ignored)
+//       ZIPPER_REQUEST_TIMEOUT_MS, ZIPPER_POLL_DEADLINE_MS, ZIPPER_MIN_POLL_GAP_MS,
+//       ZIPPER_PUSH_RETRY_MS (tests only, and only with ZIPPER_ALLOW_STUB=1: shorten the
+//       10 s per request, the 45 s per poll, the 15 s between polls and the 30 s before an
+//       owed push is retried; each is clamped, so it can only shorten its limit. Without
+//       ZIPPER_ALLOW_STUB=1 the full limits apply whatever these say. The sidecar logs
+//       the limits in effect as it starts.)
+//       ZIPPER_SE_BASE (tests only, and only with ZIPPER_ALLOW_STUB=1: points the
+//       StreamElements requests at another address)
 
-import { readFile, writeFile } from 'node:fs/promises';
-import { existsSync } from 'node:fs';
+import { readFile, writeFile, rename, rm, open } from 'node:fs/promises';
+import { existsSync, appendFileSync, statSync, renameSync } from 'node:fs';
 import { createServer } from 'node:net';
-import { resolve, relative, isAbsolute, dirname, sep } from 'node:path';
+import { resolve, relative, isAbsolute, dirname, basename, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import WebSocket from 'ws';
 import { detectPlatform } from './platforms/index.js';
-import { guardedFetch, statusError, parseRetryAfter, envLimit, seconds } from './platforms/guarded-fetch.js';
+import { guardedFetch, statusError, parseRetryAfter, envLimit, seconds, requestTimeoutMs } from './platforms/guarded-fetch.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const CONFIG_PATH = process.env.ZIPPER_CONFIG || resolve(__dirname, 'config.json');
 const EXAMPLE_PATH = resolve(__dirname, 'config.example.json');
+// A save is written here, flushed, and renamed over config.json (row 5.1).
+const TMP_PATH = `${CONFIG_PATH}.tmp`;
+// The log file (row 5.2): beside the config file and named after it (config.json →
+// config.log), so the tests' sidecars, each with a config of its own, never share one.
+// Past LOG_MAX_BYTES the running sidecar moves it to config.old.log, replacing the one
+// before, and starts it again.
+const LOG_BASE = CONFIG_PATH.replace(/\.json$/i, '');
+const LOG_PATH = `${LOG_BASE}.log`;
+const LOG_OLD_PATH = `${LOG_BASE}.old.log`;
+const LOG_MAX_BYTES = 1024 * 1024;
 const SB_WS_URL = process.env.SB_WS_URL || `ws://127.0.0.1:${process.env.SB_WS_PORT || 8080}/`;
 // Single-instance guard: a second launch (double-click + SB action) exits
 // cleanly instead of double-polling. Greenroom holds 7495; Zipper takes 7496.
@@ -96,6 +131,42 @@ const STUB_OUTSIDE_MESSAGE = 'stub: URLs may name only a file inside the Zipper 
 const STUB_UNREADABLE_MESSAGE = 'stub: the test file could not be read';
 const STUB_NOT_OBJECT_MESSAGE = 'stub: the test file is not a JSON object';
 const LOGO_REFUSED_MESSAGE = 'Logo not changed: use an http(s) URL or a path on the overlay\'s server, such as /zipper-overlay/assets/logo.png';
+// configWarning's sentences (row 5.1 to 5.4). A config.json that did not load is named by
+// what went wrong, never by its content: V8's own message quotes the file beside the
+// error, and that can be part of a key.
+const CONFIG_LOAD_TAIL = '; the sidecar runs on its defaults and saves nothing until the file is fixed and the sidecar restarted';
+const CONFIG_UNREADABLE_MESSAGE = `config.json could not be read${CONFIG_LOAD_TAIL}`;
+const CONFIG_NOT_OBJECT_MESSAGE = `config.json does not hold a JSON object${CONFIG_LOAD_TAIL}`;
+// The owner's ruling of 2026-11-26: a file saved as UTF-16 and an empty one each have a
+// sentence of their own, not "not valid JSON".
+const CONFIG_UTF16_MESSAGE = `config.json is saved as UTF-16; save it as UTF-8${CONFIG_LOAD_TAIL}`;
+const CONFIG_EMPTY_MESSAGE = `config.json is empty${CONFIG_LOAD_TAIL}`;
+// R5 (the owner's ruling of 2026-11-26): a file whose bytes are not valid UTF-8, such as
+// one saved as ANSI with an accented letter in it.
+const CONFIG_NOT_UTF8_MESSAGE = `config.json is not saved as UTF-8; save it as UTF-8${CONFIG_LOAD_TAIL}`;
+// A config.json that is missing while config.json.tmp holds a whole copy of the settings
+// (a choice: see loadConfig).
+const CONFIG_MISSING_MESSAGE = `config.json is missing${CONFIG_LOAD_TAIL}`;
+// Added after a load sentence when config.json.tmp holds a whole copy of the settings. It
+// quotes neither file.
+const CONFIG_TMP_WHOLE_MESSAGE = 'a whole copy of the settings is in config.json.tmp';
+const CONFIG_HAND_EDIT_MESSAGE = 'config.json was edited while the sidecar was running, so the sidecar no longer saves it; restart the sidecar to load the edit (changes made since then last only until the restart)';
+const LOGO_DROPPED_MESSAGE = 'config.json: the saved logo was dropped (it must be an http(s) URL or a path on the overlay\'s server)';
+// A key that is not printable ASCII (row 5.3), named by where it came from.
+const badKeyMessage = (where) => `${where} contains a space, a line break or another character that cannot be part of a key, so it is not used. Paste it again.`;
+// Windows' answers when another program (an editor, an antivirus, OneDrive) holds a file.
+const LOCK_CODES = new Set(['EBUSY', 'EPERM', 'EACCES']);
+// How long a locked config.json is read again at start before it counts as unreadable, and
+// how often (row 5.1, as Greenroom does).
+const CONFIG_READ_RETRY_MS = 2000;
+const CONFIG_READ_STEP_MS = 100;
+// How many times a save's rename over config.json is tried when the file is held, and how
+// far apart, before it is written in place instead.
+const RENAME_TRIES = 10;
+const RENAME_RETRY_MS = 50;
+// Key values shorter than this are not redacted (row 5.3): too short to be a key, and
+// likely to match ordinary text.
+const REDACT_MIN_CHARS = 8;
 // An unknown command is reported by its name only, cut to this many characters (the
 // longest real name, setMessageEnabled, has 17). The name can come from chat or any
 // local program, so nothing else limits its length.
@@ -120,9 +191,12 @@ const POLL_DEADLINE_MS = 45000;
 // also keeps a start.gg poll (up to eleven requests) inside start.gg's 80 requests a
 // minute. Counted from the end, so a slow poll is never followed straight by another.
 const MIN_POLL_GAP_MS = 15000;
-// The tests shorten these two (and the 10 s per request) through ZIPPER_* settings.
-const pollDeadlineMs = envLimit('ZIPPER_POLL_DEADLINE_MS', POLL_DEADLINE_MS, 50);
-const minPollGapMs = envLimit('ZIPPER_MIN_POLL_GAP_MS', MIN_POLL_GAP_MS, 0);
+// The tests shorten these two (and the 10 s per request, in platforms/guarded-fetch.js)
+// through ZIPPER_* settings, and only with ZIPPER_ALLOW_STUB=1 (the owner's ruling of
+// 2026-11-26): a normal install keeps the full limits whatever those settings say, so no
+// setting can make it poll a site more often or cut a poll short.
+const pollDeadlineMs = STUB_ALLOWED ? envLimit('ZIPPER_POLL_DEADLINE_MS', POLL_DEADLINE_MS, 50) : POLL_DEADLINE_MS;
+const minPollGapMs = STUB_ALLOWED ? envLimit('ZIPPER_MIN_POLL_GAP_MS', MIN_POLL_GAP_MS, 0) : MIN_POLL_GAP_MS;
 const MESSAGE_MAX_CHARS = 1000;
 const MESSAGE_MAX_LINES = 20;
 const WAITING_POLL_MS = 300000; // 5 min re-check while upcoming with no usable start time
@@ -222,38 +296,360 @@ let sbReconnectTimer = null;
 let sbMsgId = 0;
 
 // ── Config ────────────────────────────────────────────────────────────────────
+//
+// How config.json is kept safe (ZIP-05, rows 5.1 and 5.4):
+//   • It is read once, at start. A file that does not parse, cannot be read (anything but
+//     missing; a locked one is tried again for CONFIG_READ_RETRY_MS first), does not hold
+//     a JSON object, is saved as UTF-16, is empty or is not valid UTF-8 is never written
+//     over: the sidecar runs on its built-in defaults with no keys (those from the
+//     environment are not used either: a choice the plan left open, settled the
+//     conservative way), saves nothing for the rest of the run, and says why in
+//     configWarning, in a fixed sentence. A UTF-8 byte-order mark is stripped first.
+//     config.example.json is copied only when config.json is missing.
+//   • config.json.tmp, which a crash between a save's write and its rename can leave, is
+//     removed at start only once config.json has loaded, and only by an instance that
+//     holds the guard port. While config.json is refused it is kept as it is (nothing is
+//     saved, so it is never written either), and when it holds a whole copy of the
+//     settings configWarning says so. A config.json that is missing beside such a copy is
+//     not seeded from the example (see loadConfig).
+//   • A save writes config.json.tmp, flushes it, and renames it over config.json, trying
+//     again while another program holds the file; if the rename keeps failing it writes
+//     config.json in place, and puts the old bytes back if that fails too. Saves run one at
+//     a time (persist), each writing what is true when it starts. A failed write in place
+//     can leave config.json cut short, so from then until a save writes config.json whole
+//     the temp file, the one whole copy of the settings, is kept (configMayBeCut): a
+//     restart meanwhile refuses the cut file and names the copy.
+//   • A hand edit made while the sidecar runs is not written over: before each save, and
+//     again before an in-place write, the file must still have the size and modified time
+//     it had when the sidecar last read or wrote it. If not, the sidecar stops saving until
+//     it is restarted, and says so in configWarning. A failed in-place write counts as the
+//     sidecar's own change, so the next save tries again instead of stopping.
+//   • Keys from the environment are used but never saved (ZIP-21): `config` holds what
+//     config.json holds, and the keys in use are kept apart (keysInUse).
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Set when config.json did not load (one of the sentences above): nothing is saved.
+let configLoadProblem = '';
+// config.json's size and modified time as the sidecar last read or wrote it; null while
+// it does not exist; undefined before it is first looked at.
+let configStamp;
+// Set once a hand edit is seen: nothing more is saved until a restart.
+let configEditedByHand = false;
+let saveRefusedLogged = false;
+// Set when a save's write in place fails, which can leave config.json cut short, and
+// cleared once a save writes it whole: meanwhile config.json.tmp may be the one whole copy
+// of the settings, so no save removes it (saveConfig).
+let configMayBeCut = false;
+// Set once this instance holds the guard port (acquireGuard). Only then does it remove a
+// config.json.tmp at start (loadConfig).
+let guardHeld = false;
+
+// configWarning (docs/PROTOCOL.md): config.json load problems, a saved logo dropped, a
+// refused key, saves stopped after a hand edit, and a failed write, one entry each, in the
+// order they arose. A restart clears them; a failed write's clears on the next good one.
+const configWarnings = new Map();
+// logText, when given, is what the log says instead: the same sentence with the system's
+// error code, which the status leaves out.
+function warnConfig(id, text, logText = text) {
+  if (configWarnings.get(id) === text) return;
+  configWarnings.set(id, text);
+  log(logText);
+}
+function configWarning() {
+  return [...configWarnings.values()].join(' · ');
+}
 
 async function loadConfig() {
-  let raw = null;
+  let buf;
   try {
-    raw = await readFile(CONFIG_PATH, 'utf-8');
+    buf = await readConfigFile();
   } catch (err) {
-    if (err.code !== 'ENOENT') log(`Could not read config: ${err.message}`);
+    // The log line names the system's code (EPERM, EISDIR, EBUSY...), never its message,
+    // which quotes the path; the status keeps the fixed sentence.
+    await refuseConfig(CONFIG_UNREADABLE_MESSAGE, `config.json could not be read${errorCode(err)}${CONFIG_LOAD_TAIL}`);
+    return;
   }
-  if (raw == null) {
+  if (buf === null) {
+    // A choice (the owner's ruling covers a config.json that is refused, not a missing one):
+    // a config.json that is missing while config.json.tmp holds a whole copy of the settings
+    // is treated as refused, the conservative way. The example is not copied in, nothing is
+    // saved, the temp file is kept, and configWarning says both, so the operator can put
+    // the copy back (or delete it to start from the example) and restart.
+    if (await tempIsWhole()) {
+      await refuseConfig(CONFIG_MISSING_MESSAGE);
+      return;
+    }
+    let example;
     try {
-      raw = await readFile(EXAMPLE_PATH, 'utf-8');
-      await writeFile(CONFIG_PATH, raw, 'utf-8');
-      log('Seeded config.json from config.example.json');
+      example = await readFile(EXAMPLE_PATH);
     } catch {
+      configStamp = null;
       log('No config.example.json — using built-in defaults');
       return;
     }
+    try {
+      // 'wx': only a config.json that is still missing; one made meanwhile is read instead.
+      await writeFile(CONFIG_PATH, example, { flag: 'wx' });
+      log('Seeded config.json from config.example.json');
+    } catch (err) {
+      if (err?.code === 'EEXIST') { await loadConfig(); return; }
+      log(`config.json could not be created from config.example.json${errorCode(err)}; the next save tries again`);
+    }
+    buf = example;
   }
-  try { adoptConfig(JSON.parse(raw)); } catch (err) { log(`Bad config JSON: ${err.message}`); }
+  configStamp = fileStamp();
+  if (looksUtf16(buf)) {
+    await refuseConfig(CONFIG_UTF16_MESSAGE);
+    return;
+  }
+  // No bytes, or only white space once a UTF-8 byte-order mark is stripped.
+  if (!buf.toString('utf-8').replace(/^\uFEFF/, '').trim()) {
+    await refuseConfig(CONFIG_EMPTY_MESSAGE);
+    return;
+  }
+  // R5 (the owner's ruling of 2026-11-26): bytes that are not valid UTF-8 are refused. Read
+  // leniently, each bad byte would become U+FFFD (an accented letter in a file saved as
+  // ANSI, say), and the next save would write that over the file for good. A file of plain
+  // ASCII saved as ANSI is valid UTF-8, so it still loads (one saved as UTF-16 is refused
+  // above). ignoreBOM keeps a UTF-8 byte-order mark in the text, so it is stripped below as
+  // before: one mark only, so a file with two stays "not valid JSON". Nothing of the file
+  // or the decoder's error is quoted.
+  let text;
+  try {
+    text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(buf).replace(/^\uFEFF/, '');
+  } catch {
+    await refuseConfig(CONFIG_NOT_UTF8_MESSAGE);
+    return;
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch (err) {
+    await refuseConfig(notJsonMessage(err, text));
+    return;
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    await refuseConfig(CONFIG_NOT_OBJECT_MESSAGE);
+    return;
+  }
+  adoptConfig(parsed);
+  // config.json has loaded: a temp file a crash left is removed now, and only now (the
+  // owner's ruling of 2026-11-26; while config.json is refused it is kept, see
+  // refuseConfig), and only by an instance that holds the guard port. A second launch exits
+  // at the guard before it gets here; one that goes on without the guard, because the port
+  // could not be opened (main), may share the folder with a running sidecar whose save is
+  // writing that file, so it leaves the file alone (its own first save writes over it).
+  if (guardHeld) await rm(TMP_PATH, { force: true }).catch(() => {});
+}
+
+// Whether config.json's bytes are UTF-16 (the owner's ruling of 2026-11-26): a UTF-16
+// byte-order mark (FF FE, as Windows PowerShell's ">" and plain Out-File write it, or
+// FE FF), or, without one, a NUL as every second byte at the start (up to the first four
+// characters), the other byte of each pair not NUL. A file of NULs alone is not taken for
+// UTF-16: it stays "not valid JSON".
+function looksUtf16(buf) {
+  if (buf.length >= 2 && ((buf[0] === 0xff && buf[1] === 0xfe) || (buf[0] === 0xfe && buf[1] === 0xff))) return true;
+  const pairs = Math.min(4, buf.length >> 1);
+  if (!pairs) return false;
+  let le = true;
+  let be = true;
+  for (let i = 0; i < pairs; i++) {
+    const a = buf[2 * i];
+    const b = buf[2 * i + 1];
+    if (!(a !== 0 && b === 0)) le = false;
+    if (!(a === 0 && b !== 0)) be = false;
+  }
+  return le || be;
+}
+
+// Whether config.json.tmp holds a whole copy of the settings: it can be read, and parses
+// (a UTF-8 byte-order mark stripped) to a JSON object. It is only read, never changed, and
+// nothing of it is quoted anywhere.
+async function tempIsWhole() {
+  try {
+    const parsed = JSON.parse((await readFile(TMP_PATH)).toString('utf-8').replace(/^\uFEFF/, ''));
+    return !!parsed && typeof parsed === 'object' && !Array.isArray(parsed);
+  } catch {
+    return false;
+  }
+}
+
+// config.json's bytes, or null when it is missing. A file another program holds is read
+// again for CONFIG_READ_RETRY_MS before the error is passed on.
+async function readConfigFile() {
+  const until = monoNow() + CONFIG_READ_RETRY_MS;
+  for (;;) {
+    try {
+      return await readFile(CONFIG_PATH);
+    } catch (err) {
+      if (err?.code === 'ENOENT') return null;
+      if (!LOCK_CODES.has(err?.code) || monoNow() >= until) throw err;
+      await sleep(CONFIG_READ_STEP_MS);
+    }
+  }
+}
+
+// config.json did not load: nothing is saved for the rest of the run (saveConfig returns
+// before it writes anything, config.json.tmp included), and config.json.tmp is left as it
+// is. When that temp file holds a whole copy of the settings, configWarning says so after
+// the load sentence; when it does not, or there is none, nothing is said about it.
+async function refuseConfig(text, logText = text) {
+  configLoadProblem = text;
+  warnConfig('load', text, logText);
+  if (await tempIsWhole()) warnConfig('tmp', CONFIG_TMP_WHOLE_MESSAGE);
+}
+
+// "config.json is not valid JSON (line N)". N is counted from the position V8 reports, in
+// the text after the byte-order mark; with no position it is left out. Only the digits are
+// taken from V8's message, which otherwise quotes the file.
+function notJsonMessage(err, text) {
+  const m = /\bposition (\d+)\b/.exec(String(err?.message ?? ''));
+  const pos = m ? Number(m[1]) : NaN;
+  const line = Number.isFinite(pos) && pos <= text.length ? text.slice(0, pos).split('\n').length : 0;
+  return `config.json is not valid JSON${line ? ` (line ${line})` : ''}${CONFIG_LOAD_TAIL}`;
+}
+
+// " (EPERM)" for an error with a system code, or "".
+function errorCode(err) {
+  return typeof err?.code === 'string' && /^E[A-Z]+$/.test(err.code) ? ` (${err.code})` : '';
+}
+
+// The keys the sidecar uses (row 5.3), from config.json, or from the environment when the
+// file has none, and only when they pass checkKey. Never saved: `config` holds the file's own.
+const keysInUse = { challonge: null, startgg: null, jwt: null };
+const KEY_LABELS = { challonge: '[Challonge key]', startgg: '[start.gg key]', jwt: '[StreamElements token]' };
+
+// Tally's cleanKey rule: printable ASCII 0x21-0x7E after trimming. { key } to use (null
+// for none), or { refused: true }.
+function checkKey(value) {
+  if (value == null) return { key: null };
+  if (typeof value !== 'string' && typeof value !== 'number') return { refused: true };
+  const s = String(value).trim();
+  if (!s) return { key: null };
+  return /^[\x21-\x7e]+$/.test(s) ? { key: s } : { refused: true };
+}
+
+// The key a field uses: the file's, or, when the file has none, the environment's. A
+// refused one is not used (and the other source is not tried in its place); configWarning
+// names it without quoting it.
+function keyFor(fileValue, field, envName) {
+  const fromFile = checkKey(fileValue);
+  if (fromFile.refused) { warnConfig(`key:${field}`, badKeyMessage(`${field} in config.json`)); return null; }
+  if (fromFile.key || !envName) return fromFile.key;
+  const fromEnv = checkKey(process.env[envName]);
+  if (fromEnv.refused) { warnConfig(`key:${envName}`, badKeyMessage(`${envName} (environment variable)`)); return null; }
+  return fromEnv.key;
+}
+
+// Every key value known, accepted or refused, from config.json and the environment, with
+// its label (row 5.3): the forms it can take in a text (as given, trimmed, as a URL
+// encodes it) and, for a refused one, each printable run of it. Each of these is also
+// taken as a JSON string escapes it: a setCaps or setMessage value is JSON, so a key with
+// a double quote or a backslash in it arrives in the command's value as \" or \\, and the
+// log line of that command is redacted in that form. Longest first. It never
+// throws: a value with a lone surrogate (an escape such as \ud800 in config.json) has no
+// URL form, and is refused by checkKey, so it is never sent anywhere to need one.
+let redactions = [];
+function urlForm(s) {
+  try { return encodeURIComponent(s); } catch { return ''; }
+}
+function jsonForm(s) {
+  return JSON.stringify(s).slice(1, -1);
+}
+function setRedactions() {
+  const forms = (value, label) => {
+    if (typeof value !== 'string' && typeof value !== 'number') return [];
+    const raw = String(value);
+    const plain = [raw, raw.trim(), urlForm(raw.trim()), ...raw.split(/[^\x21-\x7e]+/)];
+    const all = new Set([...plain, ...plain.map(jsonForm)]);
+    return [...all].filter((f) => f.length >= REDACT_MIN_CHARS).map((f) => [f, label]);
+  };
+  redactions = [
+    ...forms(process.env.CHALLONGE_API_KEY, KEY_LABELS.challonge),
+    ...forms(process.env.STARTGG_API_KEY, KEY_LABELS.startgg),
+    ...forms(config.challongeApiKey, KEY_LABELS.challonge),
+    ...forms(config.startggApiKey, KEY_LABELS.startgg),
+    ...forms(config.streamElements?.jwtToken, KEY_LABELS.jwt),
+  ].sort((a, b) => b[0].length - a[0].length);
+}
+setRedactions(); // the environment's keys, from the first line on; adoptConfig adds the file's
+
+// A text with every key value in it replaced by its label (row 5.3). It runs in log(), on
+// every line before it reaches the console or the file, and on every error before the
+// status carries it (errorText), on a command's name and value before they are cut, and on
+// the caps and the message as the status and every pushed ticker:update carry them (R6).
+// A key cut off at the end of a text the sidecar did not cut itself (an adapter quotes a
+// site's answer cut to 200 characters) is matched by its first REDACT_MIN_CHARS or more
+// characters; a piece shorter than that, 1 to 7 characters, is left (Sprint 8, the
+// adapters, can move that cut after the redaction).
+function redact(text) {
+  let s = String(text ?? '');
+  for (const [value, label] of redactions) if (s.includes(value)) s = s.split(value).join(label);
+  for (const [value, label] of redactions) {
+    for (let n = Math.min(value.length - 1, s.length); n >= REDACT_MIN_CHARS; n--) {
+      if (s.endsWith(value.slice(0, n))) return s.slice(0, s.length - n) + label;
+    }
+  }
+  return s;
+}
+
+// The text of an error as the status carries it (lastError, the StreamElements error).
+function errorText(err) {
+  return redact(err?.message || String(err));
+}
+
+// The tournament URL as the status and every pushed payload carry it, to every client of
+// the bus: a key pasted into it (a Challonge API address with its api_key, say) is
+// replaced by its label (row 5.3). config.tournamentUrl, and config.json, keep it as set.
+function shownUrl(url) {
+  return url == null ? url : redact(url);
+}
+
+// R6 (the owner's ruling of 2026-11-26): a key typed into the caps text, the caps logo or
+// the message text is replaced by its label in the status and in every ticker:update the
+// sidecar pushes, as in the URL. The command that set it is not the sidecar's to change:
+// Streamer.bot broadcasts each ticker:command to every client of the bus as it was sent.
+// A logo is an http(s) URL or a path on the overlay's server (checkLogo refuses a data:
+// URI on every way in); a key in it is replaced as given and as a URL encodes it. A key
+// that the sidecar's own cut fell inside (the caps text at 120 characters, the logo at
+// 500, the message at 1000) can keep its first 1 to 7 characters, as redact() says.
+// Only what is sent changes: config, config.json, lastPayload and the change check
+// (hashPayload) keep what was typed. The labels for a run never change (the keys are read
+// at start), so a payload and the one before it are redacted alike: a key in the caps or
+// the message neither makes a poll push again nor stops a change from being pushed.
+function shownCaps(caps) {
+  return { ...caps, text: redact(caps?.text), logo: redact(caps?.logo) };
+}
+function shownMessage(message) {
+  return { ...message, text: redact(message?.text) };
+}
+// A ticker:update as it is pushed (pushUpdate): the caps and the message lines redacted.
+function shownPayload(payload) {
+  const shown = { ...payload, caps: shownCaps(payload.caps) };
+  if (payload.message) shown.message = { ...payload.message, lines: payload.message.lines.map((line) => redact(line)) };
+  return shown;
+}
+
+// What a platform adapter is given: the settings, with the keys in use.
+function adapterConfig() {
+  return { ...config, challongeApiKey: keysInUse.challonge, startggApiKey: keysInUse.startgg };
 }
 
 function adoptConfig(parsed) {
-  if (!parsed || typeof parsed !== 'object') return;
-  // A saved logo that fails the rule is dropped here, and written out on the next save.
+  // A saved logo that fails the rule is dropped here, and written out on the next save. The
+  // reason is in configWarning as well as the log.
   let logo = checkLogo(parsed.caps?.logo);
   if (logo === null) {
     logo = '';
-    log('config.json: the saved logo was dropped (it must be an http(s) URL or a path on the overlay\'s server)');
+    warnConfig('logo', LOGO_DROPPED_MESSAGE);
   }
   config = {
-    challongeApiKey: strOrNull(parsed.challongeApiKey) || strOrNull(process.env.CHALLONGE_API_KEY),
-    startggApiKey: strOrNull(parsed.startggApiKey) || strOrNull(process.env.STARTGG_API_KEY),
+    // The keys as config.json holds them, written back as they are: a key from the
+    // environment never lands in the file (ZIP-21), and a refused one is never deleted
+    // from it (row 5.3).
+    challongeApiKey: parsed.challongeApiKey ?? null,
+    startggApiKey: parsed.startggApiKey ?? null,
     tournamentUrl: strOrNull(parsed.tournamentUrl),
     pollIntervalMs: clampInt(parsed.pollIntervalMs, MIN_INTERVAL_MS, 3600000, 30000),
     maxItems: clampInt(parsed.maxItems, 1, 100, 20),
@@ -267,7 +663,7 @@ function adoptConfig(parsed) {
       text: String(parsed.message?.text ?? '').slice(0, MESSAGE_MAX_CHARS),
     },
     streamElements: {
-      jwtToken: strOrNull(parsed.streamElements?.jwtToken),
+      jwtToken: parsed.streamElements?.jwtToken ?? null,
       pollSeconds: clampInt(parsed.streamElements?.pollSeconds, 5, 3600, 60),
     },
     milestones: {
@@ -282,13 +678,130 @@ function adoptConfig(parsed) {
     autoSchedule: parsed.autoSchedule === undefined ? true : !!parsed.autoSchedule,
     autoStart: !!parsed.autoStart,
   };
+  setRedactions();
+  keysInUse.challonge = keyFor(config.challongeApiKey, 'challongeApiKey', 'CHALLONGE_API_KEY');
+  keysInUse.startgg = keyFor(config.startggApiKey, 'startggApiKey', 'STARTGG_API_KEY');
+  keysInUse.jwt = keyFor(config.streamElements.jwtToken, 'streamElements.jwtToken', null);
 }
 
-async function persist() {
+// Saves the settings: one save at a time, each writing what is true when it starts, so a
+// burst of commands costs at most one save running and one waiting. Never rejects.
+let saveChain = Promise.resolve();
+let saveWaiting = false;
+function persist() {
+  if (saveWaiting) return saveChain;
+  saveWaiting = true;
+  saveChain = saveChain
+    .then(() => { saveWaiting = false; return saveConfig(); })
+    .catch((err) => { log(`config.json: a save went wrong${errorCode(err)}`); });
+  return saveChain;
+}
+
+async function saveConfig() {
+  // First, before anything is written: a sidecar whose config.json was refused writes
+  // neither config.json nor config.json.tmp, and removes neither (the temp file a crash left
+  // may be the whole copy configWarning names).
+  if (configLoadProblem) {
+    if (!saveRefusedLogged) { saveRefusedLogged = true; log('config.json is not saved while it does not load (see the warning above)'); }
+    return;
+  }
+  if (configEditedByHand) return;
   // autoStart persists the CURRENT polling intent so a sidecar restart resumes.
-  const out = { ...config, autoStart: polling };
-  try { await writeFile(CONFIG_PATH, JSON.stringify(out, null, 2), 'utf-8'); }
-  catch (err) { log(`Could not persist config: ${err.message}`); }
+  const text = JSON.stringify({ ...config, autoStart: polling }, null, 2);
+  try {
+    await writeFlushed(TMP_PATH, text);
+    // Row 5.4: a hand edit since the last read or write is left as it is.
+    if (stopForHandEdit()) return;
+    if (!(await replaceConfig(text))) return; // a hand edit, seen before the in-place write
+    configMayBeCut = false; // config.json is whole: renamed into place, or written in place
+    configStamp = fileStamp();
+    if (configWarnings.delete('write')) { log('config.json saved again'); pushStatus(); }
+  } catch (err) {
+    warnConfig('write', `config.json could not be saved${errorCode(err)}; the sidecar tries again on the next change`);
+    pushStatus();
+  } finally {
+    // The temp file goes, unless config.json may be cut short (a write in place failed,
+    // in this save or an earlier one, and no save has written it whole since): the temp
+    // file is then the one whole copy of the settings, and is kept. The next save writes it
+    // again and renames it as usual; a restart before that refuses the cut-short
+    // config.json and names the copy (R3).
+    if (!configMayBeCut) await rm(TMP_PATH, { force: true }).catch(() => {});
+  }
+}
+
+async function writeFlushed(path, data) {
+  const fh = await open(path, 'w');
+  try {
+    await fh.writeFile(data);
+    await fh.sync();
+  } finally {
+    await fh.close();
+  }
+}
+
+// Row 5.4: true when config.json was edited by hand since the sidecar last read or wrote
+// it. Saving then stops until a restart, and configWarning says so.
+function stopForHandEdit() {
+  if (!editedSince()) return false;
+  configEditedByHand = true;
+  warnConfig('handEdit', CONFIG_HAND_EDIT_MESSAGE);
+  pushStatus();
+  return true;
+}
+
+// The temp file renamed over config.json, tried again while another program holds the
+// file. If the rename keeps failing, config.json is written in place, and its old bytes
+// are put back if that fails too; a failed write in place sets configMayBeCut, since its
+// open may have emptied the file. False when a hand edit stopped it before the in-place
+// write: the file was held through every rename, which is when an editor saving it holds
+// it, so it is looked at again first (row 5.4).
+async function replaceConfig(text) {
+  for (let i = 1; ; i++) {
+    try {
+      await rename(TMP_PATH, CONFIG_PATH);
+      return true;
+    } catch (err) {
+      if (!LOCK_CODES.has(err?.code)) throw err;
+      if (i >= RENAME_TRIES) break;
+      await sleep(RENAME_RETRY_MS);
+    }
+  }
+  if (stopForHandEdit()) return false;
+  let original = null;
+  try { original = await readFile(CONFIG_PATH); } catch { /* nothing to put back */ }
+  try {
+    await writeFlushed(CONFIG_PATH, text);
+  } catch (err) {
+    configMayBeCut = true; // saveConfig keeps the temp file
+    if (original) { try { await writeFlushed(CONFIG_PATH, original); } catch { /* left as it is */ } }
+    throw err;
+  } finally {
+    // Whatever config.json now holds (the save, the old bytes put back, or a file the
+    // failed write cut short) is the sidecar's own doing, so the next save does not take
+    // it for a hand edit: it tries again, and writes the file whole.
+    configStamp = fileStamp();
+  }
+  return true;
+}
+
+// config.json's size and modified time; null when it does not exist; undefined when it
+// cannot be looked at.
+function fileStamp() {
+  try {
+    const s = statSync(CONFIG_PATH);
+    return { size: s.size, mtimeMs: s.mtimeMs };
+  } catch (err) {
+    return err?.code === 'ENOENT' ? null : undefined;
+  }
+}
+
+// Whether config.json has changed since the sidecar last read or wrote it: made, removed,
+// or a size or modified time of its own.
+function editedSince() {
+  const now = fileStamp();
+  if (now === undefined || configStamp === undefined) return false;
+  if (now === null || configStamp === null) return now !== configStamp;
+  return now.size !== configStamp.size || now.mtimeMs !== configStamp.mtimeMs;
 }
 
 function strOrNull(v) {
@@ -573,7 +1086,7 @@ async function pollOnce({ oneOff = false } = {}) {
     } else {
       platformName = platform;
       consecutiveErrors++;
-      lastError = err?.message || String(err);
+      lastError = errorText(err); // every key redacted (row 5.3)
       lastPollAt = new Date().toISOString();
       log(`poll failed (${consecutiveErrors}x): ${lastError}`);
     }
@@ -662,7 +1175,7 @@ async function fetchCurrent(url, signal) {
   if (!platform) throw new Error(`Unrecognized tournament URL: ${url}`);
   const id = platform.parseId(url);
   if (!id) throw new Error(`${platform.displayName}: could not parse a tournament id from that URL`);
-  return platform.fetchTicker(id, config, url, signal);
+  return platform.fetchTicker(id, adapterConfig(), url, signal);
 }
 
 // The other half of the slow source: a stub fixture may make its poll fail as a site
@@ -793,7 +1306,7 @@ function buildPayload(result, url, platform) {
     tournament: {
       name: result.tournamentName || '',
       platform,
-      url,
+      url: shownUrl(url), // a key in it redacted (row 5.3)
       state: result.state || 'in_progress',
     },
     generatedAt: stampNow(),
@@ -824,7 +1337,7 @@ function messageBlock() {
 function blankPayload() {
   return {
     type: 'ticker:update',
-    tournament: { name: '', platform: platformName, url: config.tournamentUrl, state: 'in_progress' },
+    tournament: { name: '', platform: platformName, url: shownUrl(config.tournamentUrl), state: 'in_progress' },
     generatedAt: stampNow(),
     matches: [],
     standings: [],
@@ -929,7 +1442,10 @@ function applyOptions() {
 // the rule for each reading is milestoneStep below. Polls are chained: the next is
 // timed from the end of the last, so two never overlap.
 
-const SE_BASE = process.env.ZIPPER_SE_BASE || 'https://api.streamelements.com';
+// ZIPPER_SE_BASE points the StreamElements requests, token and all, at another address:
+// a test hook (the verify suite's StreamElements mock), honoured only with
+// ZIPPER_ALLOW_STUB=1, so no setting on a normal install can send the token elsewhere.
+const SE_BASE = (STUB_ALLOWED && process.env.ZIPPER_SE_BASE) || 'https://api.streamelements.com';
 
 const SE_METRICS = {
   followers: { keys: ['follower-total'], text: (n) => `${n} followers — thank you!` },
@@ -980,7 +1496,7 @@ function seChannelFromJwt(jwt) {
 }
 
 function seConfigured() {
-  return !!config.streamElements.jwtToken
+  return !!keysInUse.jwt
     && Object.values(config.milestones).some((step) => step > 0);
 }
 
@@ -991,14 +1507,14 @@ function seConfigured() {
 // starts (an earlier flag and an earlier clear could never be reached, and are gone).
 function startSePolling() {
   if (!seConfigured()) return;
-  const channel = seChannelFromJwt(config.streamElements.jwtToken);
+  const channel = seChannelFromJwt(keysInUse.jwt);
   if (!channel) { seLastError = 'Could not read the channel id from the StreamElements JWT'; log(seLastError); return; }
   const run = async () => {
     seTimer = null;
     try {
       await pollSe(channel);
     } catch (e) {
-      seLastError = e?.message || String(e);
+      seLastError = errorText(e); // every key redacted (row 5.3)
       log(`SE poll failed: ${seLastError}`);
     } finally {
       seTimer = setTimeout(run, config.streamElements.pollSeconds * 1000);
@@ -1020,7 +1536,7 @@ function seCounterValue(entry) {
 // this poll after 10 s, naming the host, instead of holding it for minutes.
 async function pollSe(channel) {
   const res = await guardedFetch(`${SE_BASE}/kappa/v2/sessions/${channel}`, {
-    headers: { Authorization: `Bearer ${config.streamElements.jwtToken}`, Accept: 'application/json' },
+    headers: { Authorization: `Bearer ${keysInUse.jwt}`, Accept: 'application/json' },
   });
   if (!res.ok) {
     throw new Error(`StreamElements ${res.status}${res.status === 401 ? ' — JWT invalid or expired' : ''}`);
@@ -1351,7 +1867,9 @@ function scheduleSbReconnect() {
 let pushSeq = 0;
 function pushUpdate(payload) {
   const seq = ++pushSeq;
-  sendJob('Ticker Push', 'push', { tickerPayload: JSON.stringify(payload) }, pushMatch(payload.generatedAt)).then((outcome) => {
+  // Sent with every key in the caps and the message replaced by its label (R6); the
+  // payload kept (lastPayload) stays as typed.
+  sendJob('Ticker Push', 'push', { tickerPayload: JSON.stringify(shownPayload(payload)) }, pushMatch(payload.generatedAt)).then((outcome) => {
     if (seq !== pushSeq) return; // a newer push has been made: its outcome counts, not this one's
     if (outcome === 'queued') {
       pushOwed = false;
@@ -1391,7 +1909,7 @@ function statusSnapshot(seq) {
     type: 'ticker:status',
     seq,
     polling,
-    url: config.tournamentUrl,
+    url: shownUrl(config.tournamentUrl), // a key in it redacted (row 5.3)
     platform: platformName,
     lastPollAt,
     // When the next poll runs (ZIP-13): the interval, the backoff, a Retry-After or the
@@ -1403,11 +1921,16 @@ function statusSnapshot(seq) {
     // "Ticker Push not found" or "Ticker Announce not found", from the sidecar's own sends,
     // until that action answers ok (row 4.2); "" otherwise.
     actionNotice: actionNotice(),
+    // A config.json that did not load, a saved logo dropped, a refused key, saves stopped
+    // after a hand edit, or a failed write (rows 5.1 to 5.4); "" otherwise. A good poll
+    // and setUrl never clear it.
+    configWarning: configWarning(),
     intervalMs: config.pollIntervalMs,
     maxItems: config.maxItems,
     topN: config.topN,
-    caps: { ...config.caps },
-    message: { ...config.message },
+    // A key typed into the caps or the message redacted (R6); config keeps it as typed.
+    caps: shownCaps(config.caps),
+    message: shownMessage(config.message),
     // Auto-scheduling snapshot: what the last poll said about the event and
     // what the scheduler is doing about it (docs/PROTOCOL.md).
     auto: {
@@ -1464,8 +1987,13 @@ function dispatch(command, value) {
   // "__STATUS" reported as unknown, that report would push a status, which echoes.
   const folded = command.toLowerCase();
   if (folded === '__status') return;
-  const shown = shownName(command);
-  log(`command: ${shown}${value ? ' ' + value.slice(0, 120) : ''}`);
+  // Redacted before it is cut (row 5.3): a key sent as a name is never shown, even in part.
+  const shown = shownName(redact(command));
+  // The status probe, which every open control page sends every 10 s, is not logged
+  // (row 5.2: about 8,640 lines a day per page in the log file). The value is redacted
+  // before it is cut to 120 characters (row 5.3), so the cut can fall only inside a
+  // label, never inside a key: redact() matches a cut key only by 8 characters or more.
+  if (folded !== 'status') log(`command: ${shown}${value ? ' ' + redact(value).slice(0, 120) : ''}`);
   const name = COMMANDS.get(folded);
   if (!name) { refuse(`unknown command "${shown}" — ignored`); return; }
   if (name !== 'status') commandNotice = ''; // an accepted command clears the last notice
@@ -1656,28 +2184,74 @@ function dispatch(command, value) {
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
+// One line, every key in it redacted (row 5.3), to the console and appended to the log file
+// (row 5.2). The file write is synchronous, so a line logged just before process.exit is in
+// the file; the console write stays as Node makes it (not blocking on a console window,
+// which a console in QuickEdit mode would freeze). It never throws: the log is a help,
+// never a reason to stop.
+let logTrims = false; // set once this instance holds the guard port, or runs without it
 function log(msg) {
-  console.log(`[${new Date().toISOString()}] [zipper] ${msg}`);
+  try {
+    const line = `[${new Date().toISOString()}] [zipper] ${redact(msg)}`;
+    try { console.log(line); } catch { /* no console */ }
+    try { appendFileSync(LOG_PATH, `${line}\n`, 'utf-8'); } catch { /* no log file */ }
+    if (logTrims) trimLog();
+  } catch { /* nothing to do */ }
+}
+
+// Only the instance that keeps running trims the log (row 5.2): at start, and after any
+// line that takes it past LOG_MAX_BYTES (while Streamer.bot is down a line is logged on
+// every reconnect). A second launch only adds its one line, the guard port's.
+function trimLog() {
+  try {
+    if (statSync(LOG_PATH).size <= LOG_MAX_BYTES) return;
+    renameSync(LOG_PATH, LOG_OLD_PATH);
+  } catch {
+    return;
+  }
+  log(`the log passed ${LOG_MAX_BYTES / 1048576} MB: the lines before this one are in ${basename(LOG_OLD_PATH)}`);
+}
+
+// The crash handlers (row 5.2): the error is logged, to the file too, and the sidecar exits
+// non-zero, as Node would, but with a line where a hidden launch can show nothing.
+function onCrash(kind) {
+  return (err) => {
+    log(`crash: ${kind}: ${err?.stack || err?.message || String(err)}. The sidecar stops; start it again (start-zipper.bat, or the Ticker Sidecar Start action).`);
+    process.exit(1);
+  };
 }
 
 function acquireGuard() {
   return new Promise((res) => {
-    const guard = createServer();
+    // A connection to the guard port (a launcher checking it, say) is closed at once, and
+    // its socket's errors are ignored, so it cannot raise an unhandled error.
+    const guard = createServer((socket) => { socket.on('error', () => {}); socket.destroy(); });
     guard.once('error', (err) => {
       if (err.code === 'EADDRINUSE') {
-        log(`Another Zipper sidecar is already running (guard port :${GUARD_PORT}) — exiting.`);
+        log(`Another Zipper sidecar is already running (guard port ${GUARD_PORT} is in use), so this one exits. If none is running, another program holds that port: set ZIPPER_GUARD_PORT to a free one.`);
         process.exit(0);
       }
       log(`guard port error: ${err.message} — continuing without the single-instance guard`);
       res();
     });
-    guard.listen(GUARD_PORT, '127.0.0.1', () => res());
+    guard.listen(GUARD_PORT, '127.0.0.1', () => { guardHeld = true; guard.on('error', () => {}); res(); });
   });
 }
 
 async function main() {
-  log(`Zipper sidecar starting (config: ${CONFIG_PATH})`);
+  // First, before the guard and the config (row 5.2).
+  process.on('uncaughtException', onCrash('an uncaught exception'));
+  process.on('unhandledRejection', onCrash('an unhandled promise rejection'));
   await acquireGuard();
+  // From here this instance runs (with the guard port, or without it when the port could
+  // not be opened): it trims the log (the line below is the first to, so a log already over
+  // the limit is trimmed at start). Only with the guard port does it remove a temp file a
+  // crash left (loadConfig).
+  logTrims = true;
+  log(`Zipper sidecar starting (config: ${CONFIG_PATH}; log: ${LOG_PATH})`);
+  // The limits in effect: the full ones on a normal install, whatever the test settings say
+  // (they apply only with ZIPPER_ALLOW_STUB=1).
+  log(`limits: ${seconds(requestTimeoutMs())} per request, ${seconds(pollDeadlineMs)} per poll, ${seconds(minPollGapMs)} between polls, ${seconds(pushRetryMs)} before an owed push is retried${STUB_ALLOWED ? ' (ZIPPER_ALLOW_STUB=1: the test settings apply)' : ''}`);
   await loadConfig();
   connectSb();
   startSePolling();

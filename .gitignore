@@ -1,5 +1,9 @@
 # Local config (API keys, tournament URL, caps) — copy config.example.json to config.json
 config.json
+# The sidecar's save in progress, and its log (with the copy it keeps once trimmed)
+config.json.tmp
+config.log
+config.old.log
 
 node_modules/
 test-render*.png

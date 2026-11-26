@@ -46,8 +46,10 @@ for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGBREAK']) process.on(sig, (
 
 let browser = null;
 try {
+  // Without the API keys a developer may have set: the mock needs none.
+  const mockEnv = Object.fromEntries(Object.entries(process.env).filter(([k]) => !['CHALLONGE_API_KEY', 'STARTGG_API_KEY'].includes(k.toUpperCase())));
   mock = spawn(process.execPath, [resolve(ROOT, 'mock-sb-server.mjs')], {
-    env: { ...process.env, SB_HTTP_PORT: String(HTTP_PORT), SB_WS_PORT: String(WS_PORT), MOCK_EXIT_WITH_PARENT: '1', MOCK_ARG_BLEED: '' },
+    env: { ...mockEnv, SB_HTTP_PORT: String(HTTP_PORT), SB_WS_PORT: String(WS_PORT), MOCK_EXIT_WITH_PARENT: '1', MOCK_ARG_BLEED: '' },
     stdio: ['pipe', 'pipe', 'pipe'],
   });
   let mockOut = '';

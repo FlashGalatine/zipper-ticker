@@ -102,7 +102,8 @@ Rules:
   [What the sidecar pushes](#what-the-sidecar-pushes)).
 - `ticker:announce` still interrupts it — announcements cover the strip for
   their duration and the message resumes.
-- Persisted in `config.json` (`message`), so it survives a sidecar restart.
+- Persisted in `config.json` (`message`), so it survives a sidecar restart
+  (unless saving has stopped: see `configWarning`).
 
 ## ticker:status
 
@@ -112,7 +113,7 @@ reserved command `__status` with the status JSON as `value`:
 
 ```json
 { "type": "ticker:command", "command": "__status",
-  "value": "{\"type\":\"ticker:status\",\"seq\":42,\"polling\":true,\"url\":\"…\",\"platform\":\"challonge\",\"lastPollAt\":\"…\",\"nextPollAt\":\"…\",\"lastError\":\"\",\"commandNotice\":\"\",\"actionNotice\":\"\",\"intervalMs\":30000,\"maxItems\":20,\"caps\":{…}}" }
+  "value": "{\"type\":\"ticker:status\",\"seq\":42,\"polling\":true,\"url\":\"…\",\"platform\":\"challonge\",\"lastPollAt\":\"…\",\"nextPollAt\":\"…\",\"lastError\":\"\",\"commandNotice\":\"\",\"actionNotice\":\"\",\"configWarning\":\"\",\"intervalMs\":30000,\"maxItems\":20,\"caps\":{…}}" }
 ```
 
 The sidecar ignores its own `__status` echo, in any casing; the control page
@@ -155,6 +156,79 @@ of each one, and the control page ignores it.
   notice a newer push's refusal set. The control page shows it in its status
   line. "Ticker Command not found" cannot travel here, since the status itself
   goes through `Ticker Command`: the sidecar logs it instead.
+- `configWarning` — what is wrong with the sidecar's settings, in fixed words
+  that never quote the file or a key; `""` when nothing is. Each of these,
+  joined by ` · ` when more than one applies:
+  - `config.json is not valid JSON (line N)` (the line is left out when V8 gives
+    no position), `config.json could not be read`, `config.json does not hold
+    a JSON object`, `config.json is saved as UTF-16; save it as UTF-8` (a file
+    that starts with a UTF-16 byte-order mark, `FF FE` or `FE FF`, or without one
+    has a NUL as every second byte at its start), `config.json is empty` (no
+    bytes, or only white space once a UTF-8 byte-order mark is stripped), or
+    `config.json is not saved as UTF-8; save it as UTF-8` (bytes that are not
+    valid UTF-8, such as a file saved as ANSI with an accented letter in it; a
+    file of plain ASCII saved as ANSI is valid UTF-8, so it loads),
+    each followed by `; the sidecar runs on its defaults and saves nothing until the
+    file is fixed and the sidecar restarted`. Such a file is never written over,
+    and keys from the environment are not used either while it is broken. The
+    same tail follows `config.json is missing`, which is said only when there is
+    no `config.json` but `config.json.tmp` holds a whole copy of the settings:
+    the example is then not copied in, and nothing is saved.
+  - `a whole copy of the settings is in config.json.tmp`, after one of the
+    sentences above, when the temp file a save writes before renaming it over
+    `config.json` was left behind and parses to a JSON object: a crash between
+    the write and the rename leaves it, and so does a save whose write in place
+    failed (below), which can leave `config.json` cut short. While `config.json`
+    is refused the sidecar keeps that file as it is, writes nothing, and says
+    nothing about a temp file that is not whole; it removes the temp file at
+    start only once `config.json` has loaded, and only when it holds its
+    single-instance guard port (one that goes on without it, because the port
+    could not be opened, leaves the file alone). To recover, fix or replace
+    `config.json` (for example: delete the broken one and rename
+    `config.json.tmp` to `config.json`), then restart the sidecar.
+  - `<field> in config.json contains a space, a line break or another character
+    that cannot be part of a key, so it is not used. Paste it again.` (for
+    `challongeApiKey`, `startggApiKey` or `streamElements.jwtToken`), or the same
+    for `CHALLONGE_API_KEY (environment variable)` or `STARTGG_API_KEY
+    (environment variable)`. A key must be printable ASCII.
+  - `config.json: the saved logo was dropped (…)`, for a saved logo that breaks
+    the rule under `setCapsLogo` below.
+  - `config.json was edited while the sidecar was running, so the sidecar no
+    longer saves it; …`: the sidecar reads `config.json` only when it starts, and
+    leaves a hand edit made while it runs as it is (a file deleted meanwhile
+    counts as edited, and is not made again).
+  - `config.json could not be saved (<code>); …`, which the next good save clears.
+    When the rename over `config.json` keeps failing (another program holds it),
+    the save writes the file in place; if that write fails too, `config.json`
+    may be left cut short, so `config.json.tmp`, which holds the settings whole,
+    is kept until a save writes `config.json` whole again. A restart before then
+    refuses the cut-short `config.json` and names the copy.
+
+  Only a restart clears the others. A good poll and a `setUrl` never clear it.
+  The control page shows it in its status line.
+
+A key value in `lastError`, the StreamElements
+error, `commandNotice` or `url` (and in the sidecar's log, and in the
+`tournament.url` of every `ticker:update` it pushes) is replaced by a label such
+as `[Challonge key]`, `[start.gg key]` or `[StreamElements token]`. The sidecar
+keeps the URL as it was set, key and all, and so does `config.json`. Only the
+keys in `config.json` and the two environment variables are known, and only
+at 8 characters or more: a different key pasted inside a URL is not replaced,
+and a site's answer that an adapter cut off inside a key can keep its first 1
+to 7 characters. A key typed into the caps text, the caps logo or the message
+text is replaced by its label too, in the status (`caps` and `message.text`)
+and in every `ticker:update` the sidecar pushes (`caps` and `message.lines`).
+A payload Streamer.bot stored from an older version is replayed as it was
+stored until the sidecar's next push. In a logo address
+it is replaced as typed and as a URL encodes it. The sidecar keeps what was
+typed, and so does `config.json`. The commands themselves are not changed:
+Streamer.bot broadcasts each `ticker:command` to every client of the bus as it
+was sent, so a key typed into the caps, the message or the URL still crosses
+the bus once, in that command. A caps text cut at 120 characters, a logo cut
+at 500, or a message cut at 1000, can keep the first 1 to 7 characters of a
+key the cut fell inside. The control page fills its boxes from the status, so they show
+the label, and applying them again (the message's checkbox too) saves the
+label in place of the key.
 
 The status carries an `auto` block describing the auto-scheduler (see
 `setAutoSchedule` below):
@@ -350,7 +424,7 @@ passed as they are. An unknown name is ignored and reported in the status's
 | `setMessageText` | string (≤1000 chars, `\n`-separated lines) | message text (single-field; for chat / Stream Deck) |
 | `setMessageEnabled` | `on`/`off` (also `true`/`false`, `1`/`0`, `yes`) | show the message instead of results |
 | `setCapsText` | string (≤120 chars)            | right-cap static text (single-field; for chat / Stream Deck) |
-| `setCapsLogo` | an http(s) URL, or a path on the overlay's server (≤500 chars; empty = no logo) | left-cap logo image (single-field). Anything else — `data:`, `file:`, `javascript:`, `//host`, `\\host` — is refused: the old logo stays and `commandNotice` says why. A saved logo that breaks this rule is dropped when `config.json` loads |
+| `setCapsLogo` | an http(s) URL, or a path on the overlay's server (≤500 chars; empty = no logo) | left-cap logo image (single-field). Anything else — `data:`, `file:`, `javascript:`, `//host`, `\\host` — is refused: the old logo stays and `commandNotice` says why. A saved logo that breaks this rule is dropped when `config.json` loads, and `configWarning` says so |
 | `setInterval` above, `setMaxItems`, `setTopN` | see below | single-field variants |
 | `setMaxItems` | 1–100                          | ticker item cap; a change is rebuilt from the last result and pushed at once (after a fetch, when nothing is kept yet or the URL changed since) |
 | `setTopN`     | 0–100 (0 = off)                | only show matches involving the top-N placed participants (needs platform standings — start.gg always; Challonge via `final_rank` on the keyed API for your own tournaments, or derived from elimination order on finished brackets when scraping; also trims the standings crawl to N); a change is rebuilt from the last result and pushed at once (after a fetch, when nothing is kept yet or the URL changed since) |
@@ -410,7 +484,8 @@ Midnight Velvet goal meter). Each milestones entry is a step size — e.g.
 you!"). `0` disables a metric. The first successful poll only records the
 current thresholds (no announcement blast when you first configure it), and
 announced thresholds persist in `config.json` (`milestoneState`) so restarts
-don't repeat them. **The JWT never travels the bus** — `ticker:status` carries
+don't repeat them (while saving has stopped, see `configWarning`, they are
+not saved, and a restart can repeat one). **The JWT never travels the bus** — `ticker:status` carries
 only `se: { configured, lastPollAt, lastError }`.
 
 - **A threshold moves on only once its announcement was queued** by
@@ -480,7 +555,17 @@ The tests shorten the poll loop's limits with `ZIPPER_REQUEST_TIMEOUT_MS` (10 s
 per request), `ZIPPER_POLL_DEADLINE_MS` (45 s per poll) and
 `ZIPPER_MIN_POLL_GAP_MS` (15 s between polls), and the wait before an owed
 push is retried with `ZIPPER_PUSH_RETRY_MS` (30 s). Each is clamped, so it can
-only shorten its limit. `ZIPPER_PUSH_RETRY_MS` works only with
-`ZIPPER_ALLOW_STUB=1`: without it the wait stays 30 s whatever the variable
-says, so no setting on a normal install can make a missing `Ticker Push` be
-retried many times a second.
+only shorten its limit, and each works only with `ZIPPER_ALLOW_STUB=1`: without
+it the sidecar keeps the full limits (10 s, 45 s, 15 s and 30 s) whatever the
+variables say, so no setting on a normal install can make it poll a site more
+often, cut a request or a poll short, or retry a missing `Ticker Push` many
+times a second. As it starts, the sidecar logs the limits in effect, for
+example `limits: 10 s per request, 45 s per poll, 15 s between polls, 30 s
+before an owed push is retried`.
+
+`ZIPPER_SE_BASE` points the StreamElements requests (`/kappa/v2/sessions/…`,
+with the JWT in their `Authorization` header) at another address instead of
+`https://api.streamelements.com`; the tests point it at their StreamElements
+mock. It works only with `ZIPPER_ALLOW_STUB=1`: without it the sidecar always
+asks `api.streamelements.com`, so no setting on a normal install can send the
+token anywhere else.

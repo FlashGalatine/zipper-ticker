@@ -124,7 +124,53 @@ Start` action above lets Streamer.bot launch it for you.
 
 Copy `config.example.json` → `config.json` for API keys (optional but
 recommended: `challongeApiKey`, `startggApiKey` — without them Zipper falls
-back to each site's public/keyless surface, which can be less reliable).
+back to each site's public/keyless surface, which can be less reliable). The
+sidecar copies it for you when `config.json` is missing. A key can also come
+from the `CHALLONGE_API_KEY` or `STARTGG_API_KEY` environment variable, used
+when `config.json` has none; the sidecar never writes it into `config.json`.
+A key in `config.json` wins over the environment's, so a key an older version
+of Zipper copied there from the environment overrides the variable until you
+remove it from the file.
+
+**Edit `config.json` with the sidecar stopped, or restart the sidecar
+afterwards.** It reads the file only when it starts. An edit made while it runs
+is not loaded until the restart, and the sidecar leaves it as it is: it stops
+saving the file until then (so a setting changed on the control page meanwhile
+lasts only until the restart), and from the first save it skips the control
+page shows a config warning.
+
+If `config.json` has a mistake in it (a trailing comma, a missing quote), is
+saved as UTF-16 (Windows PowerShell's `>` and plain `Out-File` do that), is
+empty, or is not saved as UTF-8 (an editor that saves as ANSI does that when
+the file has an accented letter in it), the sidecar does not touch the file: it
+runs on its built-in settings, without the keys from the file or from the
+environment, saves nothing, and the control page shows a warning such as
+"config.json is not valid JSON (line 4)", "config.json is saved as UTF-16; save
+it as UTF-8", "config.json is empty" or "config.json is not saved as UTF-8;
+save it as UTF-8". A file of plain ASCII saved as ANSI loads.
+Fix or replace the file, then restart the sidecar. If the warning adds "a whole
+copy of the settings is in config.json.tmp", a save was cut short (by a crash,
+or by another program locking `config.json` while the sidecar wrote it) and left
+that file, holding the settings it was saving. To use it, delete or rename the
+broken `config.json`, rename `config.json.tmp` to `config.json`, then restart.
+If `config.json` is missing while such a copy is there, the sidecar does not
+copy the example in and says "config.json is missing": rename the copy to
+`config.json` the same way, or delete `config.json.tmp` to start from the
+example, then restart. A key with a space
+or a line break inside it is not used either, and the warning names it; paste
+it again.
+
+The sidecar writes what it does to `config.log`, beside `config.json`; once that
+passes 1 MB it is moved to `config.old.log` and started again. The keys
+in `config.json` and in the two environment variables (8 characters or more)
+are replaced by a label there, such as `[start.gg key]`. The sidecar saves `config.json` by writing a
+new file over it, so a hard or symbolic link to the old file, or permissions set on
+the file itself, are not kept. If the sidecar stops by itself, the reason is the last line there.
+
+After upgrading from a version older than 1.0.24, press **Set** or **Poll now**
+once. Streamer.bot keeps the last payload it was sent and replays it to the
+overlay; one new push replaces a copy stored by an older version, which did not
+replace keys by labels.
 
 ### 5. Drive it
 
@@ -186,8 +232,9 @@ tournament needs to be set, so it doubles as a plain message ticker. From chat:
 - **Milestones:** put your StreamElements JWT in `config.json`
   (streamelements.com → account → Channel settings → Show secrets) and set step
   sizes, e.g. `"milestones": { "followers": 100, "subs": 25 }` — the ticker
-  announces every time a counter crosses a step. The token stays in the file;
-  it is never broadcast.
+  announces every time a counter crosses a step. Edit the file with the sidecar
+  stopped, or restart it afterwards (see step 4). The token stays in the file;
+  it is never broadcast, and never written to the log.
 - **Manual:** the control page's Announcement box sends anything you type.
 
 ## Platform notes

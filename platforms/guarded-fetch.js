@@ -39,8 +39,10 @@ export const BROWSER_USER_AGENT = `Mozilla/5.0 (compatible; Zipper/${version})`;
 
 // A test override of one of the sidecar's limits (ZIPPER_REQUEST_TIMEOUT_MS here; the
 // sidecar reads its own three the same way: ZIPPER_POLL_DEADLINE_MS, ZIPPER_MIN_POLL_GAP_MS
-// and, only with ZIPPER_ALLOW_STUB=1, ZIPPER_PUSH_RETRY_MS). It can only shorten the limit:
-// the value is clamped to min..fallback, and unset or not a number gives the fallback.
+// and ZIPPER_PUSH_RETRY_MS). It can only shorten the limit: the value is clamped to
+// min..fallback, and unset or not a number gives the fallback. Each of the four is a test
+// setting, honoured only with ZIPPER_ALLOW_STUB=1 (the owner's ruling of 2026-11-26 for the
+// three poll-loop limits): each caller checks that before it asks here.
 export function envLimit(name, fallback, min) {
   const raw = process.env[name];
   if (raw == null || String(raw).trim() === '') return fallback;
@@ -49,8 +51,11 @@ export function envLimit(name, fallback, min) {
   return Math.max(min, Math.min(fallback, n));
 }
 
+// The limit on each request: the full 10 s, or, only when the process was started with
+// ZIPPER_ALLOW_STUB=1 (the verify suite sets it; a normal install never does), what
+// ZIPPER_REQUEST_TIMEOUT_MS asks for. Read at each call.
 export function requestTimeoutMs() {
-  return envLimit('ZIPPER_REQUEST_TIMEOUT_MS', REQUEST_TIMEOUT_MS, 50);
+  return process.env.ZIPPER_ALLOW_STUB === '1' ? envLimit('ZIPPER_REQUEST_TIMEOUT_MS', REQUEST_TIMEOUT_MS, 50) : REQUEST_TIMEOUT_MS;
 }
 
 // "10 s", "0.3 s", "16 MB": how a limit reads in an error.
