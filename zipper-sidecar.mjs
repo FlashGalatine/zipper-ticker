@@ -11,6 +11,12 @@
 //             command "__status" (value = status JSON); the control page
 //             unwraps it and the sidecar ignores its own echo. No third SB
 //             action needed.
+//             Every DoAction goes through one send queue (see "send queue"): one in
+//             flight, the next once its reply and its own broadcast are both in, or
+//             after 800 ms; a send's outcome waits for its reply up to 5 s. When the
+//             newest push is not queued it is owed, and the current payload is pushed
+//             when the sidecar next connects (ZIP-09), or, while it stays connected, again
+//             30 s later and on the control page's next status request.
 //   inbound   subscribes to General.Custom and consumes
 //             { type:'ticker:command', command, value } broadcasts emitted by
 //             the control page via the "Ticker Command" action.
@@ -20,12 +26,17 @@
 //           setMessageText, setMessageEnabled, setAutoSchedule, status.
 //           Names match without regard to case. An unknown or refused command is
 //           reported in the status's commandNotice (docs/PROTOCOL.md).
+//           A new URL pushes a blank payload at once, caps and message kept
+//           (decision 5). Cap and option changes push at once, polling or not, from
+//           the last result the sidecar keeps (ZIP-14).
 //
 // Auto-scheduling (config.autoSchedule, default ON): API calls are only spent
 // while the event is actually running. A poll that comes back `completed`
 // pushes the final payload and then stops polling; one that comes back
-// `upcoming` sleeps until the platform's advertised start time (slow re-check
-// when it has none) and resumes normal polling once the event goes live.
+// `upcoming` checks again every 15 minutes (or at the poll interval, if that is
+// longer) until the platform's advertised start time, so a bracket started early
+// is picked up (slow re-check when it has no start time), and resumes normal
+// polling once the event goes live.
 //
 // The poll loop (see "Poll loop" below): one poll at a time, 45 s at most for a
 // poll and 10 s for each request in it (platforms/guarded-fetch.js), at least
@@ -52,10 +63,11 @@
 // Env:  SB_WS_URL (default ws://127.0.0.1:8080/) · ZIPPER_GUARD_PORT (7496)
 //       ZIPPER_CONFIG (config file path override)
 //       ZIPPER_ALLOW_STUB=1 (tests only: turns on stub: URLs and, in a stub file, the
-//       test keys stubHoldFile, stubHoldIgnoresAbort and stubFail)
+//       test keys stubHoldFile, stubHoldIgnoresAbort and stubFail, and lets
+//       ZIPPER_PUSH_RETRY_MS shorten the 30 s before an owed push is retried)
 //       ZIPPER_REQUEST_TIMEOUT_MS, ZIPPER_POLL_DEADLINE_MS, ZIPPER_MIN_POLL_GAP_MS
-//       (tests only: shorten the 10 s per request, the 45 s per poll and the 15 s
-//       between polls; each is clamped, so it can only shorten its limit)
+//       (tests only: shorten the 10 s per request, the 45 s per poll and the 15 s between
+//       polls; each is clamped, so it can only shorten its limit)
 
 import { readFile, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
@@ -114,7 +126,23 @@ const minPollGapMs = envLimit('ZIPPER_MIN_POLL_GAP_MS', MIN_POLL_GAP_MS, 0);
 const MESSAGE_MAX_CHARS = 1000;
 const MESSAGE_MAX_LINES = 20;
 const WAITING_POLL_MS = 300000; // 5 min re-check while upcoming with no usable start time
-const MAX_WAIT_MS = 6 * 3600000; // longest single sleep while waiting on a start time
+// The longest wait before an upcoming event (row 4.6), so a bracket started early is
+// picked up within it. It never goes below the poll interval: a streamer who set a longer
+// interval to spend fewer calls keeps it. (With no start time the re-check above is
+// already no longer than this.) A choice the plan left open: see the sprint notes.
+const UPCOMING_WAIT_CAP_MS = 15 * 60000;
+// What a timed-out milestone announcement (no reply from Streamer.bot within 5 s, see the
+// send queue) does to the saved threshold (row 4.5, a choice left to the owner). false: it
+// stays, so the next StreamElements poll announces it again (a repeat is possible, a loss
+// is not). A reply that comes after the 800 ms release but within the 5 s settles it.
+const MILESTONE_ADVANCES_ON_TIMEOUT = false;
+// A push that was not queued is owed (ZIP-09). Besides the next connect, it is pushed again
+// this long after, while the socket stays open: Streamer.bot keeps the connection when the
+// missing Ticker Push is added, so no reconnect would come to pay it. The tests shorten it,
+// and only with ZIPPER_ALLOW_STUB=1: a normal install keeps the 30 s, so no setting can make
+// a missing Ticker Push be retried many times a second.
+const PUSH_RETRY_MS = 30000;
+const pushRetryMs = STUB_ALLOWED ? envLimit('ZIPPER_PUSH_RETRY_MS', PUSH_RETRY_MS, 50) : PUSH_RETRY_MS;
 
 let config = {
   challongeApiKey: null,
@@ -138,8 +166,12 @@ let config = {
   streamElements: { jwtToken: null, pollSeconds: 60 },
   milestones: { followers: 0, subs: 0, tips: 0, cheers: 0 },
   milestoneState: {}, // last announced threshold per metric (persisted)
-  // Auto-scheduling: stop polling when the event completes; while it hasn't
-  // started, sleep until the platform's start time instead of burning API calls.
+  // The StreamElements key each metric's value was last read from (persisted), so a subs
+  // reading from the other key is recorded silently instead of taken as a drop (ZIP-16).
+  milestoneKeys: {},
+  // Auto-scheduling: stop polling when the event completes; while it hasn't started,
+  // check only every 15 minutes (or at the interval, if longer) until the platform's
+  // start time instead of burning API calls.
   autoSchedule: true,
   autoStart: false,
 };
@@ -156,14 +188,27 @@ let lastPollAt = null;
 let lastHash = null;
 let lastPayload = null; // last payload built, so config-only changes (message,
                         // caps) can re-push without waiting for a poll
+// The last good result, with what it was fetched under: { result, gen, url, platform,
+// maxItems, topN }. Option changes rebuild from it (ZIP-14); setUrl drops it.
+let lastRaw = null;
+// Set when the newest push ends any way but "queued" (an older push's outcome counts for
+// nothing, see pushUpdate): the current payload is pushed again when the sidecar next
+// connects to Streamer.bot, or while it stays connected, PUSH_RETRY_MS later and on a
+// `status` command (ZIP-09). A later queued push clears it.
+let pushOwed = false;
+let pushRetryTimer = null;
 let platformName = null;
 let eventState = null; // last fetched tournament state (upcoming/in_progress/completed)
 let eventStartAt = null; // platform's advertised start time (ISO), when it has one
-let waitingUntil = null; // set while auto-scheduling sleeps for the start time
+let waitingUntil = null; // set while auto-scheduling waits before an upcoming event: its next check
 let autoStopped = null; // 'completed' after an automatic stop, for the status line
 let urlGeneration = 0; // ZIP-02: bumped by every accepted setUrl; a poll keeps the one it began under
 let pollAgain = false; // a pollNow or start that arrived while a poll was in flight
 let pollAbort = null; // the AbortController of the poll in flight
+// One fetch outside the poll loop, for a command while polling is off (row 4.3): the
+// timer that waits for the gap, and whether another was asked for while one ran.
+let oneOffTimer = null;
+let oneOffAgain = false;
 // The three times below are on the monotonic clock (monoNow), never the wall clock.
 let lastPollEndedAt = null; // when the last poll ended; the minimum gap runs from here
 let pollDueAt = null; // when the armed poll runs (the status's nextPollAt)
@@ -232,6 +277,8 @@ function adoptConfig(parsed) {
       cheers: clampInt(parsed.milestones?.cheers, 0, 1000000, 0),
     },
     milestoneState: (parsed.milestoneState && typeof parsed.milestoneState === 'object') ? { ...parsed.milestoneState } : {},
+    milestoneKeys: Object.fromEntries(Object.entries((parsed.milestoneKeys && typeof parsed.milestoneKeys === 'object') ? parsed.milestoneKeys : {})
+      .filter(([, k]) => typeof k === 'string')),
     autoSchedule: parsed.autoSchedule === undefined ? true : !!parsed.autoSchedule,
     autoStart: !!parsed.autoStart,
   };
@@ -340,6 +387,7 @@ function startPolling() {
   if (!config.tournamentUrl) { refuse(NO_URL_MESSAGE); return; }
   polling = true;
   autoStopped = null; // manual (re)start always gets one fresh poll
+  cancelOneOff(); // the poll asked for here covers a fetch a command was waiting for
   persist();
   requestPoll(true);
   pushStatus();
@@ -388,13 +436,14 @@ function armPoll(at, why) {
   pollTimer = setTimeout(() => { pollTimer = null; pollDueAt = null; pollDueFor = null; pollOnce(); }, when - now);
 }
 
-// A command asks for a poll: pollNow, start and setUrl (deliberate), and the option
-// commands, which re-poll to rebuild the payload. It runs as soon as the gap and any
-// Retry-After hold allow, skipping the interval and the error backoff; a poll already
-// armed for sooner stands. A deliberate request that arrives while a poll is in flight
-// is kept for after it. An option command's is not: the poll in flight builds its
-// payload with the new options. (Row 4.3 replaces the option re-poll with a rebuild from
-// the last result.) The caller sends the status.
+// A command asks for a poll: pollNow, start and setUrl (deliberate), and, while polling,
+// a cap or option change that has no result to rebuild from or needs more than the last
+// result holds (see refetch). It runs as soon as the gap and any Retry-After hold allow,
+// skipping the interval and the error backoff; a poll already armed for sooner stands. A
+// deliberate request that arrives while a poll is in flight is kept for after it. A
+// command's is not: the poll in flight builds its payload with the new settings (and if
+// its result comes back cut short under the old ones, pollOnce asks again). The caller
+// sends the status.
 function requestPoll(deliberate) {
   if (!polling) return;
   if (pollInFlight) { if (deliberate) pollAgain = true; return; }
@@ -418,11 +467,12 @@ function nextDelay() {
 
 // The one next-delay function: when the next regular poll is due, counted from the end
 // of the last poll, and whether that is auto-scheduling's wait for the event's start.
-// Auto-scheduling spends API calls only while the event is running: upcoming → sleep
-// until the platform's start time (a slow re-check when it has none), so polling
-// resumes by itself once the event goes live. Errors keep the normal backoff, since a
-// failed fetch says nothing about the event state. (A completed event stops polling
-// outright: see afterPoll.)
+// Auto-scheduling spends API calls only while the event is running: upcoming → wait for
+// the platform's start time, checking again at least every UPCOMING_WAIT_CAP_MS (15 min,
+// or the interval when that is longer) so a bracket started early is picked up (a slow
+// re-check when it has no start time), so polling resumes by itself once the event goes
+// live. Errors keep the normal backoff, since a failed fetch says nothing about the event
+// state. (A completed event stops polling outright: see afterPoll.)
 function nextRegularPoll() {
   const now = monoNow();
   const from = lastPollEndedAt ?? now;
@@ -431,9 +481,11 @@ function nextRegularPoll() {
     const startsAt = eventStartAt ? now + (Date.parse(eventStartAt) - Date.now()) : NaN;
     const untilStart = startsAt - from;
     const hasStart = Number.isFinite(untilStart) && untilStart > 0;
-    // MAX_WAIT_MS chunks a far-off start into cheap once-per-6h re-checks (also
-    // catches organisers moving the date). No/passed start time → slow re-check.
-    const wait = hasStart ? Math.min(untilStart, MAX_WAIT_MS) : Math.max(WAITING_POLL_MS, config.pollIntervalMs);
+    // The cap applies to both waits but never goes below the interval, so it binds only
+    // the wait for a start time: the no-start re-check, max(5 min, interval), is never
+    // longer than max(15 min, interval). It also catches organisers moving the date.
+    const cap = Math.max(UPCOMING_WAIT_CAP_MS, config.pollIntervalMs);
+    const wait = Math.min(hasStart ? untilStart : Math.max(WAITING_POLL_MS, config.pollIntervalMs), cap);
     return { at: from + wait, waiting: true, hasStart };
   }
   return { at: from + nextDelay(), waiting: false, hasStart: false };
@@ -462,21 +514,27 @@ function afterPoll() {
   }
   const next = scheduleRegular();
   if (next?.waiting) {
-    log(`event not started — ${next.hasStart ? `sleeping until ${waitingUntil} (start ${eventStartAt})` : `re-checking in ${Math.round((pollDueAt - monoNow()) / 60000)} min (no start time from the platform)`}`);
+    log(`event not started — ${next.hasStart ? `checking again at ${waitingUntil} (start ${eventStartAt})` : `re-checking in ${Math.round((pollDueAt - monoNow()) / 60000)} min (no start time from the platform)`}`);
   }
 }
 
-async function pollOnce() {
-  if (pollInFlight || !polling) return;
+// A poll, or with oneOff a single fetch outside the poll loop (refetch, while polling is
+// off): the same fetch and the same handling of its result, but a one-off neither arms
+// the next poll nor auto-stops polling, so it does not change whether polling is on.
+async function pollOnce({ oneOff = false } = {}) {
+  if (pollInFlight) { if (oneOff) oneOffAgain = true; return; }
+  if (!polling && !oneOff) return;
   pollInFlight = true;
   // What this poll is for, taken before the fetch: a setUrl during it changes these.
   const gen = urlGeneration;
   const url = config.tournamentUrl;
   const platform = platformFor(url);
+  const fetchedWith = { maxItems: config.maxItems, topN: config.topN };
   const ac = new AbortController();
   pollAbort = ac;
   const deadline = setTimeout(() => ac.abort(new Error(`the poll took longer than ${seconds(pollDeadlineMs)} and was stopped`)), pollDeadlineMs);
   let stale = false;
+  let needMore = false; // the result kept was cut short, and a command since asks for more
   try {
     const result = await fetchCurrent(url, ac.signal);
     stale = gen !== urlGeneration;
@@ -491,6 +549,10 @@ async function pollOnce() {
       eventState = result.state || 'in_progress';
       eventStartAt = strOrNull(result.startAt);
       const payload = buildPayload(result, url, platform);
+      // Kept only once it has built: a result that cannot be built fails the poll, and an
+      // option change then rebuilds from the last one that could (row 4.3).
+      lastRaw = { result, gen, url, platform, ...fetchedWith };
+      needMore = wantsMore(lastRaw);
       lastPayload = payload;
       const hash = hashPayload(payload);
       if (hash !== lastHash) {
@@ -520,16 +582,61 @@ async function pollOnce() {
     pollAbort = null;
     pollInFlight = false;
     lastPollEndedAt = monoNow();
+    const again = oneOffAgain;
+    oneOffAgain = false;
     if (stale || pollAgain) {
       // The new URL, or the poll a command asked for while this one ran: next, once the
       // gap allows. Auto-scheduling decides after that poll.
       pollAgain = false;
       requestPoll(true);
-    } else {
-      afterPoll(); // may auto-stop; runs before the status so the status shows it
+    } else if (!oneOff) {
+      // May auto-stop; runs before the status so the status shows it. Never after a one-off:
+      // one starts only while polling is off, and polling comes on during it only through
+      // start or pollNow, which ask for a poll (pollAgain), so such a one-off takes the
+      // branch above.
+      afterPoll();
     }
+    // One more fetch only when the reason for it still holds (row 4.3). A fetch a command
+    // asked for while this one ran (polling off): this one, if it came back, was built
+    // with that command's settings, so it is needed only while nothing is kept (this one
+    // failed). A result cut short is fetched again when a command during the fetch asked
+    // for more than it was fetched with; while polling, a command's request made during a
+    // poll is not kept, so this is where that re-fetch is asked for.
+    if (!stale && (needMore || (again && !lastRaw && !polling))) refetch();
     pushStatus();
   }
+}
+
+// Whether the settings now ask for more than a kept result holds: its adapter cut it short
+// (`cutShort`; only start.gg will, from Sprint 8), and maxItems is higher than it was
+// fetched with, or topN has been switched on since.
+function wantsMore(raw) {
+  return raw.result.cutShort === true && (config.maxItems > raw.maxItems || (config.topN > 0 && raw.topN === 0));
+}
+
+// One fetch a command asks for (row 4.3): a cap or option change with no result held and a
+// URL set, or one that needs more than the result held (it was cut short). While polling it
+// is a poll asked for, under polling's rules. Otherwise it is one fetch outside the poll
+// loop: it waits for the minimum gap and any Retry-After hold, it does not go through the
+// poll timer or the next-delay function, so it does not start polling, and its result is
+// thrown away if setUrl comes first (as a poll's is). With no URL it does nothing.
+function refetch() {
+  if (!config.tournamentUrl) return;
+  if (polling) { requestPoll(false); return; }
+  if (pollInFlight) { oneOffAgain = true; return; }
+  if (oneOffTimer) return; // one is already waiting for the gap
+  const now = monoNow();
+  const at = Math.max(now, gapEnd(), holdUntil());
+  oneOffTimer = setTimeout(() => {
+    oneOffTimer = null;
+    if (polling) { requestPoll(false); return; }
+    pollOnce({ oneOff: true });
+  }, at - now);
+}
+
+function cancelOneOff() {
+  if (oneOffTimer) { clearTimeout(oneOffTimer); oneOffTimer = null; }
+  oneOffAgain = false;
 }
 
 // Fetches the normalized result for `url`, with the poll's AbortSignal.
@@ -689,7 +796,7 @@ function buildPayload(result, url, platform) {
       url,
       state: result.state || 'in_progress',
     },
-    generatedAt: new Date().toISOString(),
+    generatedAt: stampNow(),
     matches,
     standings: standings.slice(0, config.topN > 0 ? Math.min(config.topN, config.maxItems) : config.maxItems),
     caps: { ...config.caps },
@@ -712,17 +819,28 @@ function messageBlock() {
   return lines.length ? { lines } : null;
 }
 
-// A results-free payload, for pushing a message when no poll has ever run (the
-// message-only use case: no tournament configured at all).
+// A results-free payload: setUrl's own blank (decision 5), and a message pushed when no
+// poll has ever run (the message-only use case: no tournament configured at all).
 function blankPayload() {
   return {
     type: 'ticker:update',
     tournament: { name: '', platform: platformName, url: config.tournamentUrl, state: 'in_progress' },
-    generatedAt: new Date().toISOString(),
+    generatedAt: stampNow(),
     matches: [],
     standings: [],
     caps: { ...config.caps },
   };
+}
+
+// The generatedAt of each payload: the wall time, but never at or before the last one
+// this sidecar stamped. The pages ignore an update stamped older than the newest they
+// have when it comes within 5 s of that newest one (decision 14), so a wall clock set back
+// would otherwise drop the pushes that follow each other closely; and the send queue tells
+// its pushes' broadcasts apart by it.
+let lastStampMs = 0;
+function stampNow() {
+  lastStampMs = Math.max(Date.now(), lastStampMs + 1);
+  return new Date(lastStampMs).toISOString();
 }
 
 // Re-push the current strip state NOW, restamped with the live message + caps.
@@ -731,27 +849,74 @@ function blankPayload() {
 function pushCurrent() {
   const payload = {
     ...(lastPayload || blankPayload()),
-    generatedAt: new Date().toISOString(),
+    generatedAt: stampNow(),
     caps: { ...config.caps },
   };
   const msg = messageBlock();
   if (msg) payload.message = msg;
   else delete payload.message;
   lastPayload = payload;
-  lastHash = hashPayload(payload); // pushUpdate resets this to null if SB is down
+  lastHash = hashPayload(payload); // a push that is not queued resets this to null
   pushUpdate(payload);
 }
 
-// Change detection: only what the strip renders — ids, states, scores, caps,
-// message.
+// Change detection: only what the strip renders — ids, states, rounds, winners,
+// scores, names, the event's state, caps, message (ZIP-15: the winner, the round and
+// the event's state are in it, so a corrected winner or an event that completes with no
+// set changing is pushed).
 function hashPayload(p) {
   return JSON.stringify([
     p.tournament?.name ?? '',
+    p.tournament?.state ?? '',
     p.caps,
     p.message ?? null,
-    p.matches.map((m) => [m.id, m.state, m.p1?.score, m.p2?.score, m.p1?.name, m.p2?.name]),
+    p.matches.map((m) => [m.id, m.state, m.round ?? '', m.winner ?? 0, m.p1?.score, m.p2?.score, m.p1?.name, m.p2?.name]),
     p.standings,
   ]);
+}
+
+// Row 4.3 (ZIP-14): a cap change pushes the payload the sidecar holds with the new caps,
+// polling or not, so it shows at once even while the site is failing. Since a setUrl that
+// payload is setUrl's blank, so it pushes the blank with the new caps. It is the blank too
+// once a message has gone out with nothing held (on connect with polling off, or a message
+// edit: pushCurrent keeps what it pushed), since that blank has already replaced the stored
+// strip. With nothing held at all (after a restart, before the first good poll or any
+// message push) and a URL set, it fetches once instead,
+// rather than push a blank over the strip Streamer.bot stored, and the caps show with that
+// fetch's results; with no URL (a message-only strip) it pushes the blank, with the caps.
+function showCaps() {
+  if (lastPayload || !config.tournamentUrl) pushCurrent();
+  else refetch();
+}
+
+// Row 4.3 (ZIP-14): an option change (maxItems, topN) rebuilds the payload from the last
+// result, with the URL and platform it was fetched under, and pushes it at once, polling
+// or not. A result its adapter cut short (`cutShort`, only start.gg will mark one, from
+// Sprint 8) is fetched again when the change asks for more than it held: a higher maxItems
+// than it was fetched with, or topN switched on. With nothing held (after a restart, or
+// since setUrl) and a URL set, it fetches once; with no URL it only saves the setting.
+// Apart from setUrl's own blank (decision 5), no blank payload is pushed here. (setUrl
+// drops the result kept, so what is kept is always the URL now set's.)
+// The rebuild runs inside a command, outside any poll's try: a result that built under the
+// settings it was polled with can still throw under others (a standing that is not an
+// object, read only once topN is on), and that must not end the process.
+function applyOptions() {
+  const raw = lastRaw;
+  if (raw) {
+    let payload;
+    try {
+      payload = buildPayload(raw.result, raw.url, raw.platform);
+    } catch (err) {
+      log(`could not rebuild the payload from the last result with the new options: ${err?.message || err}`);
+      return;
+    }
+    lastPayload = payload;
+    lastHash = hashPayload(payload);
+    pushUpdate(payload);
+    if (wantsMore(raw)) refetch();
+  } else if (config.tournamentUrl) {
+    refetch();
+  }
 }
 
 // ── StreamElements milestone poller ───────────────────────────────────────────
@@ -760,6 +925,9 @@ function hashPayload(p) {
 // counters, and fire a "Ticker Announce" (kind milestone) whenever a counter
 // crosses its configured step. The first successful poll only RECORDS the
 // current thresholds — no announcement blast when you first configure it.
+// A threshold moves on only once its announcement was queued by Streamer.bot (ZIP-16);
+// the rule for each reading is milestoneStep below. Polls are chained: the next is
+// timed from the end of the last, so two never overlap.
 
 const SE_BASE = process.env.ZIPPER_SE_BASE || 'https://api.streamelements.com';
 
@@ -773,6 +941,35 @@ const SE_METRICS = {
 let seTimer = null;
 let seLastPollAt = null;
 let seLastError = '';
+// Per metric, the announcement that last failed to be queued ({ threshold, outcome }), so
+// one that keeps failing on every poll (Ticker Announce missing, Streamer.bot down) is
+// logged once, not twice a poll: again only when its threshold or its outcome changes.
+const milestoneLogged = new Map();
+
+// ── milestone rule: BEGIN (verify.mjs runs this block on its own, in-process) ──
+// What one StreamElements reading does to a metric's saved threshold (ZIP-16). `saved` is
+// the threshold saved for the metric (not a number before its first sighting), `savedKey`
+// the StreamElements key that was read from, `value` and `key` the reading, `step` the
+// metric's step. Returns { record } to save a new threshold silently, { announce } for a
+// milestone to announce (its threshold is saved only once the announcement is queued), or
+// nothing to do ({}).
+//   • A first sighting, or a reading from another key than the saved one's (the subs
+//     reader takes subscriber-total, or subscriber-count when that is missing), is
+//     recorded silently: configuring Zipper mid-stream announces nothing, and a switch of
+//     key is not taken as a drop.
+//   • A fall to 0, or to more than one step below the saved threshold, is a reset (a new
+//     session): it is recorded silently, and milestones above it are announced again as
+//     the counter climbs back. A dip of a step or less never resets, so an unfollow and a
+//     refollow within one step, or a sub that lapses and renews, never repeat a milestone.
+//   • A threshold above the saved one is announced.
+function milestoneStep({ saved, savedKey, value, key, step }) {
+  const threshold = Math.max(0, Math.floor(value / step) * step);
+  if (!Number.isFinite(saved) || (savedKey !== undefined && savedKey !== key)) return { record: threshold };
+  if (value <= 0 || value < saved - step) return { record: threshold };
+  if (threshold > saved) return { announce: threshold };
+  return {};
+}
+// ── milestone rule: END ──
 
 function seChannelFromJwt(jwt) {
   try {
@@ -787,14 +984,27 @@ function seConfigured() {
     && Object.values(config.milestones).some((step) => step > 0);
 }
 
+// Chained timeouts (ZIP-16): the next poll is armed only in the finally of the last, once
+// it has settled, its announcements included, so a slow answer never makes two overlap.
+// That alone keeps them apart: startSePolling runs once, at start-up, and no timer exists
+// while a poll runs, so no in-flight flag is needed, and no timer is there to clear when it
+// starts (an earlier flag and an earlier clear could never be reached, and are gone).
 function startSePolling() {
-  if (seTimer) { clearInterval(seTimer); seTimer = null; }
   if (!seConfigured()) return;
   const channel = seChannelFromJwt(config.streamElements.jwtToken);
   if (!channel) { seLastError = 'Could not read the channel id from the StreamElements JWT'; log(seLastError); return; }
-  const run = () => pollSe(channel).catch((e) => { seLastError = e?.message || String(e); log(`SE poll failed: ${seLastError}`); });
+  const run = async () => {
+    seTimer = null;
+    try {
+      await pollSe(channel);
+    } catch (e) {
+      seLastError = e?.message || String(e);
+      log(`SE poll failed: ${seLastError}`);
+    } finally {
+      seTimer = setTimeout(run, config.streamElements.pollSeconds * 1000);
+    }
+  };
   run();
-  seTimer = setInterval(run, config.streamElements.pollSeconds * 1000);
   log(`StreamElements milestone polling every ${config.streamElements.pollSeconds}s`);
 }
 
@@ -807,8 +1017,7 @@ function seCounterValue(entry) {
 }
 
 // Through the fetch wrapper (ZIP-06), so a StreamElements that stops answering fails
-// this poll after 10 s, naming the host, instead of holding it for minutes. (The poller
-// still runs on setInterval; row 4.5 chains its polls with an in-flight guard.)
+// this poll after 10 s, naming the host, instead of holding it for minutes.
 async function pollSe(channel) {
   const res = await guardedFetch(`${SE_BASE}/kappa/v2/sessions/${channel}`, {
     headers: { Authorization: `Bearer ${config.streamElements.jwtToken}`, Accept: 'application/json' },
@@ -822,34 +1031,265 @@ async function pollSe(channel) {
   seLastError = '';
 
   let stateChanged = false;
+  const announcing = [];
   for (const [metric, def] of Object.entries(SE_METRICS)) {
     const step = config.milestones[metric];
     if (!step) continue;
     let value = null;
-    for (const key of def.keys) {
-      value = seCounterValue(data[key]);
-      if (value != null) break;
+    let key = null;
+    for (const k of def.keys) {
+      value = seCounterValue(data[k]);
+      if (value != null) { key = k; break; }
     }
     if (value == null) continue;
-    const threshold = Math.floor(value / step) * step;
-    const prev = config.milestoneState[metric];
-    if (prev === undefined) {
-      // First sighting: record silently so configuring Zipper mid-stream
-      // doesn't announce every historical milestone at once.
+    const saved = config.milestoneState[metric];
+    const next = milestoneStep({ saved, savedKey: config.milestoneKeys[metric], value, key, step });
+    if (config.milestoneKeys[metric] !== key) { config.milestoneKeys[metric] = key; stateChanged = true; }
+    if (next.record !== undefined && next.record !== saved) {
+      config.milestoneState[metric] = next.record;
+      stateChanged = true;
+    }
+    if (next.announce !== undefined) {
+      const threshold = next.announce;
+      if (milestoneLogged.get(metric)?.threshold !== threshold) log(`milestone: ${metric} crossed ${threshold} → announcing`);
+      announcing.push(announce(def.text(threshold)).then((outcome) => ({ metric, threshold, outcome })));
+    }
+  }
+  // Only an announcement Streamer.bot queued moves its threshold on, in memory as well as
+  // in the file (any later save writes the in-memory value). One that was dropped (the bus
+  // down), refused or failed leaves it, so the next poll after a reconnect announces it.
+  for (const { metric, threshold, outcome } of await Promise.all(announcing)) {
+    const failedBefore = milestoneLogged.get(metric);
+    if (outcome === 'queued' || (outcome === 'timed out' && MILESTONE_ADVANCES_ON_TIMEOUT)) {
       config.milestoneState[metric] = threshold;
       stateChanged = true;
-    } else if (threshold > prev) {
-      config.milestoneState[metric] = threshold;
-      stateChanged = true;
-      const text = def.text(threshold);
-      log(`milestone: ${metric} crossed ${threshold} → announcing`);
-      doAction('Ticker Announce', { kind: 'milestone', text, duration: '10' });
+      milestoneLogged.delete(metric);
+      if (failedBefore) log(`milestone: the ${metric} announcement for ${threshold} was ${outcome} at last`);
+    } else {
+      if (failedBefore?.threshold !== threshold || failedBefore.outcome !== outcome) {
+        log(`milestone: the ${metric} announcement for ${threshold} was ${outcome}; each poll announces it again until it is queued (logged once)`);
+      }
+      milestoneLogged.set(metric, { threshold, outcome });
     }
   }
   if (stateChanged) await persist();
 }
 
 // ── Streamer.bot WS client ────────────────────────────────────────────────────
+
+// ── send queue: BEGIN (verify.mjs runs this block on its own, in-process) ──
+// The sidecar's own DoActions (ZIP-11, decision 3): one in flight at a time. Streamer.bot
+// replies to a DoAction when the action is QUEUED, not when it has run, so the reply
+// alone cannot pace the next send: in its Default queue two runs of one action close
+// together both see the later one's arguments (two milestones in one poll would show one
+// text twice). The next send goes once the job's reply AND its own broadcast (the end of
+// its run) have both arrived, in either order, or after SEND_RELEASE_MS. An error reply
+// releases at once, since nothing was queued; a ticker:error while the job is in flight
+// is the end of its run too. The blocking action queue the README asks for is what keeps
+// a page's, chat's or a Stream Deck's run from mixing with the sidecar's; this orders only
+// the sidecar's own sends.
+//
+// Each job ends with exactly one outcome, which the promise enqueue returns resolves with.
+// The release above does not wait for it: a job released after SEND_RELEASE_MS with no
+// reply keeps waiting for its reply, up to SEND_OUTCOME_MS after it was sent, while the
+// next job goes, so a slow Streamer.bot that answers late is not taken for one that did
+// not answer. Several jobs can be waiting for their replies at once; each reply is
+// matched to its own job by its request id.
+//   'queued'     an ok reply: the action was queued (it says nothing of the run); or no
+//                reply yet, but the job's own broadcast arrived while it was in flight,
+//                when its release comes or the socket closes (the run has happened)
+//   'refused'    an error reply, such as "The action 'Ticker Push' was not found"
+//   'failed'     a ticker:error arrived while it was in flight (ticker:error names no
+//                sender, so a page's failed run at that moment, or the run of an earlier
+//                job still waiting for its reply, counts against the job)
+//   'timed out'  no reply within SEND_OUTCOME_MS of the send, and no broadcast of its own
+//                while it was in flight
+//   'dropped'    the socket was closed when it was to be sent, or closed while it waited,
+//                while it was in flight with no reply and no broadcast of its own (a
+//                ticker:error then counts for nothing: the close comes first), or while it
+//                waited for its reply
+// Every reply is passed on to be read (onReply), with whether it answers the newest job
+// sent to its action: a late reply to an older send must not undo what the newest one's
+// reply said (an older push's late ok after a newer push was refused).
+// While a push waits, a newer push takes its place (each push is the whole payload), and
+// a newer status the place of a waiting status, so a status never waits behind an old
+// one; the job replaced settles with its replacement's outcome. Announcements are never
+// merged or replaced. The job in flight is never replaced.
+// A job's args may be a function, called when the job is sent, so a status that waited
+// says what is true when it goes. `match(d)` says whether a broadcast is the job's own.
+const SEND_RELEASE_MS = 800;
+const SEND_OUTCOME_MS = 5000;
+function createSendQueue({ send, isOpen, nextId, onReply, setTimeout, clearTimeout }) {
+  let waiting = [];
+  let inFlight = null;
+  const awaiting = new Set(); // released with no reply: their outcome waits for it
+  const byId = new Map(); // request id → job, until its reply is read (also after it settles)
+  const REPLIES_KEPT = 64;
+  const newestSent = new Map(); // action name → the newest job sent to it
+
+  // A job's one timer: its release while in flight, the end of its wait for a reply after.
+  function settle(job, outcome) {
+    if (job.outcome) return;
+    job.outcome = outcome;
+    if (job.timer !== null) { clearTimeout(job.timer); job.timer = null; }
+    awaiting.delete(job);
+    for (const done of job.done) done(outcome);
+  }
+  function enqueue(spec) {
+    return new Promise((resolve) => {
+      const job = { ...spec, done: [resolve], id: null, replied: false, refused: false, failed: false, ended: false, timer: null, outcome: null };
+      if (!isOpen()) { settle(job, 'dropped'); return; }
+      const merges = job.kind === 'push' || job.kind === 'status';
+      const older = merges ? waiting.findIndex((w) => w.kind === job.kind) : -1;
+      if (older >= 0) { job.done.push(...waiting[older].done); waiting[older] = job; }
+      else waiting.push(job);
+      pump();
+    });
+  }
+  function pump() {
+    while (!inFlight && waiting.length) {
+      const job = waiting.shift();
+      if (!isOpen()) { settle(job, 'dropped'); continue; }
+      job.id = nextId();
+      const args = typeof job.args === 'function' ? job.args() : job.args;
+      if (!send({ request: 'DoAction', id: job.id, action: { name: job.name }, args })) { settle(job, 'dropped'); continue; }
+      inFlight = job;
+      byId.set(job.id, job);
+      newestSent.set(job.name, job);
+      // The oldest entry goes. It is never a job still waiting for its reply: a reply removes
+      // its entry, and a job with none stays in flight for SEND_RELEASE_MS, so no more than
+      // about seven such jobs are sent in the SEND_OUTCOME_MS a reply is waited for, far
+      // fewer than REPLIES_KEPT.
+      if (byId.size > REPLIES_KEPT) byId.delete(byId.keys().next().value);
+      job.timer = setTimeout(() => release(job), SEND_RELEASE_MS);
+    }
+  }
+  // The job in flight goes, and the next is sent. Its outcome is settled now when what it
+  // has had settles it; a job with no reply and no broadcast of its own waits for its reply.
+  function release(job) {
+    if (inFlight !== job) return;
+    clearTimeout(job.timer);
+    job.timer = null;
+    inFlight = null;
+    const outcome = job.refused ? 'refused' : job.failed ? 'failed' : (job.replied || job.ended) ? 'queued' : null;
+    if (outcome) settle(job, outcome);
+    else {
+      awaiting.add(job);
+      job.timer = setTimeout(() => settle(job, 'timed out'), SEND_OUTCOME_MS - SEND_RELEASE_MS);
+    }
+    pump();
+  }
+  // A reply to one of our DoActions; false when it is not one (the Subscribe ack). A reply
+  // to a job already released settles the outcome it was waiting for; one to a job whose
+  // outcome is settled (timed out, or queued by its own broadcast) is read and changes it not.
+  function reply(m) {
+    const id = m && m.id != null ? String(m.id) : null;
+    const job = id === null ? undefined : byId.get(id);
+    if (!job) return false;
+    byId.delete(id);
+    onReply(job.name, m, newestSent.get(job.name) === job);
+    if (inFlight !== job) { settle(job, m.status === 'error' ? 'refused' : 'queued'); return true; }
+    if (m.status === 'error') { job.refused = true; release(job); return true; }
+    job.replied = true;
+    if (job.ended) release(job);
+    return true;
+  }
+  // A General.Custom broadcast: the end of the in-flight job's run, if it is its own.
+  function broadcast(d) {
+    const job = inFlight;
+    if (!job || !d || typeof d !== 'object') return;
+    if (d.type === 'ticker:error') job.failed = true;
+    else if (!job.match(d)) return;
+    job.ended = true;
+    if (job.replied) release(job);
+  }
+  // The socket closed: every job not yet settled is, at once, and no timer is left. No
+  // reply can come on a closed socket, so a job waiting for one is dropped.
+  function close() {
+    const job = inFlight;
+    inFlight = null;
+    if (job) settle(job, job.replied ? (job.failed ? 'failed' : 'queued') : (job.ended && !job.failed) ? 'queued' : 'dropped');
+    for (const j of [...awaiting]) settle(j, 'dropped');
+    const rest = waiting;
+    waiting = [];
+    for (const w of rest) settle(w, 'dropped');
+    byId.clear();
+    newestSent.clear();
+  }
+  return { enqueue, reply, broadcast, close };
+}
+
+// Which broadcast is a job's own, from what the C# actions already echo (no re-paste): a
+// push by its payload's generatedAt (each is a unique millisecond, see stampNow); a status
+// by the seq inside its value (Ticker Command passes the value through as it is); an
+// announcement by its kind and its text, trimmed (the C# trims its arguments). A page's
+// connect-sync, its commands and a Twitch announcement do not match.
+// The stamp is compared as a time, never as text: Streamer.bot's WebsocketBroadcastJson
+// parses the payload with Newtonsoft's default date handling and writes it out again, so a
+// date-shaped string can come back in another form (measured on 1.0.7 for Greenroom:
+// "…:00.000Z" comes back "…:00Z"; by the same format "…:00.120Z" would come back
+// "…:00.12Z"), and as text one push in ten would never match its own broadcast.
+function pushMatch(stamp) {
+  const at = Date.parse(stamp);
+  return (d) => d.type === 'ticker:update' && typeof d.generatedAt === 'string' && Date.parse(d.generatedAt) === at;
+}
+function statusMatch(seq) {
+  return (d) => {
+    if (d.type !== 'ticker:command' || d.command !== '__status' || typeof d.value !== 'string') return false;
+    try { return JSON.parse(d.value)?.seq === seq; } catch { return false; }
+  };
+}
+function announceMatch(kind, text) {
+  const want = String(text).trim();
+  return (d) => d.type === 'ticker:announce' && d.kind === kind && typeof d.text === 'string' && d.text.trim() === want;
+}
+// ── send queue: END ──
+
+const sendQueue = createSendQueue({
+  send: (msg) => { try { sbWs.send(JSON.stringify(msg)); return true; } catch { return false; } },
+  isOpen: () => !!sbWs && sbWs.readyState === WebSocket.OPEN,
+  nextId: () => String(++sbMsgId),
+  onReply: readReply,
+  setTimeout,
+  clearTimeout,
+});
+const sendJob = (name, kind, args, match) => sendQueue.enqueue({ name, kind, args, match });
+
+// Replies are read (ZIP-11), late ones too. An error reply is logged once per action until
+// that action answers ok again; Ticker Push's and Ticker Announce's go in the status's
+// actionNotice, which the control page shows. Ticker Command's can only be logged: the
+// status itself travels on Ticker Command. Only the reply to the newest send to an action
+// sets or clears its notice (`newest`, from the send queue): a late reply to an older send
+// changes nothing, so an older push's late ok does not clear "Ticker Push not found" that a
+// newer push's refusal set, as it does not pay that push (pushUpdate). A queueName of
+// "Default" is logged once per action, from any ok reply: it is a fact of the action's
+// setup, not of one send.
+const actionErrors = new Map(); // action name → its notice, from an error reply until an ok one
+const defaultQueueLogged = new Set();
+function readReply(name, m, newest) {
+  if (m.status !== 'error' && m.args && m.args.queueName === 'Default' && !defaultQueueLogged.has(name)) {
+    defaultQueueLogged.add(name);
+    log(`${name} runs in Streamer.bot's Default action queue; put the three bus actions in one blocking queue (README, step 1), or overlapping runs can mix their arguments`);
+  }
+  if (!newest) return;
+  if (m.status === 'error') {
+    const error = typeof m.error === 'string' ? m.error : '';
+    const text = /was not found/i.test(error) ? `${name} not found` : `${name}: Streamer.bot answered with an error (${error.slice(0, 200)})`;
+    if (actionErrors.get(name) === text) return;
+    const first = !actionErrors.has(name);
+    actionErrors.set(name, text);
+    if (first) log(name === 'Ticker Command' ? `${text}: the sidecar's status cannot reach the control page` : text);
+    if (name !== 'Ticker Command') pushStatus();
+    return;
+  }
+  if (actionErrors.delete(name)) {
+    log(`${name} answers again`);
+    if (name !== 'Ticker Command') pushStatus();
+  }
+}
+function actionNotice() {
+  return [...actionErrors].filter(([name]) => name !== 'Ticker Command').map(([, text]) => text).join(' · ');
+}
 
 function connectSb() {
   if (sbWs && sbWs.readyState === WebSocket.OPEN) return;
@@ -862,22 +1302,26 @@ function connectSb() {
       sbWs.send(JSON.stringify({ request: 'Subscribe', id: String(++sbMsgId), events: { general: ['Custom'] } }));
       log(`Connected to Streamer.bot at ${SB_WS_URL}`);
       pushStatus();
-      // A message-only setup never polls, so no other code path would ever put
-      // the configured message on screen after a restart.
-      if (!polling && messageBlock()) pushCurrent();
+      // ZIP-09: a push that did not get through (Streamer.bot down, still starting, or
+      // the action missing) is made good now: the payload the sidecar holds, pushed again.
+      // A message-only setup never polls, so no other code path would ever put the
+      // configured message on screen after a restart.
+      if ((pushOwed && lastPayload) || (!polling && messageBlock())) pushCurrent();
     });
-    sbWs.on('close', () => { sbWs = null; scheduleSbReconnect(); });
+    sbWs.on('close', () => { sbWs = null; sendQueue.close(); scheduleSbReconnect(); });
     sbWs.on('error', (e) => { log(`SB WS error: ${e.message} — is SB's WebSocket Server on ${SB_WS_URL} with auth OFF?`); });
     sbWs.on('message', (raw) => {
       let m;
       try { m = JSON.parse(raw.toString()); } catch { return; }
-      if (m && m.id && !m.event) return; // request acks
+      if (m && m.id != null && !m.event) { sendQueue.reply(m); return; } // request acks: replies to our DoActions, and the Subscribe ack
       if (!(m && m.event && m.event.source === 'General' && m.event.type === 'Custom')) return;
       let d = m.data;
       if (typeof d === 'string') { try { d = JSON.parse(d); } catch { return; } }
+      if (!d || typeof d !== 'object') return;
+      sendQueue.broadcast(d); // the end of the run of the send in flight, if it is its own
       // Echo-loop guard: this client also hears its own ticker:update /
       // ticker:status broadcasts. Consume ONLY the command channel.
-      if (!d || typeof d !== 'object' || d.type !== 'ticker:command') return;
+      if (d.type !== 'ticker:command') return;
       dispatch(String(d.command ?? ''), String(d.value ?? ''));
     });
   } catch {
@@ -890,30 +1334,62 @@ function scheduleSbReconnect() {
   sbReconnectTimer = setTimeout(() => { sbReconnectTimer = null; connectSb(); }, 3000);
 }
 
-function doAction(name, args) {
-  if (!sbWs || sbWs.readyState !== WebSocket.OPEN) return false;
-  try {
-    sbWs.send(JSON.stringify({ request: 'DoAction', id: String(++sbMsgId), action: { name }, args }));
-    return true;
-  } catch { return false; }
+// ticker:update rides the "Ticker Push" action so the C# side persists it for
+// the sync-on-connect replay. The newest push, when it ends any way but "queued", is owed (ZIP-09):
+// the current payload is pushed again when the sidecar next connects, or, while the socket
+// stays open, PUSH_RETRY_MS later and on the next `status` command (payOwedPush); the next
+// poll pushes whatever it brings (lastHash is cleared). A retry refused again stays owed,
+// and "Ticker Push not found" is still logged only once (readReply).
+// Each push acts on its own settled outcome, which can come up to SEND_OUTCOME_MS after it
+// was sent, after a newer push was made (several can be waiting for their replies at once).
+// Only the newest push's outcome counts: once a newer push has been made, it carries the
+// whole payload and its outcome, whatever it is, settles what is owed (every push settles,
+// at the latest SEND_OUTCOME_MS after it is sent, or when the socket closes). So a push that
+// times out while a newer one is queued or still waiting for its reply owes nothing, logs
+// nothing and leaves lastHash alone, and a late "queued" for an older push does not pay a
+// newer one that was refused.
+let pushSeq = 0;
+function pushUpdate(payload) {
+  const seq = ++pushSeq;
+  sendJob('Ticker Push', 'push', { tickerPayload: JSON.stringify(payload) }, pushMatch(payload.generatedAt)).then((outcome) => {
+    if (seq !== pushSeq) return; // a newer push has been made: its outcome counts, not this one's
+    if (outcome === 'queued') {
+      pushOwed = false;
+      if (pushRetryTimer) { clearTimeout(pushRetryTimer); pushRetryTimer = null; }
+      return;
+    }
+    lastHash = null;
+    if (!pushOwed) log(`Ticker Push ${outcome}: the current payload is pushed again when the sidecar next connects to Streamer.bot, or in ${seconds(pushRetryMs)} while it stays connected`);
+    pushOwed = true;
+    if (!pushRetryTimer) pushRetryTimer = setTimeout(() => { pushRetryTimer = null; payOwedPush(); }, pushRetryMs);
+  });
 }
 
-// ticker:update rides the "Ticker Push" action so the C# side persists it for
-// the sync-on-connect replay.
-function pushUpdate(payload) {
-  if (!doAction('Ticker Push', { tickerPayload: JSON.stringify(payload) })) {
-    // SB is down — force a re-push on the next successful poll after reconnect.
-    lastHash = null;
-  }
+// Pays an owed push now, if the socket is open (a closed one pays it on connect).
+function payOwedPush() {
+  if (pushOwed && lastPayload && sbWs && sbWs.readyState === WebSocket.OPEN) pushCurrent();
+}
+
+// A milestone announcement. Resolves with the send's outcome (see the send queue).
+function announce(text) {
+  return sendJob('Ticker Announce', 'announce', { kind: 'milestone', text, duration: '10' }, announceMatch('milestone', text));
 }
 
 // ticker:status is ephemeral (never persisted) — it rides the "Ticker Command"
 // relay with the reserved command "__status"; the C# action broadcasts
 // { type:'ticker:command', command:'__status', value:'<status JSON>' } and the
-// control page unwraps it. dispatch() below ignores it (echo guard).
+// control page unwraps it. dispatch() below ignores it (echo guard). Its `seq` tells
+// the send queue which broadcast is this status's own. It is built when it is sent.
+let statusSeq = 0;
 function pushStatus() {
-  const status = {
+  const seq = ++statusSeq;
+  sendJob('Ticker Command', 'status', () => ({ command: '__status', value: JSON.stringify(statusSnapshot(seq)) }), statusMatch(seq));
+}
+
+function statusSnapshot(seq) {
+  return {
     type: 'ticker:status',
+    seq,
     polling,
     url: config.tournamentUrl,
     platform: platformName,
@@ -924,6 +1400,9 @@ function pushStatus() {
     nextPollAt: pollDueAt !== null ? wallTime(pollDueAt) : null,
     lastError,
     commandNotice,
+    // "Ticker Push not found" or "Ticker Announce not found", from the sidecar's own sends,
+    // until that action answers ok (row 4.2); "" otherwise.
+    actionNotice: actionNotice(),
     intervalMs: config.pollIntervalMs,
     maxItems: config.maxItems,
     topN: config.topN,
@@ -941,7 +1420,6 @@ function pushStatus() {
     // StreamElements milestone status — never the token itself.
     se: { configured: seConfigured(), lastPollAt: seLastPollAt, lastError: seLastError },
   };
-  doAction('Ticker Command', { command: '__status', value: JSON.stringify(status) });
 }
 
 // ── Command dispatch (inbound half of the bus) ────────────────────────────────
@@ -998,12 +1476,23 @@ function dispatch(command, value) {
       // nothing is saved, and no poll follows.
       const refusal = url && url.startsWith('stub:') ? stubRefusal(url) : null;
       if (refusal) { refuse(refusal); return; }
+      if (url === config.tournamentUrl) {
+        // The URL already set, after trimming (row 4.6, a choice left open; see the sprint
+        // notes). The control page's Set button sends setUrl on every click, so this is
+        // not a new tournament: the strip is not blanked (after an auto-stop on a completed
+        // event no poll would come to replace a blank), the result kept and the event's
+        // state stay, and a poll in flight goes on. While polling it asks for a poll, as
+        // pollNow does; with polling off it does nothing but answer.
+        if (polling) requestPoll(true);
+        pushStatus();
+        return;
+      }
       config.tournamentUrl = url;
       // ZIP-02: a poll in flight now belongs to the old URL. It is stopped, and whatever
       // it brings back is thrown away; the new URL is polled once the gap allows.
       urlGeneration++;
       if (pollAbort) pollAbort.abort(new Error('the tournament URL changed'));
-      lastHash = null;
+      cancelOneOff(); // a fetch a command asked for was for the old URL
       platformName = platformFor(config.tournamentUrl);
       // A Retry-After hold is left as it is: it belongs to its platform (see holdUntil).
       lastError = '';
@@ -1012,6 +1501,14 @@ function dispatch(command, value) {
       eventStartAt = null;
       autoStopped = null;
       waitingUntil = null;
+      // Decision 5 (ZIP-22): the old bracket leaves the strip at once, and stays gone if
+      // the new URL keeps failing. The result kept for the old URL is dropped, and a blank
+      // payload, caps and message kept, is pushed and becomes the current one, so cap and
+      // option changes rebuild from nothing until the new URL's first good poll.
+      lastRaw = null;
+      lastPayload = blankPayload();
+      pushCurrent();
+      lastHash = null; // the new URL's first good poll is pushed, whatever it holds
       if (!config.tournamentUrl) {
         // ZIP-12: with no URL there is nothing to poll, so clearing it stops polling.
         polling = false;
@@ -1042,37 +1539,40 @@ function dispatch(command, value) {
       return;
     case 'setCapsText':
       config.caps.text = String(value ?? '').slice(0, 120);
-      lastHash = null; // caps travel in the update payload — force a re-push
       persist();
-      // Stopped (or message-only, with no tournament) still needs the new caps
-      // on screen, so push rather than wait for a poll that may never come.
-      if (polling) requestPoll(false); else pushCurrent();
+      // Caps travel in the update payload: pushed at once, polling or not (showCaps).
+      showCaps();
       pushStatus();
       return;
     case 'setCapsLogo': {
       const logo = checkLogo(value);
       if (logo === null) { refuse(LOGO_REFUSED_MESSAGE); return; } // the logo is kept
       config.caps.logo = logo;
-      lastHash = null;
       persist();
-      if (polling) requestPoll(false); else pushCurrent();
+      showCaps();
       pushStatus();
       return;
     }
-    case 'setTopN':
-      config.topN = clampInt(value, 0, 100, config.topN);
-      lastHash = null;
+    case 'setTopN': {
+      const n = clampInt(value, 0, 100, config.topN);
+      const changed = n !== config.topN;
+      config.topN = n;
       persist();
-      requestPoll(false);
+      // Rebuilt from the last result and pushed at once (applyOptions); a value already set
+      // changes nothing on the strip.
+      if (changed) applyOptions();
       pushStatus();
       return;
-    case 'setMaxItems':
-      config.maxItems = clampInt(value, 1, 100, config.maxItems);
-      lastHash = null;
+    }
+    case 'setMaxItems': {
+      const n = clampInt(value, 1, 100, config.maxItems);
+      const changed = n !== config.maxItems;
+      config.maxItems = n;
       persist();
-      requestPoll(false);
+      if (changed) applyOptions();
       pushStatus();
       return;
+    }
     // Batched setters — the control page sends ONE of these per button so it
     // never fires a burst of DoActions (Streamer.bot bleeds arguments between
     // action invocations that arrive within a few ms, which corrupted the caps
@@ -1088,9 +1588,8 @@ function dispatch(command, value) {
           if (logo === null) notice(LOGO_REFUSED_MESSAGE); else config.caps.logo = logo;
         }
       }
-      lastHash = null; // caps travel in the update payload — force a re-push
       persist();
-      if (polling) requestPoll(false); else pushCurrent();
+      showCaps(); // caps travel in the update payload: pushed at once, polling or not
       pushStatus();
       return;
     }
@@ -1122,12 +1621,11 @@ function dispatch(command, value) {
       pushStatus();
       return;
     case 'setOptions': {
-      // The control page sends all three on every Apply. Only a changed maxItems or topN
-      // needs the payload rebuilt, which takes a poll (row 4.3 replaces it with a rebuild
-      // from the last result); that re-poll is a request, as setMaxItems and setTopN make.
-      // Otherwise, a new interval alone or no change at all, it is a reschedule through
-      // the one next-delay function, so it cannot cut a longer error backoff or a
-      // Retry-After short (ZIP-13).
+      // The control page sends all three on every Apply. A changed maxItems or topN
+      // rebuilds the payload from the last result and pushes it at once (applyOptions),
+      // as setMaxItems and setTopN do. A new interval is a reschedule through the one
+      // next-delay function, so it cannot cut a longer error backoff or a Retry-After
+      // short (ZIP-13).
       const o = parseJson(value);
       let rebuild = false;
       if (o && typeof o === 'object') {
@@ -1142,11 +1640,17 @@ function dispatch(command, value) {
         }
       }
       persist();
-      if (rebuild) { lastHash = null; requestPoll(false); } else scheduleRegular();
+      scheduleRegular();
+      if (rebuild) applyOptions();
       pushStatus();
       return;
     }
-    case 'status': pushStatus(); return;
+    case 'status':
+      // The control page asks every 10 s while it is open: a push still owed (Ticker Push
+      // was missing and has been added since, with the socket kept open) is paid here.
+      payOwedPush();
+      pushStatus();
+      return;
   }
 }
 
@@ -1181,7 +1685,8 @@ async function main() {
   const shutdown = () => {
     log('shutting down');
     if (pollTimer) clearTimeout(pollTimer);
-    if (seTimer) clearInterval(seTimer);
+    if (seTimer) clearTimeout(seTimer);
+    if (pushRetryTimer) clearTimeout(pushRetryTimer);
     try { sbWs?.close(); } catch {}
     process.exit(0);
   };

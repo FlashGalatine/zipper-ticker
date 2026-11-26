@@ -75,8 +75,10 @@
     <button class="danger" id="btn-stop">Stop</button>
     <label class="chk"><input type="checkbox" id="autosched" checked> Auto start/stop</label>
   </div>
-  <div class="hint">Auto start/stop saves API calls: before the event it sleeps until the platform's
-    start time, and once the event completes it stops polling by itself (the final results stay up).</div>
+  <div class="hint">Auto start/stop saves API calls: before the event it waits for the platform's start
+    time, checking again every 15 minutes (or at your poll interval, if that is longer) so a bracket that
+    starts early is picked up (every 5 minutes if there is no start time, or at your poll interval if that is longer), and once the event completes
+    it stops polling by itself (the final results stay up).</div>
 </fieldset>
 
 <fieldset>
@@ -231,7 +233,8 @@
   const setIfClean = (id, v) => { if (!dirty.has(id)) $(id).value = v; };
 
   // ticker:status rides the command relay as command "__status" (docs/PROTOCOL.md).
-  // Its lastError is a failed poll; its commandNotice an unknown or refused command.
+  // Its lastError is a failed poll; its commandNotice an unknown or refused command;
+  // its actionNotice an action the sidecar sends to that answered "not found" or with another error.
   window.addEventListener('ticker:command', (e) => {
     const d = e.detail || {};
     if (d.command !== '__status') return;
@@ -265,6 +268,7 @@
       ` · Milestones: <b>${s.se?.configured ? 'ON' : 'off'}</b>` +
       (s.lastError ? `<br><span class="err">${esc(s.lastError)}</span>` : '') +
       (s.commandNotice ? `<br><span class="err">${esc(s.commandNotice)}</span>` : '') +
+      (s.actionNotice ? `<br><span class="err">${esc(s.actionNotice)}</span>` : '') +
       (s.se?.lastError ? `<br><span class="err">SE: ${esc(s.se.lastError)}</span>` : '');
   });
 

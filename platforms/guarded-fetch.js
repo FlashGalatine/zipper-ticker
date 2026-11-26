@@ -38,8 +38,9 @@ export const USER_AGENT = `Zipper/${version}`;
 export const BROWSER_USER_AGENT = `Mozilla/5.0 (compatible; Zipper/${version})`;
 
 // A test override of one of the sidecar's limits (ZIPPER_REQUEST_TIMEOUT_MS here; the
-// sidecar reads its own two the same way). It can only shorten the limit: the value is
-// clamped to min..fallback, and unset or not a number gives the fallback.
+// sidecar reads its own three the same way: ZIPPER_POLL_DEADLINE_MS, ZIPPER_MIN_POLL_GAP_MS
+// and, only with ZIPPER_ALLOW_STUB=1, ZIPPER_PUSH_RETRY_MS). It can only shorten the limit:
+// the value is clamped to min..fallback, and unset or not a number gives the fallback.
 export function envLimit(name, fallback, min) {
   const raw = process.env[name];
   if (raw == null || String(raw).trim() === '') return fallback;

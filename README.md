@@ -20,7 +20,8 @@ polled straight from the bracket site. Named after the Times Square news
 - **Persistent message:** type a message in the control page and flip a
   checkbox to hold it on the strip instead of results ("bracket starts at 8pm",
   a Discord plug) — one line per ticker item. Results keep polling underneath
-  and return the moment you switch it off, and it works with no tournament set
+  and return the moment you switch it off (one exception, just after a restart
+  with polling off, is under *5. Drive it* below), and it works with no tournament set
   at all.
 - **Announcements:** subs, raids, milestones, or anything you type interrupt
   the crawl — the strip pauses, shows the alert with a kind pill, and resumes.
@@ -134,16 +135,30 @@ http://127.0.0.1:7474/zipper-shared/control.html
 ```
 
 Paste the tournament URL (e.g. `https://challonge.com/blko42` or
-`https://www.start.gg/tournament/…/event/…`), **Set**, **Start polling**. Set
-the end-cap text/logo and the persistent message there too. Chat control also works — point a `!ticker`
+`https://www.start.gg/tournament/…/event/…`), **Set**, **Start polling**. **Set**
+with a new URL clears the old tournament's results from the strip at once (the
+end caps and the message stay), so an old bracket never crawls under a new
+event's name; the new results appear with the first good poll. Set
+the end-cap text/logo and the persistent message there too; end-cap and option
+changes show on the strip at once, even while the bracket site is failing (just
+after the sidecar starts, before it has fetched the bracket once, a change waits
+for that fetch). The message is the exception: when the sidecar starts with the
+persistent message on and polling off, it puts the message on the strip at once,
+on a payload with no results, which replaces the results Streamer.bot kept (a
+message edit before the first good fetch does the same). From then on an end-cap
+change shows at once on that payload, and switching the message off leaves the
+strip with no results until the bracket is fetched again: **Start polling**,
+**Poll now**, or an option change. Chat control also works — point a `!ticker`
 command trigger at the `Ticker Command` action and type
 `!ticker setUrl https://…`, `!ticker setTopN 4`, `!ticker stop`, etc.
 
 **Auto start/stop** (the checkbox next to the polling buttons, on by default)
 keeps API calls to a minimum: start polling any time — before the event begins
-the sidecar just sleeps until the platform's advertised start time (re-checking
-every 5 minutes if there isn't one), and once the event completes it pushes the
-final results and stops polling by itself. The results stay on the strip. To
+the sidecar waits for the platform's advertised start time, checking again every
+15 minutes (or at your poll interval, if that is longer) so a bracket that starts
+early is picked up (every 5 minutes if there is no start time, or at your poll interval if that is longer), and once the
+event completes it pushes the final results and stops polling by itself. The
+results stay on the strip. To
 turn it off from chat: `!ticker setAutoSchedule off`. **Start polling** /
 **Poll now** get a fresh poll even before the start time or after that stop,
 but no poll comes sooner than 15 seconds after the last one (a click inside
@@ -156,7 +171,8 @@ that is longer.
 
 Type into the control page's **Persistent message** box — one line per ticker
 item — and tick *Show this instead of results*. It holds the strip until you
-untick it; results keep polling underneath and come straight back. No
+untick it; results keep polling underneath and come straight back (except just after a
+restart with polling off, as described above). No
 tournament needs to be set, so it doubles as a plain message ticker. From chat:
 `!ticker setMessageText Bracket starts at 8pm ET` then
 `!ticker setMessageEnabled on` / `off`.

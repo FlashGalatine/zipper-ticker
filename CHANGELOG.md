@@ -10,6 +10,67 @@ traceability.
 
 ## [Unreleased]
 
+## [1.0.22] — 2026-11-26
+
+Copy `zipper-sidecar.mjs`, the `platforms` folder and the `zipper-shared`
+folder, then stop the sidecar and start it again, reload the dock, and refresh
+the OBS browser source. Copy them together. Nothing to re-paste.
+
+### Fixed
+
+- **A push made while Streamer.bot was unreachable is no longer lost.** Before,
+  results fetched during a disconnect never reached the strip unless they
+  changed again. The sidecar now remembers that a push is owed and sends it
+  when it reconnects, when the dock asks for the status, and every 30 seconds
+  until it goes through.
+- **End-cap, logo and option changes show at once.** Before, with polling
+  stopped or the bracket site failing, a new cap text, logo, item limit or
+  top-N waited for the next good poll, which might never come. The sidecar now
+  keeps the last result and rebuilds the strip from it.
+- **Two milestones crossed in one check both show.** The sidecar now sends one
+  thing at a time to Streamer.bot and waits for it to finish.
+- **A corrected winner is pushed.** Before, a change to the winner, the round
+  or the tournament's state with the scores unchanged was treated as "nothing
+  changed".
+- **A follower or sub count that dips and comes back no longer repeats a
+  milestone,** and a count that falls well below the last milestone starts
+  again from there quietly. A milestone announcement that Streamer.bot did not
+  accept is tried again instead of being skipped.
+- **A bracket that starts early is picked up.** Before an upcoming event the
+  sidecar checks again at least every 15 minutes (or at your poll interval, if
+  that is longer) instead of sleeping up to six hours.
+- **An out-of-date update no longer replaces a newer one on the strip or in the
+  dock preview.** If the computer's clock is set back, the strip follows again
+  by itself after 5 seconds.
+
+### Changed
+
+- **Setting a new tournament URL clears the strip at once,** keeping the end
+  caps and the message, so the old bracket never shows under the new address.
+  Setting the same URL again changes nothing.
+- **A missing Streamer.bot action is named on the control page.** If
+  `Ticker Push` or `Ticker Announce` is not found, or answers with an error,
+  the dock says so. A slow Streamer.bot that answers within 5 seconds is not
+  treated as a failure.
+- Before an upcoming event Zipper can make up to four requests an hour at the
+  default settings, where it made one or none.
+- With the persistent message on and polling off, the sidecar puts the message
+  on the strip each time it starts. Just after a start that update carries no
+  results, so switching the message off then leaves the strip empty until you
+  press **Start polling** or **Poll now**.
+
+### Development
+
+- `mock-sb-server.mjs` can hold an action's reply (`/mock/delay`), for tests.
+- `ZIPPER_PUSH_RETRY_MS` shortens the 30-second retry, only with
+  `ZIPPER_ALLOW_STUB=1`.
+
+### Not checked
+
+- Nothing here was run against a real Streamer.bot or in OBS: slow and missing
+  replies were tested against the mock only.
+- How StreamElements' counters really behave when a count falls.
+
 ## [1.0.20] — 2026-11-25
 
 Copy `zipper-sidecar.mjs` and the whole `platforms` folder, which has a new
@@ -301,7 +362,8 @@ Initial release — scrolling tournament-results ticker for Streamer.bot.
 Live-validated keyless against real start.gg and Challonge brackets across
 pre-start, mid-event and completed states.
 
-[Unreleased]: https://github.com/FlashGalatine/zipper-ticker/compare/v1.0.20...main
+[Unreleased]: https://github.com/FlashGalatine/zipper-ticker/compare/v1.0.22...main
+[1.0.22]: https://github.com/FlashGalatine/zipper-ticker/compare/v1.0.20...v1.0.22
 [1.0.20]: https://github.com/FlashGalatine/zipper-ticker/compare/v1.0.18...v1.0.20
 [1.0.18]: https://github.com/FlashGalatine/zipper-ticker/compare/v1.0.16...v1.0.18
 [1.0.16]: https://github.com/FlashGalatine/zipper-ticker/compare/v1.0.14...v1.0.16

@@ -10,6 +10,11 @@
 //                      where matches[] entries are the normalized shape in
 //                      docs/PROTOCOL.md: { id, round, state, p1:{name,score},
 //                      p2:{name,score}, winner, order }.
+//                      It may also carry `cutShort: true` when the adapter stopped
+//                      reading early (enough matches for maxItems): an option change
+//                      that asks for more (a higher maxItems, or topN switched on)
+//                      is rebuilt from what it holds and pushed at once, and the
+//                      sidecar then fetches again. No adapter sets it yet.
 //                      `signal` is the poll's AbortSignal (its 45-second deadline,
 //                      or a setUrl that replaced the URL). Pass it to every request,
 //                      and make every request through guardedFetch

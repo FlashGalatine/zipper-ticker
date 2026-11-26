@@ -1,5 +1,5 @@
-// Real-pixel render verification — drives the untouched overlay + control page
-// in a real Chromium (system Edge/Chrome via playwright-core; nothing bundled)
+// Real-pixel render verification — drives the overlay + control page as they ship
+// (the out-of-order pages only get a stand-in clock, see skewClock) in a real Chromium (system Edge/Chrome via playwright-core; nothing bundled)
 // against the mock SB server, injects the sample fixture, and asserts the DOM.
 // Every page it loads also records page errors and console errors, and the run
 // fails on any. Writes test-render-1920.png / test-render-640.png / control-render.png
@@ -81,8 +81,19 @@ for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGBREAK']) process.on(sig, (
 // by itself on its first page, neither page names one, and Streamer.bot's HTTP server
 // has none to give either.
 let browser = null;
-async function openPage(label, viewport, url) {
+// A stand-in for the clock the stamp rule's 5 s window runs on (panel-core reads
+// window.performance.now()): the real one plus a skew the test moves on with
+// window.__zipperTestClockSkew(ms), so the window is tested without waiting for it. Only
+// the pages opened with it get it, through addInitScript; nothing the pages ship reads it.
+function skewClock() {
+  const real = performance.now.bind(performance);
+  let skew = 0;
+  performance.now = () => real() + skew;
+  window.__zipperTestClockSkew = (ms) => { skew += ms; };
+}
+async function openPage(label, viewport, url, { init } = {}) {
   const page = await browser.newPage({ viewport });
+  if (init) await page.addInitScript(init);
   const problems = [];
   page.on('pageerror', (err) => problems.push(`page error: ${err.message}`));
   page.on('console', (msg) => {
@@ -225,6 +236,127 @@ try {
     await closePage(p);
   }
 
+  // Out of order (ZIP-11, decision 14): the overlay and the control preview each get a
+  // newer payload, then a broadcast of an older one, and both keep the newer one on
+  // screen. A payload with the same stamp and other content is applied, and so is the
+  // C#'s connect-sync empty update, which has no generatedAt. The older one is ignored
+  // only within 5 s of the page applying its newest (the owner's ruling of 2026-11-25):
+  // past that it is applied and its stamp becomes the newest, so a far-future stamp does
+  // not freeze the pages. The pages' clock is moved on (skewClock), not waited for.
+  {
+    const sample = JSON.parse(await readFile(resolve(__dirname, 'platforms', 'fixtures', 'sample-update.json'), 'utf-8'));
+    const named = (stamp, name) => {
+      const body = { ...sample, matches: sample.matches.map((m, i) => (i === 0 ? { ...m, p1: { ...m.p1, name } } : m)) };
+      if (stamp === undefined) delete body.generatedAt; else body.generatedAt = stamp;
+      return JSON.stringify(body);
+    };
+    const push = (body) => fetch(`${HTTP}/mock/push`, { method: 'POST', body });
+    const ov = await openPage('out-of-order overlay page', { width: 1920, height: 72 }, `${HTTP}/zipper-overlay/ticker.html?w=1920&sbport=${WS_PORT}`, { init: skewClock });
+    const ctl = await openPage('out-of-order control page', { width: 700, height: 900 }, `${HTTP}/zipper-shared/control.html?sbport=${WS_PORT}`, { init: skewClock });
+    const skew = async (ms) => {
+      for (const p of [ov, ctl]) await p.page.evaluate((m) => window.__zipperTestClockSkew(m), ms);
+    };
+    await ov.page.waitForSelector('.track .seg .item', { timeout: 8000 });
+    await ctl.page.waitForSelector('#preview .m', { timeout: 8000 });
+    const shows = async (name) => {
+      const track = await ov.page.locator('.track').textContent();
+      const preview = await ctl.page.locator('#preview').textContent();
+      return { overlay: track.includes(name), preview: preview.includes(name) };
+    };
+    const waitBoth = async (name) => {
+      await ov.page.waitForFunction((n) => document.querySelector('.track').textContent.includes(n), name, { timeout: 5000 }).catch(() => {});
+      await ctl.page.waitForFunction((n) => document.getElementById('preview').textContent.includes(n), name, { timeout: 5000 }).catch(() => {});
+      return shows(name);
+    };
+    // A marker each page shows once everything broadcast before it has arrived: an
+    // announcement for the overlay, a status line for the control page.
+    let markers = 0;
+    const marker = async () => {
+      const text = `order marker ${++markers}`;
+      await fetch(`${HTTP}/mock/announce?text=${encodeURIComponent(text)}&kind=custom&duration=2`);
+      await sendStatus({ type: 'ticker:status', polling: false, url: null, platform: null, lastPollAt: null, lastError: '', commandNotice: text, intervalMs: 30000, maxItems: 20, topN: 0,
+        caps: { text: '', logo: '' }, message: { enabled: false, text: '' }, auto: { enabled: true, eventState: null, startAt: null, waitingUntil: null, stopped: null }, se: { configured: false, lastPollAt: null, lastError: '' } });
+      await ov.page.waitForFunction((t) => document.getElementById('announce-text').textContent === t, text, { timeout: 5000 }).catch(() => {});
+      await ctl.page.waitForFunction((t) => document.getElementById('status').textContent.includes(t), text, { timeout: 5000 }).catch(() => {});
+    };
+
+    await push(named('2026-07-11T20:20:00Z', 'NewerName'));
+    const newer = await waitBoth('NewerName');
+    await push(named('2026-07-11T20:10:00Z', 'OlderName'));
+    await marker();
+    const kept = await shows('NewerName');
+    const older = await shows('OlderName');
+    check('out of order: after a newer payload, a broadcast of an older one (by generatedAt) is ignored: the overlay and the control preview both keep the newer one on screen',
+      newer.overlay && newer.preview && kept.overlay && kept.preview && !older.overlay && !older.preview, JSON.stringify({ newer, kept, older }));
+    await push(named('2026-07-11T20:20:00Z', 'EqualName'));
+    const equal = await waitBoth('EqualName');
+    check('out of order: a payload with the same stamp and other content is applied on both pages', equal.overlay && equal.preview, JSON.stringify(equal));
+    // Past the window: the older one is applied, and the newest is reset to its stamp.
+    await skew(5001);
+    await push(named('2026-07-11T20:10:00Z', 'LateOlderName'));
+    const late = await waitBoth('LateOlderName');
+    await push(named('2026-07-11T20:05:00Z', 'BelowResetName'));
+    await marker();
+    const belowKept = await shows('LateOlderName');
+    const below = await shows('BelowResetName');
+    await push(named('2026-07-11T20:15:00Z', 'AboveResetName'));
+    const above = await waitBoth('AboveResetName');
+    check('out of order: an older payload that arrives more than 5 s after a page applied its newest is applied on both pages; the newest is reset to its stamp, so one older than that, just after, is ignored, and one newer is applied',
+      late.overlay && late.preview && belowKept.overlay && belowKept.preview && !below.overlay && !below.preview && above.overlay && above.preview,
+      JSON.stringify({ late, belowKept, below, above }));
+    // A far-future stamp ("9999-…") freezes neither page past the window.
+    await push(named('9999-12-31T23:59:59Z', 'FarFutureName'));
+    const far = await waitBoth('FarFutureName');
+    await push(named('2026-07-11T20:16:00Z', 'FrozenName'));
+    await marker();
+    const farKept = await shows('FarFutureName');
+    const frozen = await shows('FrozenName');
+    await skew(5001);
+    await push(named('2026-07-11T20:16:00Z', 'ThawedName'));
+    const thawed = await waitBoth('ThawedName');
+    check('out of order: a far-future stamp ("9999-…") does not freeze the pages: an ordinary payload after it is ignored within the 5 s, and applied on both pages once they have passed',
+      far.overlay && far.preview && farKept.overlay && farKept.preview && !frozen.overlay && !frozen.preview && thawed.overlay && thawed.preview,
+      JSON.stringify({ far, farKept, frozen, thawed }));
+    // Every newer payload starts the window again, as each of the sidecar's pushes does in
+    // steady use: past the window once more, a newer payload is applied, and an older one
+    // 4 s after it is ignored on both pages.
+    await skew(6000);
+    await push(named('2026-07-11T20:17:00Z', 'RestartName'));
+    const restart = await waitBoth('RestartName');
+    await skew(4000);
+    await push(named('2026-07-11T20:16:30Z', 'InsideRestartName'));
+    await marker();
+    const restartKept = await shows('RestartName');
+    const inside = await shows('InsideRestartName');
+    check('out of order: every newer payload starts the 5 s window again: past the window, a newer payload is applied on both pages, and an older one 4 s after it is ignored on both',
+      restart.overlay && restart.preview && restartKept.overlay && restartKept.preview && !inside.overlay && !inside.preview,
+      JSON.stringify({ restart, restartKept, inside }));
+    // The C#'s connect-sync with nothing stored: the empty update, with no generatedAt,
+    // broadcast to every page.
+    await fetch(`${HTTP}/mock/reset`);
+    {
+      const ws = new WebSocket(`ws://127.0.0.1:${WS_PORT}/`);
+      try {
+        await new Promise((res, rej) => { ws.once('open', res); ws.once('error', rej); });
+        const answered = new Promise((res) => ws.on('message', (raw) => { try { if (JSON.parse(String(raw)).id === 'sync') res(true); } catch {} }));
+        ws.send(JSON.stringify({ request: 'DoAction', id: 'sync', action: { name: 'Ticker Push' }, args: { reason: 'overlay-connect' } }));
+        await Promise.race([answered, sleep(3000)]);
+      } finally {
+        try { ws.close(); } catch {}
+      }
+    }
+    await ov.page.waitForFunction(() => document.querySelector('.track').textContent.includes('waiting for results'), null, { timeout: 5000 }).catch(() => {});
+    await ctl.page.waitForFunction(() => document.getElementById('preview').textContent.includes('empty ticker payload'), null, { timeout: 5000 }).catch(() => {});
+    const emptyOverlay = await ov.page.locator('.track').textContent();
+    const emptyPreview = await ctl.page.locator('#preview').textContent();
+    check('out of order: the C#\'s connect-sync empty update, which has no generatedAt, is applied on both pages',
+      emptyOverlay.includes('waiting for results') && emptyPreview.includes('empty ticker payload'), JSON.stringify({ emptyOverlay, emptyPreview }));
+    // The store as the control-page checks below expect it: the sample.
+    await push(JSON.stringify(sample));
+    await closePage(ov);
+    await closePage(ctl);
+  }
+
   // Control page: preview + status fields render.
   const p = await openPage('control page', { width: 700, height: 900 }, `${HTTP}/zipper-shared/control.html?sbport=${WS_PORT}`);
   const { page } = p;
@@ -253,6 +385,21 @@ try {
     const text = await page.locator('#status').textContent();
     const tags = await page.locator('#status i').count();
     check('control: the status line shows the sidecar\'s commandNotice, as text', text.includes(notice) && tags === 0, text);
+  }
+  // …and its actionNotice (row 4.2: an action the sidecar sends to answered "not found").
+  {
+    const notice = 'Ticker Push not found';
+    await sendStatus({
+      type: 'ticker:status', polling: false, url: null, platform: null, lastPollAt: null, lastError: '',
+      commandNotice: '', actionNotice: notice, intervalMs: 30000, maxItems: 20, topN: 0,
+      caps: { text: '', logo: '' }, message: { enabled: false, text: '' },
+      auto: { enabled: true, eventState: null, startAt: null, waitingUntil: null, stopped: null },
+      se: { configured: false, lastPollAt: null, lastError: '' },
+    });
+    await page.waitForFunction((t) => document.getElementById('status').textContent.includes(t), notice, { timeout: 5000 }).catch(() => {});
+    const text = await page.locator('#status').textContent();
+    const errs = await page.locator('#status .err').allTextContents();
+    check('control: the status line shows the sidecar\'s actionNotice ("Ticker Push not found") as an error line', errs.includes(notice), text);
   }
   await closePage(p);
 } catch (err) {
