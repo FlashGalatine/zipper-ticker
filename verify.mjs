@@ -14,15 +14,24 @@
 //      its action; the id map's bound; a push's stamp matched as a time, in the forms
 //      Streamer.bot writes a date in) and the milestone rule (resets, the one-step
 //      boundary, a switch of StreamElements key).
+//   2d. panel-core in a vm context, with a stand-in WebSocket and timers moved on by
+//      hand (no real socket): ?sbport (ZIP-18; a refused one dials nothing and raises
+//      sb:connection with reason sbport-refused), its marker for pages (S2), a WebSocket
+//      constructor that throws,
+//      reconnect pacing (decision 11), the events it raises (sb:connection,
+//      sb:action-queued, sb:action-error, sb:action-timeout; ZIP-17), the id
+//      __ZIPPER_DO_ACTION returns, and its send queue's release (decision 13).
 //   3. Mock-SB E2E: the REAL panel-core.js runs in a browser shim against the
 //      mock server — Subscribe (lowercase), sync-on-connect replay, live push, and
 //      the stamp rule (an update older than the newest is dropped, compared as dates,
 //      but only within 5 s of the newest, which every newer update starts again: the
-//      shim's clock is moved on, not waited for).
+//      shim's clock is moved on, not waited for); its events from the mock's own
+//      replies, and its send queue under the mock's bleed mode (decision 13).
 //   4. The mock itself: its HTTP maps, DoAction replies in Streamer.bot's shape,
 //      its test switches (the delay switch, a slow Streamer.bot whose reply is decided
 //      when the request arrives, among them), and what it refuses (bad requests, other
-//      sites, messages over 1 MiB), and the file types it serves.
+//      sites, messages over 1 MiB), and the file types it serves. Section 3's panel-core
+//      is then retired: its socket closed, and nothing it dials after that connects.
 //   5. The three bus actions as the mock runs them, against the case table
 //      tools/cs/ticker-cases.json (verify-cs.mjs runs the same rows through the
 //      compiled C#).
@@ -104,6 +113,7 @@ import { resolve, dirname, join, sep, basename, win32 } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { connect } from 'node:net';
 import { tmpdir } from 'node:os';
+import vm from 'node:vm';
 import WebSocket from 'ws';
 
 import { detectPlatform, PLATFORMS } from './platforms/index.js';
@@ -1083,6 +1093,497 @@ async function testSidecarBlocks() {
   }
 }
 
+// ── 2d. panel-core in a vm context (ZIP-17, ZIP-18, decision 11 (b), decision 13) ──
+// The real zipper-shared/panel-core.js, run in a fresh vm context per case, as a page
+// loads it: its own location.search, no window.__SB_WS_URL unless the case gives one, a
+// stand-in WebSocket that records the address it is given and every frame sent on it,
+// and timers this suite moves on by hand (Math.random gives the case's own figures). No
+// real socket is opened, so no case can dial a Streamer.bot, and a case that throws
+// leaves no reconnect loop running. Its document is already parsed, unless the case
+// says it is still loading (readyState 'loading'): then domContentLoaded() runs what
+// panel-core left for DOMContentLoaded.
+
+const PANEL_CORE_FILE = resolve(__dirname, 'zipper-shared', 'panel-core.js');
+
+function panelCoreInVm({ search = '', wsUrl, randoms = [], throwsFirst = 0, readyState = 'complete' } = {}) {
+  let now = 0;
+  let timerSeq = 0;
+  const timers = new Map();
+  const setTimeoutFake = (fn, ms) => { const id = ++timerSeq; timers.set(id, { id, at: now + Math.max(0, Number(ms) || 0), fn }); return id; };
+  const clearTimeoutFake = (id) => { timers.delete(id); };
+  const nextTimer = (limit) => {
+    let next = null;
+    for (const t of timers.values()) if (t.at <= limit && (!next || t.at < next.at || (t.at === next.at && t.id < next.id))) next = t;
+    return next;
+  };
+  // Runs every timer due within ms, in order, and leaves the clock at the end.
+  const advance = (ms) => {
+    const end = now + ms;
+    for (let t = nextTimer(end); t; t = nextTimer(end)) { timers.delete(t.id); now = t.at; t.fn(); }
+    now = end;
+  };
+  // Runs timers in order until pred() holds. Gives the time that took, or null when it
+  // does not hold within maxMs.
+  const runUntil = (pred, maxMs) => {
+    const start = now;
+    const end = now + maxMs;
+    while (!pred()) {
+      const t = nextTimer(end);
+      if (!t) { now = end; return null; }
+      timers.delete(t.id);
+      now = t.at;
+      t.fn();
+    }
+    return now - start;
+  };
+  const sockets = [];
+  let constructed = 0;
+  class RecordingWebSocket {
+    constructor(url) {
+      constructed++;
+      if (constructed <= throwsFirst) throw new Error('the stand-in WebSocket refused this address');
+      this.url = String(url);
+      this.readyState = 0;
+      this.sent = [];
+      this.dropped = [];
+      sockets.push(this);
+    }
+    // As a browser's: a send before the socket opens throws, and one after it closed is
+    // dropped without a word.
+    send(text) {
+      if (this.readyState === 0) throw new Error('InvalidStateError: still connecting');
+      if (this.readyState === 1) this.sent.push(JSON.parse(text)); else this.dropped.push(JSON.parse(text));
+    }
+    close() { this.drop(); }
+    // The other end of the socket, driven by the case.
+    open() { this.readyState = 1; this.onopen?.({}); }
+    deliver(m) { this.onmessage?.({ data: JSON.stringify(m) }); }
+    broadcast(data) { this.deliver({ timeStamp: '1970-01-01T00:00:00.0000000', event: { source: 'General', type: 'Custom' }, data }); }
+    drop() { if (this.readyState === 3) return; this.readyState = 3; this.onclose?.({}); }
+    doActions() { return this.sent.filter((f) => f.request === 'DoAction'); }
+  }
+  RecordingWebSocket.CONNECTING = 0;
+  RecordingWebSocket.OPEN = 1;
+  RecordingWebSocket.CLOSING = 2;
+  RecordingWebSocket.CLOSED = 3;
+  const events = [];
+  const listeners = new Map();
+  const offline = []; // each body.offline toggle panel-core makes, in order
+  const domReady = []; // the DOMContentLoaded listeners panel-core added, run by domContentLoaded()
+  const ctx = {
+    console, URLSearchParams,
+    location: { search },
+    setTimeout: setTimeoutFake, clearTimeout: clearTimeoutFake,
+    WebSocket: RecordingWebSocket,
+    CustomEvent: class { constructor(type, opts) { this.type = type; this.detail = opts?.detail; } },
+    document: {
+      readyState,
+      addEventListener: (type, fn) => { if (type === 'DOMContentLoaded') domReady.push(fn); },
+      body: { classList: { toggle: (cls, on) => { if (cls === 'offline') offline.push(on); } } },
+    },
+    performance: { now: () => now },
+    addEventListener: (type, fn) => { (listeners.get(type) || listeners.set(type, []).get(type)).push(fn); },
+    dispatchEvent: (ev) => { events.push({ type: ev.type, detail: ev.detail, at: now }); for (const fn of listeners.get(ev.type) || []) fn(ev); return true; },
+  };
+  ctx.window = ctx; // the global object is the window, as in a page
+  if (wsUrl !== undefined) ctx.__SB_WS_URL = wsUrl;
+  vm.createContext(ctx);
+  vm.runInContext(`Math.random = (() => { const r = ${JSON.stringify(randoms)}; let i = 0; return () => (i < r.length ? r[i++] : 0.5); })();`, ctx);
+  let loadError = null;
+  try { vm.runInContext(readFileSync(PANEL_CORE_FILE, 'utf-8'), ctx, { filename: 'panel-core.js' }); }
+  catch (err) { loadError = err; }
+  return {
+    ctx, sockets, events, advance, runUntil, loadError,
+    evs: (type) => events.filter((e) => e.type === type),
+    constructed: () => constructed,
+    pendingTimers: () => timers.size,
+    offline: () => [...offline],
+    now: () => now,
+    on: ctx.addEventListener,
+    domContentLoaded: () => { ctx.document.readyState = 'interactive'; for (const fn of domReady.splice(0)) fn({ type: 'DOMContentLoaded' }); },
+  };
+}
+
+function testPanelCoreVm() {
+  console.log('\n[2d] panel-core in a vm context: ?sbport, a WebSocket that throws, reconnect pacing, its events and its send queue (no real socket)');
+  const DEFAULT_URL = 'ws://127.0.0.1:8080/';
+  // A case that throws fails its own line, and the cases after it still run.
+  const vmCase = (fn) => {
+    try { fn(); } catch (err) { check('panel-core in a vm context: a case ran to its end', false, String(err && err.stack || err).split('\n').slice(0, 3).join(' | ')); }
+  };
+
+  // Row 6.3 (ZIP-18): ?sbport takes a port from 1 to 65535 and nothing else. A ?sbport
+  // that is there and refused dials nothing (the owner's ruling of 2026-11-26): no socket,
+  // no reconnect, the page marked offline, window.__ZIPPER_SB_PORT_REFUSED true, and one
+  // sb:connection false with reason 'sbport-refused', raised on a zero timer so a listener
+  // added after panel-core loaded still hears it.
+  vmCase(() => {
+    const urlFor = (search, wsUrl) => {
+      const p = panelCoreInVm({ search, wsUrl });
+      return p.loadError ? `threw: ${p.loadError.message}` : (p.sockets[0]?.url ?? null);
+    };
+    // How a page with this address fares, from load to 60 s on.
+    const refusedRun = (search) => {
+      const p = panelCoreInVm({ search });
+      if (p.loadError) return { search, threw: p.loadError.message };
+      // panel-core has run (this vm's document is already loaded): a listener added now
+      // is one a page adds after it.
+      const heard = [];
+      p.on('sb:connection', (e) => heard.push(e.detail));
+      const atLoad = p.evs('sb:connection').length;
+      const doAction = p.ctx.__ZIPPER_DO_ACTION('Ticker Command', { command: 'status', value: '' });
+      const sendCommand = p.ctx.__ZIPPER_SEND_COMMAND('status');
+      p.advance(0);
+      const afterZero = p.pendingTimers();
+      p.advance(60000);
+      return { search, dialled: p.constructed(), atLoad, heard, afterZero, pending: p.pendingTimers(),
+        flag: p.ctx.__ZIPPER_SB_PORT_REFUSED, doAction, sendCommand, offline: p.offline() };
+    };
+    const asRefused = (r) => r.dialled === 0 && r.atLoad === 0 && r.heard.length === 1 && r.heard[0]?.connected === false
+      && r.heard[0]?.reason === 'sbport-refused' && r.heard[0]?.notSent === 0 && JSON.stringify(r.heard[0]?.notSentIds) === '[]' && r.heard[0]?.inFlight === null
+      && r.afterZero === 0 && r.pending === 0 && r.flag === true && r.doAction === false && r.sendCommand === false && r.offline.at(-1) === true;
+    // The last four are numbers to Number() but not digits only. A bare ?sbport (no "=")
+    // is there with an empty value, as ?sbport= is.
+    const refused = ['1@evil.example', 'abc', '0', '00000', '65536', '0065536', '99999', '123456', '', '8e3', '0x1F90', '+80', ' 80'];
+    const runs = [...refused.map((v) => refusedRun(`?sbport=${encodeURIComponent(v)}`)), refusedRun('?sbport'), refusedRun('?w=1920&sbport=abc')];
+    const wrong = runs.filter((r) => !asRefused(r));
+    check('panel-core ?sbport (ZIP-18, the ruling of 2026-11-26): a ?sbport that is not a port from 1 to 65535 written in digits (1@evil.example, abc, 0, 00000, 65536, 0065536, 99999, 123456, empty, 8e3, 0x1F90, +80, " 80", a bare ?sbport, one after another parameter) dials nothing and schedules nothing, even 60 s on; the page is marked offline, __ZIPPER_SB_PORT_REFUSED is true, the send functions return false, and sb:connection { connected: false, reason: "sbport-refused", notSent: 0, notSentIds: [], inFlight: null } is raised once, on a zero timer, to a listener added after panel-core ran',
+      wrong.length === 0, JSON.stringify(wrong.slice(0, 3)));
+    // Digits giving 1 to 65535, however many leading zeros they have (the ruling's words).
+    const accepted = [['1', 'ws://127.0.0.1:1/'], ['65535', 'ws://127.0.0.1:65535/'], ['08082', 'ws://127.0.0.1:8082/'], ['00001', 'ws://127.0.0.1:1/'],
+      ['008080', 'ws://127.0.0.1:8080/'], ['0008082', 'ws://127.0.0.1:8082/']];
+    const wrongOk = accepted.map(([v, want]) => [v, urlFor(`?sbport=${v}`), want]).filter(([, got, want]) => got !== want);
+    check('panel-core ?sbport (ZIP-18, the ruling of 2026-11-26: digits giving 1 to 65535): 1, 65535 and a port written with leading zeros, however many (08082, 00001, 008080, 0008082), are dialled on 127.0.0.1 at that port',
+      wrongOk.length === 0, JSON.stringify(wrongOk));
+    const won = urlFor('?sbport=1234', 'ws://127.0.0.1:9999/');
+    const wonRefused = panelCoreInVm({ search: '?sbport=abc', wsUrl: 'ws://127.0.0.1:9999/' });
+    check('panel-core ?sbport: window.__SB_WS_URL still wins over ?sbport, a refused one too (that page dials __SB_WS_URL and is not marked refused)',
+      won === 'ws://127.0.0.1:9999/' && wonRefused.sockets[0]?.url === 'ws://127.0.0.1:9999/' && wonRefused.ctx.__ZIPPER_SB_PORT_REFUSED === false,
+      JSON.stringify({ won, wonRefused: wonRefused.sockets[0]?.url ?? null, flag: wonRefused.ctx.__ZIPPER_SB_PORT_REFUSED }));
+    const plain = panelCoreInVm({ search: '?w=1920' });
+    const accept = panelCoreInVm({ search: '?sbport=8082' });
+    plain.advance(0);
+    check('panel-core: with no ?sbport in the address the default ws://127.0.0.1:8080/ is dialled as before, and __ZIPPER_SB_PORT_REFUSED is false there and with an accepted ?sbport; no sb:connection is raised before the socket opens',
+      plain.sockets[0]?.url === DEFAULT_URL && plain.ctx.__ZIPPER_SB_PORT_REFUSED === false && accept.ctx.__ZIPPER_SB_PORT_REFUSED === false && plain.evs('sb:connection').length === 0,
+      JSON.stringify({ plain: plain.sockets[0]?.url ?? null, flags: [plain.ctx.__ZIPPER_SB_PORT_REFUSED, accept.ctx.__ZIPPER_SB_PORT_REFUSED], events: plain.evs('sb:connection') }));
+    // S2: the marker a page reads to know it has this panel-core, not an older copy.
+    const marker = plain.ctx.__ZIPPER_PANEL_CORE;
+    check('panel-core (S2): it sets window.__ZIPPER_PANEL_CORE to { api: 2 }, frozen, so a page can tell it from the copy before it (which set none)',
+      marker?.api === 2 && Object.isFrozen(marker), JSON.stringify(marker ?? null));
+  });
+
+  // When the refused event comes (the panel-core header): on a page still being parsed,
+  // nothing is raised and no timer runs until DOMContentLoaded, and then the event comes
+  // on a zero timer, not inside panel-core's own DOMContentLoaded listener. The flag is
+  // set as the file runs, so a listener added later can read it.
+  vmCase(() => {
+    const p = panelCoreInVm({ search: '?sbport=abc', readyState: 'loading' });
+    p.advance(0);
+    const before = { events: p.evs('sb:connection').length, timers: p.pendingTimers(), flag: p.ctx.__ZIPPER_SB_PORT_REFUSED };
+    p.domContentLoaded();
+    const inListener = p.evs('sb:connection').length;
+    p.advance(0);
+    const after = p.evs('sb:connection').map((e) => e.detail);
+    p.advance(60000);
+    check('panel-core (the ruling of 2026-11-26): on a page still being parsed, a refused ?sbport raises nothing and starts no timer before DOMContentLoaded, while __ZIPPER_SB_PORT_REFUSED is already true; then sb:connection (reason sbport-refused) comes once, on a zero timer and not inside the DOMContentLoaded listener, and nothing is dialled',
+      p.loadError === null && before.events === 0 && before.timers === 0 && before.flag === true && inListener === 0
+        && after.length === 1 && after[0]?.reason === 'sbport-refused' && p.evs('sb:connection').length === 1 && p.constructed() === 0,
+      JSON.stringify({ loadError: p.loadError?.message ?? null, before, inListener, after, total: p.evs('sb:connection').length, dialled: p.constructed() }));
+  });
+
+  // Row 6.3 (ZIP-18): a WebSocket constructor that throws schedules a reconnect.
+  vmCase(() => {
+    const p = panelCoreInVm({ throwsFirst: 1 });
+    const before = p.constructed();
+    const offAtLoad = p.evs('sb:connection').map((e) => e.detail);
+    const waited = p.runUntil(() => p.sockets.length > 0, 60000);
+    check('panel-core (ZIP-18): a WebSocket constructor that throws does not end the reconnect chain: a reconnect is scheduled, and the next try opens a socket',
+      p.loadError === null && before === 1 && waited !== null && p.constructed() === 2 && p.sockets.length === 1,
+      JSON.stringify({ loadError: p.loadError?.message ?? null, before, waited, constructed: p.constructed() }));
+    // The page is told, as for a closed socket, so the control page says Streamer.bot is
+    // offline instead of nothing (a port the browser blocks, such as ?sbport=6000).
+    check('panel-core (ZIP-18): a WebSocket constructor that throws raises sb:connection false, with nothing dropped, so the control page can say Streamer.bot is offline',
+      offAtLoad.length === 1 && offAtLoad[0]?.connected === false && offAtLoad[0]?.notSent === 0 && offAtLoad[0]?.inFlight === null,
+      JSON.stringify(offAtLoad));
+  });
+
+  // Row 6.5 (decision 11 (b)): the wait goes back to its start only after a connection has
+  // stayed open 5 s, and each wait has a random part. Math.random gives 0 for the first
+  // five waits (the wait is then exactly its base), then 0.8 and 0.2.
+  vmCase(() => {
+    const p = panelCoreInVm({ randoms: [0, 0, 0, 0, 0, 0.8, 0.2] });
+    const waitForNext = () => { const n = p.sockets.length; return p.runUntil(() => p.sockets.length > n, 60000); };
+    const openFor = (ms) => { const s = p.sockets.at(-1); s.open(); if (ms) p.advance(ms); s.drop(); return waitForNext(); };
+    const grow = [openFor(0), openFor(0), openFor(0)];
+    check('panel-core reconnect pacing (decision 11): a connection that opens and drops at once makes the waits grow (2 s, 3 s, 4.5 s), not start again at 2 s',
+      JSON.stringify(grow) === JSON.stringify([2000, 3000, 4500]), JSON.stringify(grow));
+    const shortOpen = openFor(4999);
+    const stableOpen = openFor(5000);
+    check('panel-core reconnect pacing (decision 11): a connection open 4.999 s does not reset the wait (6.75 s, still growing); one open 5 s does (2 s)',
+      shortOpen === 6750 && stableOpen === 2000, JSON.stringify({ shortOpen, stableOpen }));
+    // Two more waits from the base (each after a connection open 5 s), with random parts
+    // 0.8 and 0.2.
+    const high = openFor(5000);
+    const low = openFor(5000);
+    check('panel-core reconnect pacing (decision 11): successive waits from the same base differ by a random part on top of the base (never below it, and less than half of it)',
+      high !== low && high > 2000 && low > 2000 && high < 3000 && low < 3000, JSON.stringify({ high, low }));
+  });
+
+  // Row 6.2: the events panel-core raises, and what __ZIPPER_DO_ACTION returns.
+  vmCase(() => {
+    const p = panelCoreInVm();
+    const s = p.sockets[0];
+    let atConnect = null;
+    let fromListener = null;
+    p.on('sb:connection', (e) => {
+      if (e.detail?.connected !== true) return;
+      atConnect = s.sent.map((f) => f.request);
+      fromListener = p.ctx.__ZIPPER_SEND_COMMAND('status');
+    });
+    s.open();
+    const conn = p.evs('sb:connection');
+    check('panel-core sb:connection (ZIP-17): true when the socket opens, raised after the Subscribe was sent, so a status probe sent from its listener follows the Subscribe on the wire',
+      conn.length === 1 && conn[0].detail?.connected === true && JSON.stringify(atConnect) === '["Subscribe"]'
+        && s.sent[1]?.request === 'DoAction' && s.sent[1]?.action?.name === 'Ticker Command' && s.sent[1]?.args?.command === 'status',
+      JSON.stringify({ conn, atConnect, sent: s.sent }));
+    check('panel-core: __ZIPPER_DO_ACTION (through __ZIPPER_SEND_COMMAND) returns the request\'s id, the one sent on the wire, so a page can match its own replies',
+      typeof fromListener === 'string' && fromListener !== '' && s.sent[1]?.id === fromListener, JSON.stringify({ fromListener, sent: s.sent[1] ?? null }));
+    // The Subscribe ack sends the connect-sync, on its own id (not behind the probe).
+    s.deliver({ id: s.sent[0].id, status: 'ok' });
+    const sync = s.doActions().find((f) => f.action?.name === 'Ticker Push');
+    if (sync) s.deliver({ id: sync.id, status: 'ok', args: { reason: 'overlay-connect', actionName: 'Ticker Push', queueName: 'Default' } });
+    const syncQueued = p.evs('sb:action-queued').find((e) => sync && e.detail?.id === sync.id);
+    check('panel-core: the connect-sync Ticker Push has its reply read: sb:action-queued names Ticker Push, with sync true, queueName "Default" and defaultQueue true',
+      !!sync && !!syncQueued && syncQueued.detail.action === 'Ticker Push' && syncQueued.detail.sync === true
+        && syncQueued.detail.queueName === 'Default' && syncQueued.detail.defaultQueue === true,
+      JSON.stringify({ sync: sync ?? null, syncQueued: syncQueued ?? null }));
+    s.deliver({ id: fromListener, status: 'ok', args: { command: 'status', value: '', actionName: 'Ticker Command', queueName: 'Zipper' } });
+    const probeQueued = p.evs('sb:action-queued').find((e) => e.detail?.id === fromListener);
+    check('panel-core sb:action-queued (ZIP-17): an ok reply to a request a page sent names the action and the id, with sync false, its queueName, and defaultQueue false for a queue not named "Default"',
+      !!probeQueued && probeQueued.detail.action === 'Ticker Command' && probeQueued.detail.sync === false
+        && probeQueued.detail.queueName === 'Zipper' && probeQueued.detail.defaultQueue === false,
+      JSON.stringify(probeQueued ?? null));
+    // A connect-sync with no reply in 800 ms.
+    const q = panelCoreInVm();
+    const qs = q.sockets[0];
+    qs.open();
+    qs.deliver({ id: qs.sent[0].id, status: 'ok' });
+    const qsync = qs.doActions().find((f) => f.action?.name === 'Ticker Push');
+    q.advance(800);
+    const syncTimeout = q.evs('sb:action-timeout');
+    check('panel-core sb:action-timeout: a connect-sync with no reply within 800 ms raises it, naming Ticker Push, with sync true',
+      !!qsync && syncTimeout.length === 1 && syncTimeout[0].detail.id === qsync.id && syncTimeout[0].detail.action === 'Ticker Push' && syncTimeout[0].detail.sync === true,
+      JSON.stringify({ qsync: qsync ?? null, syncTimeout }));
+  });
+
+  // Decision 13: the page's send queue releases the next send on the matching echo, or
+  // after 800 ms; an error reply releases at once. Each case: a connected panel-core
+  // whose Subscribe and connect-sync were answered, then "first" and "second" sent
+  // together; the case looks for "second" on the wire.
+  const connected = () => {
+    const p = panelCoreInVm();
+    const s = p.sockets[0];
+    s.open();
+    s.deliver({ id: s.sent[0].id, status: 'ok' });
+    const sync = s.doActions().find((f) => f.action?.name === 'Ticker Push');
+    if (sync) s.deliver({ id: sync.id, status: 'ok', args: { queueName: 'Zipper' } });
+    const frame = (command) => s.doActions().find((f) => f.args?.command === command);
+    return { p, s, frame, sent: (command) => !!frame(command), send: (c, v) => p.ctx.__ZIPPER_SEND_COMMAND(c, v) };
+  };
+  vmCase(() => {
+    const { p, s, frame, sent, send } = connected();
+    send('first', 'A');
+    send('second', 'B');
+    const beforeReply = sent('second');
+    s.deliver({ id: frame('first')?.id, status: 'ok', args: { queueName: 'Zipper' } });
+    const afterReply = sent('second');
+    s.broadcast({ type: 'ticker:command', command: 'first', value: 'other' });
+    const afterOtherValue = sent('second');
+    s.broadcast({ type: 'ticker:command', command: 'first', value: 'A' });
+    const afterEcho = sent('second');
+    check('panel-core send queue (decision 13): an ok reply alone does not release the next send (Streamer.bot answers when the action is queued), nor does a ticker:command with another value; the matching echo (same command and value) releases it at once',
+      !beforeReply && !afterReply && !afterOtherValue && afterEcho && p.now() === 0,
+      JSON.stringify({ beforeReply, afterReply, afterOtherValue, afterEcho, now: p.now() }));
+  });
+  vmCase(() => {
+    const { s, frame, sent, send } = connected();
+    send('first', 'A');
+    send('second', 'B');
+    s.broadcast({ type: 'ticker:command', command: 'first', value: 'A' });
+    const afterEcho = sent('second');
+    s.deliver({ id: frame('first')?.id, status: 'ok' });
+    const afterReply = sent('second');
+    check('panel-core send queue (decision 13): the echo and the reply in either order: with the echo first, the reply releases the next send',
+      !afterEcho && afterReply, JSON.stringify({ afterEcho, afterReply }));
+  });
+  vmCase(() => {
+    const { p, s, frame, sent, send } = connected();
+    send('first', 'A');
+    send('second', 'B');
+    s.deliver({ id: frame('first')?.id, status: 'ok' });
+    p.advance(799);
+    const at799 = sent('second');
+    p.advance(1);
+    const at800 = sent('second');
+    check('panel-core send queue (decision 13): with an ok reply and no echo, the next send goes after 800 ms, not before, and no sb:action-timeout is raised (the reply came)',
+      !at799 && at800 && p.evs('sb:action-timeout').length === 0, JSON.stringify({ at799, at800, timeouts: p.evs('sb:action-timeout') }));
+  });
+  vmCase(() => {
+    const { p, s, frame, sent, send } = connected();
+    const firstId = send('first', 'A');
+    send('second', 'B');
+    s.deliver({ id: frame('first')?.id, status: 'error', error: "The action 'Ticker Command' was not found" });
+    const released = sent('second');
+    const missing = p.evs('sb:action-error').find((e) => e.detail?.id === frame('first')?.id);
+    check('panel-core send queue (decision 13): an error reply releases the next send at once; sb:action-error has code action-missing for "was not found", the action, the id __ZIPPER_SEND_COMMAND returned and Streamer.bot\'s text',
+      released && !!missing && missing.detail.id === firstId && missing.detail.action === 'Ticker Command' && missing.detail.code === 'action-missing'
+        && missing.detail.sync === false && missing.detail.error === "The action 'Ticker Command' was not found",
+      JSON.stringify({ released, firstId, missing: missing ?? null }));
+    s.deliver({ id: frame('second')?.id, status: 'error', error: 'Something else went wrong' });
+    const other = p.evs('sb:action-error').find((e) => e.detail?.id === frame('second')?.id);
+    check('panel-core sb:action-error: any other error reply has code "error" and Streamer.bot\'s own text',
+      !!other && other.detail.code === 'error' && other.detail.error === 'Something else went wrong', JSON.stringify(other ?? null));
+  });
+  vmCase(() => {
+    const { p, s, frame, sent, send } = connected();
+    send('first', 'A');
+    send('second', 'B');
+    p.advance(800);
+    const timeouts = p.evs('sb:action-timeout');
+    const released = sent('second');
+    s.deliver({ id: frame('first')?.id, status: 'ok', args: { queueName: 'Zipper' } });
+    const late = p.evs('sb:action-queued').find((e) => e.detail?.id === frame('first')?.id);
+    check('panel-core sb:action-timeout: no reply within 800 ms raises it, naming the action and the id, and the next send goes; a reply that comes later still raises sb:action-queued',
+      timeouts.length === 1 && timeouts[0].detail.id === frame('first')?.id && timeouts[0].detail.action === 'Ticker Command' && released && !!late,
+      JSON.stringify({ timeouts, released, late: late ?? null }));
+  });
+  vmCase(() => {
+    const { p, s, sent } = connected();
+    p.ctx.__ZIPPER_DO_ACTION('Ticker Announce', { kind: ' raid ', text: '  Hello there  ', duration: '5' });
+    p.ctx.__ZIPPER_SEND_COMMAND('second', 'B');
+    const ann = s.doActions().find((f) => f.action?.name === 'Ticker Announce');
+    s.deliver({ id: ann?.id, status: 'ok' });
+    s.broadcast({ type: 'ticker:announce', kind: 'raid', text: 'Hello there!', duration: 5 });
+    const afterOtherText = sent('second');
+    s.broadcast({ type: 'ticker:announce', kind: 'custom', text: 'Hello there', duration: 5 });
+    const afterOtherKind = sent('second');
+    s.broadcast({ type: 'ticker:announce', kind: 'raid', text: 'Hello there', duration: 8 });
+    const afterEcho = sent('second');
+    check('panel-core send queue (decision 13): a Ticker Announce is released by its echo, the same kind and the trimmed text (whatever the duration, which the action clamps); another text or kind does not release it',
+      !!ann && !afterOtherText && !afterOtherKind && afterEcho, JSON.stringify({ afterOtherText, afterOtherKind, afterEcho }));
+  });
+  // The text is trimmed as the C# trims it (String.Trim), not as JavaScript's trim():
+  // .NET takes U+0085 (next line), which trim() leaves, and keeps U+FEFF, which trim()
+  // takes. The mock's copy of the actions trims the same way (section 5's table).
+  vmCase(() => {
+    const NEL = String.fromCharCode(0x85);
+    const BOM = String.fromCharCode(0xfeff);
+    const releasedBy = (text, echoText) => {
+      const { p, s, sent } = connected();
+      p.ctx.__ZIPPER_DO_ACTION('Ticker Announce', { kind: 'custom', text, duration: '5' });
+      p.ctx.__ZIPPER_SEND_COMMAND('second', 'B');
+      const ann = s.doActions().find((f) => f.action?.name === 'Ticker Announce');
+      s.deliver({ id: ann?.id, status: 'ok' });
+      s.broadcast({ type: 'ticker:announce', kind: 'custom', text: echoText, duration: 5 });
+      return sent('second') && p.now() === 0;
+    };
+    const nel = releasedBy(`Next line${NEL}`, 'Next line');
+    const nelBefore = releasedBy(`${NEL}  Next line`, 'Next line');
+    const bom = releasedBy(`${BOM}Kept`, `${BOM}Kept`);
+    check('panel-core send queue (decision 13): an announcement is matched to its echo by its text trimmed as the C# trims it: one ending or starting in U+0085 is released by its echo without it, one starting with U+FEFF by its echo that keeps it',
+      nel && nelBefore && bom, JSON.stringify({ nel, nelBefore, bom }));
+  });
+  // A late echo of a request the 800 ms fail-safe released is that request's own, not the
+  // next one's: two Poll now clicks, then Stop, must not let Stop go while the second
+  // Poll now still runs (they would overlap in the Default queue).
+  vmCase(() => {
+    const { p, s, sent, send } = connected();
+    const id1 = send('pollNow', '');
+    const id2 = send('pollNow', '');
+    send('stop', '');
+    s.deliver({ id: id1, status: 'ok' });
+    p.advance(800); // no echo yet: the fail-safe releases the first, and the second goes
+    const secondSent = s.doActions().filter((f) => f.args?.command === 'pollNow').length === 2;
+    s.deliver({ id: id2, status: 'ok' });
+    s.broadcast({ type: 'ticker:command', command: 'pollNow', value: '' }); // the first's run, late
+    const afterLate = sent('stop');
+    s.broadcast({ type: 'ticker:command', command: 'pollNow', value: '' }); // the second's own
+    const afterOwn = sent('stop');
+    check('panel-core send queue (decision 13): the late echo of a request the fail-safe released does not release the next request alike (Poll now twice, then Stop): Stop waits for the second Poll now\'s own echo, and goes at once with it',
+      secondSent && !afterLate && afterOwn && p.now() === 800, JSON.stringify({ secondSent, afterLate, afterOwn, now: p.now() }));
+  });
+  vmCase(() => {
+    const { p, s, sent, send } = connected();
+    const id1 = send('pollNow', '');
+    const id2 = send('pollNow', '');
+    send('stop', '');
+    p.advance(800); // no answer at all: the first is released, and the second goes
+    s.deliver({ id: id1, status: 'error', error: 'Something else went wrong' }); // so it never runs
+    s.deliver({ id: id2, status: 'ok' });
+    s.broadcast({ type: 'ticker:command', command: 'pollNow', value: '' });
+    const afterEcho = sent('stop');
+    check('panel-core send queue (decision 13): a request released before its answer, whose answer is then an error, never runs: the next echo alike is the second request\'s own, and lets Stop go at once',
+      afterEcho && p.now() === 800, JSON.stringify({ afterEcho, now: p.now() }));
+  });
+  vmCase(() => {
+    const { p, s, sent, send } = connected();
+    const id1 = send('pollNow', '');
+    s.deliver({ id: id1, status: 'ok' });
+    p.advance(800); // released; its echo never comes (an action whose run does nothing)
+    p.advance(5001);
+    const id2 = send('pollNow', '');
+    send('stop', '');
+    s.deliver({ id: id2, status: 'ok' });
+    const at = p.now();
+    s.broadcast({ type: 'ticker:command', command: 'pollNow', value: '' });
+    const afterEcho = sent('stop') && p.now() === at;
+    check('panel-core send queue (decision 13): a released request whose echo never came is forgotten after 5 s, so it does not take the echo of a later request alike: Stop goes at once with that echo',
+      afterEcho, JSON.stringify({ afterEcho, at, now: p.now() }));
+  });
+  vmCase(() => {
+    const { p, s, send } = connected();
+    const id1 = send('pollNow', '');
+    s.deliver({ id: id1, status: 'ok' });
+    p.advance(800); // released; its echo never comes
+    s.drop();
+    p.runUntil(() => p.sockets.length > 1, 60000); // back within 5 s of the release
+    const s2 = p.sockets[1];
+    s2.open();
+    s2.deliver({ id: s2.sent[0].id, status: 'ok' });
+    const sync = s2.doActions().find((f) => f.action?.name === 'Ticker Push');
+    if (sync) s2.deliver({ id: sync.id, status: 'ok', args: { queueName: 'Zipper' } });
+    const id2 = send('pollNow', '');
+    send('stop', '');
+    s2.deliver({ id: id2, status: 'ok' });
+    const at = p.now();
+    s2.broadcast({ type: 'ticker:command', command: 'pollNow', value: '' });
+    const stopSent = s2.doActions().some((f) => f.args?.command === 'stop') && p.now() === at;
+    check('panel-core send queue (decision 13): a close forgets the requests released before their echo, so on the new connection, within 5 s, the first echo of a request alike is that request\'s own: Stop goes at once with it',
+      at - 800 < 5000 && stopSent, JSON.stringify({ sinceRelease: at - 800, stopSent }));
+  });
+  vmCase(() => {
+    const { p, s, frame, send } = connected();
+    send('first', 'A');
+    const idB = send('second', 'B');
+    const idC = send('third', 'C');
+    s.deliver({ id: frame('first')?.id, status: 'ok' });
+    s.drop();
+    const off = p.evs('sb:connection').filter((e) => e.detail?.connected === false);
+    check('panel-core sb:connection (ZIP-17): on a close it is false and carries how many queued requests were never sent (2), their ids, and the request that was on its way, which may not have run',
+      off.length === 1 && off[0].detail.notSent === 2 && JSON.stringify(off[0].detail.notSentIds) === JSON.stringify([idB, idC])
+        && off[0].detail.inFlight?.id === frame('first')?.id && off[0].detail.inFlight?.action === 'Ticker Command' && off[0].detail.inFlight?.replied === true,
+      JSON.stringify({ off, idB, idC }));
+    p.runUntil(() => p.sockets.length > 1, 60000);
+    const s2 = p.sockets[1];
+    s2?.open();
+    s2?.deliver({ id: s2.sent[0]?.id, status: 'ok' });
+    p.advance(3000);
+    const resent = s2 ? s2.doActions().filter((f) => f.action?.name === 'Ticker Command') : null;
+    check('panel-core: nothing queued before a close is sent after the reconnect (a stale command could undo a newer change)',
+      Array.isArray(resent) && resent.length === 0, JSON.stringify(resent));
+  });
+}
+
 // ── Mock server helpers ───────────────────────────────────────────────────────
 
 let mockProc = null;
@@ -1185,11 +1686,20 @@ function busClient() {
 
 // ── 3. panel-core in a browser shim ──────────────────────────────────────────
 
-const received = []; // every CustomEvent panel-core dispatches, for this whole run
+const received = []; // every CustomEvent panel-core dispatches, while the shim runs
 // The shim's monotonic clock, which panel-core reads as window.performance.now(): the real
 // one plus clockSkew, which only ever grows, so the stamp rule's 5 s window is tested by
 // moving the clock on instead of waiting.
 let clockSkew = 0;
+// The shim's panel-core dials again after every close, for as long as this process runs,
+// and each connection it opens sends a connect-sync Ticker Push, which the mock answers by
+// broadcasting the stored payload to every subscriber. So the shim is retired once section
+// 4 is done with it (retirePanelCoreShim): otherwise one of its syncs could land in a later
+// section and be counted there as a push. shimSockets are the sockets it opened;
+// shimRetired switches its WebSocket to a stand-in that never connects.
+const shimSockets = [];
+let shimRetired = false;
+let shimDialsAfterRetiring = 0;
 async function testPanelCore() {
   console.log('\n[3] panel-core (real file, browser shim, mock SB)');
 
@@ -1207,7 +1717,18 @@ async function testPanelCore() {
     body: { classList: { toggle: () => {} } },
   };
   globalThis.location = { search: '' };
-  globalThis.WebSocket = WebSocket;
+  // A WebSocket as panel-core uses it (readyState, send, the on* handlers, OPEN), whose
+  // instances are kept, so the shim can be closed; once retired, one that never connects.
+  globalThis.WebSocket = class ShimWebSocket extends WebSocket {
+    constructor(...a) {
+      if (shimRetired) {
+        shimDialsAfterRetiring++;
+        return { readyState: 0, send() { throw new Error('the retired shim never connects'); }, close() {} };
+      }
+      super(...a);
+      shimSockets.push(this);
+    }
+  };
 
   await import('./zipper-shared/panel-core.js');
 
@@ -1320,6 +1841,67 @@ async function testPanelCore() {
     const newestLast = await pushSeen('2026-07-11T20:15:05Z', 'stamp-newest-last');
     check('panel-core: every newer update starts the 5 s window again: past the window, a newer stamp is applied, and an older one 4.7 s after it is dropped',
       newerRestarts === true && olderInNewWindow === false && newestLast === true, JSON.stringify({ newerRestarts, olderInNewWindow, newestLast }));
+  }
+
+  // Row 6.2 (ZIP-17), from the mock's own replies, in Streamer.bot 1.0.7's shape: an
+  // action it says it does not have, and a reply that names the Default queue. Nothing
+  // listens to these commands here (no sidecar runs in this section).
+  {
+    const W = globalThis.window;
+    await mockGet(`/mock/missing?name=${enc('Ticker Command')}&on=1`);
+    let id, err;
+    try {
+      const at = received.length;
+      id = W.__ZIPPER_SEND_COMMAND('status');
+      err = await waitFor(() => received.slice(at).find((e) => e.type === 'sb:action-error'), 3000);
+    } finally {
+      await mockGet(`/mock/missing?name=${enc('Ticker Command')}&on=0`);
+    }
+    check('panel-core against the mock (ZIP-17): a request for an action the mock does not have raises sb:action-error with code action-missing, the action, the id __ZIPPER_SEND_COMMAND returned, and the reply\'s own text',
+      !!err && typeof id === 'string' && err.detail?.id === id && err.detail.action === 'Ticker Command' && err.detail.code === 'action-missing'
+        && err.detail.error === "The action 'Ticker Command' was not found",
+      JSON.stringify({ id, err: err?.detail ?? null }));
+    await mockGet(`/mock/queue?name=${enc('Ticker Command')}&queue=Default`);
+    let id2, queued;
+    try {
+      const at = received.length;
+      id2 = W.__ZIPPER_SEND_COMMAND('status');
+      queued = await waitFor(() => received.slice(at).find((e) => e.type === 'sb:action-queued'), 3000);
+    } finally {
+      await mockGet(`/mock/queue?name=${enc('Ticker Command')}&queue=`);
+    }
+    check('panel-core against the mock (ZIP-17): an ok reply that names the Default queue raises sb:action-queued with queueName "Default" and defaultQueue true',
+      !!queued && typeof id2 === 'string' && queued.detail?.id === id2 && queued.detail.action === 'Ticker Command'
+        && queued.detail.queueName === 'Default' && queued.detail.defaultQueue === true,
+      JSON.stringify({ id2, queued: queued?.detail ?? null }));
+  }
+
+  // Decision 13 under the mock's bleed mode (Streamer.bot's Default queue, as measured):
+  // a status probe and an Apply sent together each run with their own arguments, because
+  // the second goes only once the first one's echo is in, not on its reply (which comes
+  // when the action is queued). Released on the reply, both would land in one 10 ms
+  // window and both run with the Apply's arguments.
+  {
+    const W = globalThis.window;
+    const c = await sbClient();
+    const opts = JSON.stringify({ intervalMs: 45000, maxItems: 12, topN: 0 });
+    let cmds = [];
+    try {
+      await mockGet('/mock/bleed?on=1');
+      const at = c.frames.length;
+      const commandsSince = () => c.custom(at).map((d) => (typeof d === 'string' ? null : d)).filter((d) => d?.type === 'ticker:command');
+      W.__ZIPPER_SEND_COMMAND('status');
+      W.__ZIPPER_SEND_COMMAND('setOptions', opts);
+      await waitFor(() => commandsSince().length >= 2, 4000);
+      await sleep(300); // a third (a bled repeat) would be in by now
+      cmds = commandsSince();
+    } finally {
+      await mockGet('/mock/bleed?on=0');
+      closeClient(c);
+    }
+    check('panel-core send queue under the mock\'s bleed mode (decision 13): a status probe and an Apply sent together each run once, with their own arguments',
+      cmds.length === 2 && cmds[0].command === 'status' && cmds[0].value === '' && cmds[1].command === 'setOptions' && cmds[1].value === opts,
+      JSON.stringify(cmds));
   }
 }
 
@@ -1590,7 +2172,8 @@ async function testMock() {
   }
 
   // /mock/kick closes every open socket. panel-core's (section 3) is one of them: wait
-  // until it has reconnected and synced again, so no late sync lands in later sections.
+  // until it has reconnected and synced again. It is retired after this section
+  // (retirePanelCoreShim), so no late sync of its lands in later sections.
   {
     const atRecv = received.length;
     const kicked = await mockGet('/mock/kick');
@@ -1605,6 +2188,23 @@ async function testMock() {
   }
   closeClient(a);
   closeClient(b);
+  await retirePanelCoreShim();
+}
+
+// Section 4 is the shim's last user. Retired, its socket is closed and the next one it
+// dials (its reconnect wait is 2 to 18.75 s) is a stand-in that never connects, so no
+// connect-sync of its lands in a later section (S3: 6i's row 4.3 once counted
+// "pushed":1 with no URL set; its reconnect waits grow with 6i's kicks and can end inside
+// that check). Its timer then stops: a socket that never opens never closes.
+async function retirePanelCoreShim() {
+  shimRetired = true;
+  for (const s of shimSockets) { try { s.close(); } catch {} }
+  const closed = await waitFor(() => shimSockets.every((s) => s.readyState === WebSocket.CLOSED), 3000);
+  await waitFor(() => shimDialsAfterRetiring > 0, 20000, 50);
+  await sleep(200); // a socket it had opened instead would have reached the mock by now
+  const st = await stats();
+  check('S3: section 3\'s panel-core shim is retired after section 4: its socket is closed, and when its reconnect timer fires it dials a stand-in that never connects, so the mock has no client left and no later section can count its connect-sync',
+    closed === true && shimDialsAfterRetiring === 1 && st.clients === 0, JSON.stringify({ closed, dialsAfter: shimDialsAfterRetiring, clients: st.clients }));
 }
 
 // ── 5. The bus actions as the mock runs them: the case table ─────────────────
@@ -3668,6 +4268,11 @@ const isSetUrlBlank = (d, url) => isUpdate(d) && d.tournament?.url === url && !h
 
 async function testPushes() {
   console.log('\n[6i] what is pushed, and when: setUrl\'s blank, caps and options from the last result, the change check, the 15-minute cap, actionNotice, a push owed across a reconnect');
+  // This section counts pushes on the bus. Section 3's panel-core shim, left connected,
+  // would add its connect-sync after each kick here (S3), so it must be retired by now.
+  check('S3: section 3\'s panel-core shim is retired before 6i counts pushes: every socket it opened is closed',
+    shimRetired === true && shimSockets.length > 0 && shimSockets.every((s) => s.readyState === WebSocket.CLOSED),
+    JSON.stringify({ shimRetired, sockets: shimSockets.length, open: shimSockets.filter((s) => s.readyState !== WebSocket.CLOSED).length }));
   const statusOf = (d) => (isStatus(d) ? parseStatus(d) : null);
   const T = (name) => `stub:${TMP_REL}/${name}`;
   const fixture = (name, body) => writeFile(join(TMP_DIR, name), typeof body === 'string' ? body : JSON.stringify(body), 'utf-8');
@@ -3720,8 +4325,8 @@ async function testPushes() {
   };
   // Closes every connection and waits until the mock has none; reconnect() opens the bus
   // client again and waits for the sidecar itself to be back (it waits 3 s before it
-  // dials again, and logs when it is connected). A count of the mock's clients would not
-  // do: section 3's panel-core shim is connected too, and comes back sooner (2 s).
+  // dials again, and logs when it is connected). Section 3's panel-core shim, which came
+  // back on its own pace and sent a connect-sync each time, was retired after section 4.
   let kickedAt = 0;
   const kick = async () => {
     kickedAt = sc.out.length;
@@ -6118,6 +6723,7 @@ try {
   testDetection();
   await testFetchWrapper();
   await testSidecarBlocks();
+  testPanelCoreVm();
   await startMock();
   await testPanelCore();
   await testMock();

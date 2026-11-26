@@ -228,7 +228,9 @@ the bus once, in that command. A caps text cut at 120 characters, a logo cut
 at 500, or a message cut at 1000, can keep the first 1 to 7 characters of a
 key the cut fell inside. The control page fills its boxes from the status, so they show
 the label, and applying them again (the message's checkbox too) saves the
-label in place of the key.
+label in place of the key. A box the streamer has typed in is the exception: it
+keeps what was typed until a status carries the value its own Apply or Set sent,
+so a box holding a key stays as typed, and marked, until Esc or a reload.
 
 The status carries an `auto` block describing the auto-scheduler (see
 `setAutoSchedule` below):
@@ -444,7 +446,18 @@ passed as they are. An unknown name is ignored and reported in the status's
 > the README's setup asks for it. The batching stays as a second guard for an
 > install without that queue: each control button sends exactly **one** command
 > carrying a JSON value, and `panel-core` additionally serializes outbound
-> `DoAction`s (one in flight at a time). The single-field commands remain for
+> `DoAction`s (one in flight at a time). The connect-sync `Ticker Push` a page
+> sends when it connects goes on its own request, not through the page's queue.
+> Streamer.bot answers a `DoAction` when the action is queued, not when it has
+> run, so a page sends its next request
+> only once Streamer.bot's answer and the run's own broadcast are both in (the
+> `ticker:command` with the same command and value, or the `ticker:announce`
+> with the same kind and text), or after 800 ms. Text is trimmed as the C#
+> trims it, which takes U+0085 (next line) as well. An error answer lets the
+> next go at once. A broadcast that comes after its request was let go at
+> 800 ms belongs to that request, not to the next one alike, for up to 5 s.
+> The sidecar's own sends follow the same rule, and also take a `ticker:error`
+> as the end of a run; a page does not. The single-field commands remain for
 > chat / Stream Deck.
 
 ## ticker:announce
@@ -511,7 +524,11 @@ only `se: { configured, lastPollAt, lastError }`.
 ## ticker:error
 
 Broadcast by either C# action when it throws, so failures are visible instead
-of silent: `{ "type": "ticker:error", "message": "…" }`.
+of silent: `{ "type": "ticker:error", "message": "…" }`. The control page shows
+the message in its banner until the next `ticker:command` or `ticker:announce`
+broadcast, a status, or a reconnect. It reads a `code` only when one is there.
+A `ticker:error` carries no sender, so the page also stops waiting for the
+echo of the clicks it has sent: it does not then say they "did not answer".
 
 ## Test hook
 

@@ -120,7 +120,19 @@ start-zipper.bat        (or: npm run sidecar)
 polls and pushes. If it isn't up, the control page shows a red banner and the
 Start / Poll / Stop / end-cap buttons do nothing (announcements still work, as
 those go Streamer.bot → overlay without the sidecar). The `Ticker Sidecar
-Start` action above lets Streamer.bot launch it for you.
+Start` action above lets Streamer.bot launch it for you. The banner says when
+the problem is Streamer.bot instead: "Streamer.bot offline", "Action missing"
+(an action from step 1 is not there, or has another name), or "Ticker Command
+did not answer" (check that its code compiled). Two more lines come first when
+they hold. One says the page did not connect at all, because the `?sbport=` in
+its address is not a port from 1 to 65535 (an empty one too). The page then
+dials nothing, not even the usual 8080: fix the number and reload. The other
+says an older copy of `panel-core.js` is loaded, which OBS or the browser kept:
+reload the dock, and if that does not help, restart OBS. If `panel-core.js`
+did not load at all (the `zipper-shared` folder is not where the page looks
+for it), the dot is red and the page says so. Under the status line
+the page also says when an action is in Streamer.bot's Default queue (see
+step 1), and how many clicks were not sent when the connection dropped.
 
 Copy `config.example.json` → `config.json` for API keys (optional but
 recommended: `challongeApiKey`, `startggApiKey` — without them Zipper falls
@@ -180,6 +192,9 @@ Open the control page — in a browser or as an OBS custom dock:
 http://127.0.0.1:7474/zipper-shared/control.html
 ```
 
+A box you type in keeps what you typed, and is marked, until the sidecar
+reports the value you applied; press Esc in it to put back the current value.
+
 Paste the tournament URL (e.g. `https://challonge.com/blko42` or
 `https://www.start.gg/tournament/…/event/…`), **Set**, **Start polling**. **Set**
 with a new URL clears the old tournament's results from the strip at once (the
@@ -236,6 +251,9 @@ tournament needs to be set, so it doubles as a plain message ticker. From chat:
   stopped, or restart it afterwards (see step 4). The token stays in the file;
   it is never broadcast, and never written to the log.
 - **Manual:** the control page's Announcement box sends anything you type.
+  The text stays in the box until the announcement comes back from
+  Streamer.bot, then the box clears. A second click on Send while the same
+  text is still on its way sends nothing, so it is not shown twice.
 
 ## Platform notes
 

@@ -6,10 +6,13 @@
 <title>Zipper — ticker control</title>
 <!--
   Browser control page — open http://127.0.0.1:7474/zipper-shared/control.html
-  in any browser (or dock it in OBS: Docks → Custom Browser Docks). Everything
-  goes through the "Ticker Command" Streamer.bot action; the sidecar answers
-  with ticker:status snapshots, and the live preview mirrors ticker:update.
-  ?sbport=<n> overrides the Streamer.bot WebSocket port.
+  in any browser (or dock it in OBS: Docks → Custom Browser Docks). The buttons
+  go through the "Ticker Command" Streamer.bot action, and the Announce box
+  through "Ticker Announce"; the sidecar answers with ticker:status snapshots,
+  and the live preview mirrors ticker:update.
+  ?sbport=<n> overrides the Streamer.bot WebSocket port (1 to 65535). Any other
+  value, an empty one too, makes the page connect to nothing, and the banner
+  says so.
 -->
 <style>
   :root { --bg:#14171c; --panel:#1c2129; --ink:#e8ecf1; --muted:#8b94a3; --acc:#ffd166; --bad:#ff4d5e; --ok:#3ddc84; --edge:#2a3342; }
@@ -21,7 +24,9 @@
   .sub { color:var(--muted); font-size:12px; margin-bottom:14px; }
   .warn { display:none; color:#ffd7dd; background:#241318; border:1px solid var(--bad);
     border-radius:8px; padding:9px 12px; font-size:12.5px; line-height:1.45; margin:0 0 12px; }
-  body.no-sidecar .warn { display:block; }
+  body.no-sidecar #sidecar-note, #sb-note.on { display:block; }
+  .page-note { font-size:12px; color: var(--acc); margin-top:6px; white-space: pre-line; }
+  .page-note:empty { display:none; }
   .warn b { color:#fff; }
   .warn code { background:#3a1a20; padding:.05em .4em; border-radius:4px; color:#ffd7dd; }
   fieldset { border:1px solid var(--edge); border-radius:8px; background:var(--panel); margin:0 0 12px; padding:12px 14px; }
@@ -31,6 +36,10 @@
   textarea { resize:vertical; min-height:60px; }
   .chk { display:flex; align-items:center; gap:7px; margin:0; color:var(--ink); font-size:13px; cursor:pointer; }
   .chk input { accent-color: var(--acc); width:15px; height:15px; }
+  /* A box typed in and not yet confirmed. After the box rules above: input[type=text]
+     sets the border with the same specificity as input.dirty, so the later rule wins. */
+  input.dirty, textarea.dirty { border-color: var(--acc); box-shadow: inset 3px 0 0 var(--acc); }
+  .chk input.dirty { outline: 2px solid var(--acc); outline-offset: 2px; }
   .hint { color:var(--muted); font-size:11.5px; margin-top:6px; }
   .row { display:flex; gap:8px; align-items:flex-end; }
   .row > div { flex:1 1 auto; }
@@ -52,9 +61,10 @@
   .preview .rnd { color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.06em; margin-right:6px; }
 </style>
 </head>
-<body>
+<body class="offline">
 <h1><span class="dot"></span>Zipper — Tournament Ticker</h1>
 <div class="sub">Ticker Command → sidecar · needs the sidecar running (<code>npm run sidecar</code>)</div>
+<div id="sb-note" class="warn" role="status"></div>
 <div id="sidecar-note" class="warn">
   ⚠ <b>The Zipper sidecar isn't responding.</b> Streamer.bot is connected (announcements still work),
   but <b>Start / Poll / Stop / Options / end-cap / message</b> buttons do nothing until the sidecar is running.
@@ -148,6 +158,7 @@
 <fieldset>
   <legend>Status</legend>
   <div class="status" id="status"><span class="dim">waiting for sidecar…</span></div>
+  <div class="page-note" id="page-note" role="status"></div>
   <div class="preview" id="preview"><span class="dim">no ticker payload yet</span></div>
 </fieldset>
 
@@ -158,79 +169,350 @@
   const $ = (id) => document.getElementById(id);
   const esc = (s) => { const d = document.createElement('div'); d.textContent = String(s ?? ''); return d.innerHTML; };
 
-  // Sidecar liveness: every command should draw a ticker:status reply from the
-  // sidecar. If none arrives within the window, the sidecar is down — the
-  // commands are being broadcast into the void (announcements still work, since
-  // those go SB → overlay without the sidecar). Show a banner instead of
-  // silently swallowing the click.
-  let lastStatusAt = 0;
-  let heartbeatTimer = null;
+  // ── What the page knows of Streamer.bot and the sidecar (ZIP-17) ──────────────
+  // The banner shows one line: the first of these that holds. It is built from what
+  // Streamer.bot answers (panel-core's sb:* events) and what comes back on the bus.
+  //   noCore         no panel-core.js loaded at all (a wrong folder, a 404): nothing
+  //                  can connect, so the page says the file did not load. The body
+  //                  starts with class "offline" for this case; a panel-core that
+  //                  loads sets that class itself. Checked once, at start.
+  //   oldCore        the panel-core.js that loaded sets no __ZIPPER_PANEL_CORE: an older
+  //                  copy, kept by OBS or the browser. It raises none of the sb:* events
+  //                  the lines below need, so the page says to reload. Checked once, at
+  //                  start.
+  //   portRefused    panel-core refused this page's ?sbport and connected to nothing
+  //                  (its __ZIPPER_SB_PORT_REFUSED, or sb:connection's reason)
+  //   offline        the socket is closed: "Streamer.bot offline"
+  //   missing        an answer "The action '…' was not found": "Action missing", naming it
+  //   refused        any other error answer, in Streamer.bot's own words
+  //   runError       a ticker:error (an action threw), until the next echo, status or
+  //                  reconnect
+  //   noAnswer       a click's action answered ok (or not at all) and the click's echo
+  //                  did not come within ECHO_WAIT_MS: "<action> did not answer"
+  //   sidecarSilent  a click's echo came and no status followed within HEARTBEAT_MS:
+  //                  the sidecar note (body.no-sidecar). Streamer.bot is fine; the
+  //                  sidecar is not running.
+  const ECHO_WAIT_MS = 1500;
   const HEARTBEAT_MS = 3000;
-  function armHeartbeat() {
-    if (heartbeatTimer) clearTimeout(heartbeatTimer);
-    heartbeatTimer = setTimeout(() => {
-      heartbeatTimer = null;
-      if (Date.now() - lastStatusAt > HEARTBEAT_MS - 250) document.body.classList.add('no-sidecar');
-    }, HEARTBEAT_MS);
-  }
-  function noteSidecarAlive() {
-    lastStatusAt = Date.now();
-    document.body.classList.remove('no-sidecar');
-    if (heartbeatTimer) { clearTimeout(heartbeatTimer); heartbeatTimer = null; }
+  const PROBE_MS = 10000;
+  const link = {
+    // An older panel-core.js sends, but returns true and not a request id, and raises no
+    // sb:* event. Only a copy that loaded is named: with none, there is nothing to name.
+    noCore: typeof window.__ZIPPER_DO_ACTION !== 'function',
+    oldCore: typeof window.__ZIPPER_DO_ACTION === 'function'
+      && !(window.__ZIPPER_PANEL_CORE && window.__ZIPPER_PANEL_CORE.api >= 2),
+    portRefused: window.__ZIPPER_SB_PORT_REFUSED === true,
+    connected: null,          // null until the socket first opens or closes
+    missing: new Set(),       // actions Streamer.bot says it does not have
+    refused: null,            // { action, error }: another error answer
+    runError: null,           // the text of the last ticker:error
+    noAnswer: new Set(),      // actions whose echo did not come
+    sidecarSilent: false,
+    defaultQueue: new Set(),  // actions whose last answer named the Default queue
+  };
+  let clickNote = '';         // what happened to the last click(s), when it is worth saying
+
+  function showBanner() {
+    let text = '';
+    if (link.noCore) {
+      text = 'panel-core.js did not load, so this page cannot connect. Check that the zipper-shared folder is served, then reload this dock.';
+    } else if (link.oldCore) {
+      text = 'An older copy of panel-core.js is loaded. Reload this dock; if that does not help, restart OBS.';
+    } else if (link.portRefused) {
+      // The refused value itself is never shown.
+      text = "The port in this page's address was refused, so the page did not connect. Fix ?sbport (a number from 1 to 65535) and reload.";
+    } else if (link.connected === false) {
+      text = 'Streamer.bot offline: retrying. Check that its WebSocket Server is running, with authentication off.';
+    } else if (link.missing.size) {
+      text = `Action missing: Streamer.bot has no action named ${[...link.missing].map((a) => `"${a}"`).join(' or ')}. Create it and paste its code (README, setup step 1).`;
+    } else if (link.refused) {
+      text = `Streamer.bot refused ${link.refused.action}${link.refused.error ? `: ${link.refused.error}` : '.'}`;
+    } else if (link.runError !== null) {
+      text = `A Zipper action failed in Streamer.bot: ${link.runError.replace(/[.!?]+$/, '')}. See Streamer.bot's log.`;
+    } else if (link.noAnswer.size) {
+      text = [...link.noAnswer].map((a) => `${a} did not answer; check that it compiled (README, setup step 1).`).join(' ');
+    }
+    $('sb-note').textContent = text;
+    $('sb-note').classList.toggle('on', !!text);
+    document.body.classList.toggle('no-sidecar', !text && link.connected === true && link.sidecarSilent);
   }
 
-  const send = (command, value) => {
-    if (!window.__ZIPPER_SEND_COMMAND || !window.__ZIPPER_SEND_COMMAND(command, value)) {
-      $('status').innerHTML = '<span class="err">Not connected to Streamer.bot — is its WebSocket Server running (auth off)?</span>';
-      return;
+  // The page's own notes, under its status line: the Default queue, and clicks a
+  // closed connection dropped.
+  function showNotes() {
+    const inDefault = [...link.defaultQueue];
+    const queueNote = inDefault.length
+      ? `${inDefault.join(' and ')} ${inDefault.length > 1 ? 'are' : 'is'} in Streamer.bot's Default queue, where two runs of one action that arrive together can both run with one run's arguments. Put Ticker Command, Ticker Push and Ticker Announce in one blocking queue (README, setup step 1).`
+      : '';
+    $('page-note').textContent = [queueNote, clickNote].filter(Boolean).join('\n');
+  }
+  function droppedNote(n, onItsWay) {
+    const lost = n === 1 ? '1 click was not sent' : `${n} clicks were not sent`;
+    if (n && onItsWay) return `${lost}: the connection to Streamer.bot closed first. The click sent just before ${n === 1 ? 'it' : 'them'} may not have run.`;
+    if (n) return `${lost}: the connection to Streamer.bot closed first.`;
+    return 'The last click may not have run: the connection to Streamer.bot closed while it was on its way.';
+  }
+
+  // Sidecar liveness: every command should draw a ticker:status from the sidecar. Once a
+  // click's echo is in (Streamer.bot ran Ticker Command), a status is due within
+  // HEARTBEAT_MS; if none comes, the sidecar is not running.
+  let heartbeatTimer = null;
+  function clearHeartbeat() { if (heartbeatTimer) { clearTimeout(heartbeatTimer); heartbeatTimer = null; } }
+  function armHeartbeat() {
+    clearHeartbeat();
+    heartbeatTimer = setTimeout(() => { heartbeatTimer = null; link.sidecarSilent = true; showBanner(); }, HEARTBEAT_MS);
+  }
+  function noteSidecarAlive() { link.sidecarSilent = false; clearHeartbeat(); }
+
+  // The page's own requests, by request id, until their echo comes. The wait for it
+  // starts with the answer (or with no answer in 800 ms) and lasts ECHO_WAIT_MS. When it
+  // runs out the page says "did not answer" and keeps the request as late: an echo that
+  // still comes ends it, so the Announce box still clears and a Ticker Command's echo
+  // still arms the heartbeat. A ticker:error ends the waits the same way, without "did
+  // not answer": its own line says what went wrong. Only the newest LATE_MAX late
+  // requests are kept, and none outlives a reconnect.
+  const LATE_MAX = 16;
+  const awaitingEcho = new Map(); // id → { action, command, value, text, probe, timer, late }
+  const probeIds = new Set();     // ids of status probes, which are not clicks
+  // An older panel-core.js (link.oldCore) gives true for every request, not its id, and
+  // raises no answer. Each such request is kept under an id of the page's own, so one
+  // does not take another's place. Its wait for the echo starts when the current
+  // panel-core's sb:action-timeout would come (NO_ANSWER_MS, its 800 ms).
+  const NO_ANSWER_MS = 800;
+  let pageIds = 0;
+  function track(id, entry) {
+    const key = typeof id === 'string' ? id : `page-${++pageIds}`;
+    awaitingEcho.set(key, { ...entry, timer: null, late: false });
+    if (entry.probe) {
+      probeIds.add(key);
+      if (probeIds.size > 64) probeIds.delete(probeIds.values().next().value);
     }
-    armHeartbeat(); // expect a status reply from the sidecar; warn if it never comes
+    if (key !== id) setTimeout(() => startEchoWait(key), NO_ANSWER_MS);
+  }
+  function markLate(id) {
+    const e = awaitingEcho.get(id);
+    if (!e) return;
+    if (e.timer) { clearTimeout(e.timer); e.timer = null; }
+    e.late = true;
+    const late = [...awaitingEcho.keys()].filter((k) => awaitingEcho.get(k).late);
+    for (const k of late.slice(0, Math.max(0, late.length - LATE_MAX))) awaitingEcho.delete(k);
+  }
+  function startEchoWait(id) {
+    const e = awaitingEcho.get(id);
+    if (!e || e.timer || e.late) return;
+    e.timer = setTimeout(() => { e.timer = null; markLate(id); link.noAnswer.add(e.action); showBanner(); }, ECHO_WAIT_MS);
+  }
+  function endEchoWait(id) {
+    const e = awaitingEcho.get(id);
+    if (e && e.timer) clearTimeout(e.timer);
+    awaitingEcho.delete(id);
+  }
+  // The request whose echo this is: the oldest one still waiting for it, else the oldest
+  // late one. A request that never ran must not take the echo of a newer one alike.
+  function echoOf(match) {
+    for (const [id, e] of awaitingEcho) if (!e.late && match(e)) return [id, e];
+    for (const [id, e] of awaitingEcho) if (e.late && match(e)) return [id, e];
+    return null;
+  }
+  // Trimmed as JavaScript and the C# actions both trim: U+0085, which only .NET takes,
+  // as well. The text kept to match an echo is then the text the action broadcasts.
+  const trimText = (s) => String(s ?? '').replace(/^[\s\u0085]+|[\s\u0085]+$/g, '');
+
+  // One command per click. Returns its request id, or false when it was not sent.
+  const send = (command, value) => {
+    const id = window.__ZIPPER_SEND_COMMAND ? window.__ZIPPER_SEND_COMMAND(command, value) : false;
+    if (!id) {
+      clickNote = 'Not connected to Streamer.bot: that click was not sent.';
+      showNotes();
+      return false;
+    }
+    if (clickNote) { clickNote = ''; showNotes(); }
+    track(id, { action: 'Ticker Command', command: String(command), value: value == null ? '' : String(value), probe: false });
+    return id;
+  };
+  // The status probe: on every (re)connect, and every PROBE_MS while the page is open.
+  const probe = () => {
+    const id = window.__ZIPPER_SEND_COMMAND ? window.__ZIPPER_SEND_COMMAND('status') : false;
+    if (id) track(id, { action: 'Ticker Command', command: 'status', value: '', probe: true });
   };
 
-  $('btn-seturl').onclick = () => send('setUrl', $('url').value.trim());
+  // ── Edits kept (ZIP-03) ────────────────────────────────────────────────────────
+  // A field is dirty from its first input until a status carries the value its own Apply
+  // or Set sent, as the sidecar stores it: after the page's own trims and fallbacks, and
+  // the sidecar's clamps and cuts. Neither Streamer.bot's answer (it comes when the action
+  // is queued) nor the mere arrival of a status settles it: a status sent before the
+  // sidecar had the change would put the old value back. A field typed in again after
+  // its send stays dirty. Dirty fields are marked, and Esc puts the live value back. A
+  // logo the sidecar refuses stays dirty, and the status line says why.
+  const FIELDS = ['url', 'interval', 'maxitems', 'topn', 'capstext', 'capslogo', 'msgtext', 'msgon', 'autosched'];
+  const dirty = new Map(); // field id → the send that settles it, { box, expect }, or null before one
+  const live = {};         // field id → what the last status put in the box
+  const liveRaw = { interval: 30000, maxitems: 20, topn: 0 }; // the same in the status's own terms
+  const boxValue = (id) => ($(id).type === 'checkbox' ? $(id).checked : $(id).value);
+  const setBox = (id, v) => { if ($(id).type === 'checkbox') $(id).checked = !!v; else $(id).value = v; };
+  for (const id of FIELDS) live[id] = boxValue(id);
+
+  function markDirty(id) { if (!dirty.has(id)) dirty.set(id, null); $(id).classList.add('dirty'); }
+  function markClean(id) { dirty.delete(id); $(id).classList.remove('dirty'); }
+  // A dirty field was sent: what its box held, and what a status will carry once the
+  // sidecar has it.
+  function noteSent(id, expect) { if (dirty.has(id)) dirty.set(id, { box: boxValue(id), expect }); }
+  function revert(id) { markClean(id); setBox(id, live[id]); }
+  // A value from a status (raw: as the status carries it). A clean field takes it; a dirty
+  // one only when it is what the field's own last send will be stored as, and the box
+  // still holds what was sent.
+  function takeLive(id, value, raw = value) {
+    live[id] = value;
+    liveRaw[id] = raw;
+    if (dirty.has(id)) {
+      const sent = dirty.get(id);
+      if (!sent || boxValue(id) !== sent.box || raw !== sent.expect) return;
+      markClean(id);
+    }
+    setBox(id, value);
+  }
+  for (const id of ['url', 'interval', 'maxitems', 'topn', 'capstext', 'capslogo', 'msgtext']) $(id).addEventListener('input', () => markDirty(id));
+  document.addEventListener('keydown', (e) => {
+    const t = e.target;
+    if (e.key !== 'Escape' || !t || !dirty.has(t.id) || (t.tagName !== 'INPUT' && t.tagName !== 'TEXTAREA')) return;
+    e.preventDefault();
+    revert(t.id);
+  });
+  // The sidecar's clampInt (zipper-sidecar.mjs), to know what it stores.
+  function clampInt(v, min, max, fallback) {
+    const n = Math.round(Number(v));
+    if (!Number.isFinite(n)) return fallback;
+    return Math.max(min, Math.min(max, n));
+  }
+
+  $('btn-seturl').onclick = () => {
+    const url = $('url').value.trim();
+    if (send('setUrl', url)) noteSent('url', url);
+  };
   $('btn-start').onclick = () => send('start');
   $('btn-stop').onclick = () => send('stop');
   $('btn-poll').onclick = () => send('pollNow');
-  $('autosched').onchange = () => send('setAutoSchedule', $('autosched').checked);
+  $('autosched').onchange = () => {
+    markDirty('autosched');
+    const on = $('autosched').checked;
+    if (send('setAutoSchedule', on)) noteSent('autosched', on);
+  };
   // One command per button — NOT several. Firing multiple DoActions to the same
   // Streamer.bot action in a burst makes SB bleed their arguments together (the
   // second command's value lands on the first), which silently blanked the caps
   // text. Batched values ride as JSON; the sidecar unpacks them.
   $('btn-opts').onclick = () => {
-    send('setOptions', JSON.stringify({
+    const text = JSON.stringify({
       intervalMs: Math.round(Number($('interval').value) * 1000) || 30000,
       maxItems: Number($('maxitems').value) || 20,
       topN: Number($('topn').value) || 0,
-    }));
+    });
+    if (!send('setOptions', text)) return;
+    const o = JSON.parse(text); // as the sidecar reads it
+    noteSent('interval', clampInt(o.intervalMs, 15000, 3600000, liveRaw.interval));
+    noteSent('maxitems', clampInt(o.maxItems, 1, 100, liveRaw.maxitems));
+    noteSent('topn', clampInt(o.topN, 0, 100, liveRaw.topn));
   };
   $('btn-caps').onclick = () => {
-    send('setCaps', JSON.stringify({ text: $('capstext').value, logo: $('capslogo').value.trim() }));
+    const caps = { text: $('capstext').value, logo: $('capslogo').value.trim() };
+    if (!send('setCaps', JSON.stringify(caps))) return;
+    noteSent('capstext', caps.text.slice(0, 120));
+    noteSent('capslogo', caps.logo.slice(0, 500));
   };
   // Text and toggle ride one batched command, so flipping the checkbox can apply
-  // the text sitting in the box without a second (arg-bleeding) DoAction.
-  const sendMessage = () => send('setMessage', JSON.stringify({
-    text: $('msgtext').value, enabled: $('msgon').checked,
-  }));
+  // the text sitting in the box without a second (arg-bleeding) DoAction. The
+  // checkbox counts as the message's Apply, and Apply sends the checkbox.
+  const sendMessage = () => {
+    const m = { text: $('msgtext').value, enabled: $('msgon').checked };
+    if (!send('setMessage', JSON.stringify(m))) return;
+    noteSent('msgtext', m.text.slice(0, 1000));
+    noteSent('msgon', m.enabled);
+  };
   $('btn-msg').onclick = sendMessage;
-  $('msgon').onchange = sendMessage;
+  $('msgon').onchange = () => { markDirty('msgon'); sendMessage(); };
+  // The Announce box clears only when its announcement comes back (the echo), so one
+  // typed while Streamer.bot is offline, or that its action never runs, is kept. A click
+  // while the same text is still on its way sends nothing: it would show it twice.
   $('btn-announce').onclick = () => {
-    const text = $('ann-text').value.trim();
+    const text = trimText($('ann-text').value);
     if (!text) return;
-    window.__ZIPPER_DO_ACTION('Ticker Announce', {
+    if (echoOf((x) => x.action === 'Ticker Announce' && !x.late && x.text === text)) return;
+    const id = window.__ZIPPER_DO_ACTION ? window.__ZIPPER_DO_ACTION('Ticker Announce', {
       kind: $('ann-kind').value,
       text,
       duration: $('ann-dur').value,
-    });
-    $('ann-text').value = '';
+    }) : false;
+    if (!id) {
+      clickNote = 'Not connected to Streamer.bot: that announcement was not sent.';
+      showNotes();
+      return;
+    }
+    if (clickNote) { clickNote = ''; showNotes(); }
+    track(id, { action: 'Ticker Announce', text, probe: false });
   };
 
-  // Fields the operator is typing in shouldn't be clobbered by status echoes.
-  const dirty = new Set();
-  for (const id of ['url', 'interval', 'maxitems', 'topn', 'capstext', 'capslogo', 'msgtext']) {
-    $(id).addEventListener('focus', () => dirty.add(id));
-    $(id).addEventListener('blur', () => dirty.delete(id));
-  }
-  const setIfClean = (id, v) => { if (!dirty.has(id)) $(id).value = v; };
+  // ── Streamer.bot's answers (panel-core) ───────────────────────────────────────
+  window.addEventListener('sb:connection', (e) => {
+    const d = e.detail || {};
+    // What was said of the actions belonged to the connection before.
+    link.missing.clear();
+    link.refused = null;
+    link.runError = null;
+    link.noAnswer.clear();
+    link.sidecarSilent = false;
+    clearHeartbeat();
+    for (const id of [...awaitingEcho.keys()]) endEchoWait(id);
+    link.connected = !!d.connected;
+    if (d.reason === 'sbport-refused') link.portRefused = true;
+    if (!link.connected) {
+      const notSent = (d.notSentIds || []).filter((id) => !probeIds.has(id)).length;
+      const onItsWay = !!(d.inFlight && !probeIds.has(d.inFlight.id));
+      if (notSent || onItsWay) clickNote = droppedNote(notSent, onItsWay);
+    }
+    showBanner();
+    showNotes();
+    if (link.connected) probe(); // the probe on reconnect, and on the first connect
+  });
+  window.addEventListener('sb:action-queued', (e) => {
+    const d = e.detail || {};
+    link.missing.delete(d.action);
+    if (link.refused && link.refused.action === d.action) link.refused = null;
+    if (d.defaultQueue) link.defaultQueue.add(d.action);
+    else if (d.queueName) link.defaultQueue.delete(d.action);
+    startEchoWait(d.id);
+    showBanner();
+    showNotes();
+  });
+  window.addEventListener('sb:action-error', (e) => {
+    const d = e.detail || {};
+    endEchoWait(d.id);
+    if (d.code === 'action-missing') link.missing.add(d.action);
+    else link.refused = { action: d.action, error: d.error || '' };
+    showBanner();
+  });
+  window.addEventListener('sb:action-timeout', (e) => startEchoWait((e.detail || {}).id));
+  // An action threw. The message is shown; a code, when there is one, after it.
+  window.addEventListener('ticker:error', (e) => {
+    const d = e.detail || {};
+    const message = typeof d.message === 'string' ? d.message.trim() : '';
+    const code = typeof d.code === 'string' ? d.code.trim() : '';
+    link.runError = message ? (code && !message.includes(code) ? `${message} (${code})` : message) : (code || 'no reason given');
+    // A run that threw broadcasts no echo. The requests waiting for one stop waiting
+    // without "did not answer", which would outlive this line and blame the wrong thing.
+    for (const id of [...awaitingEcho.keys()]) if (awaitingEcho.get(id)?.timer) markLate(id);
+    showBanner();
+  });
+  window.addEventListener('ticker:announce', (e) => {
+    const d = e.detail || {};
+    link.noAnswer.delete('Ticker Announce');
+    link.runError = null;
+    const hit = echoOf((x) => x.action === 'Ticker Announce' && x.text === d.text);
+    if (hit) {
+      endEchoWait(hit[0]);
+      if (trimText($('ann-text').value) === hit[1].text) $('ann-text').value = '';
+    }
+    showBanner();
+  });
 
   // ticker:status rides the command relay as command "__status" (docs/PROTOCOL.md).
   // Its lastError is a failed poll; its commandNotice an unknown or refused command;
@@ -238,21 +520,29 @@
   // its configWarning a config.json that did not load, a refused key, a dropped logo, a failed save, or saves stopped after a hand edit.
   window.addEventListener('ticker:command', (e) => {
     const d = e.detail || {};
-    if (d.command !== '__status') return;
-    noteSidecarAlive();
-    let s; try { s = JSON.parse(d.value); } catch { return; }
-    setIfClean('url', s.url || '');
-    setIfClean('interval', Math.round((s.intervalMs || 30000) / 1000));
-    setIfClean('maxitems', s.maxItems || 20);
-    setIfClean('topn', s.topN ?? 0);
-    if (s.caps) { setIfClean('capstext', s.caps.text || ''); setIfClean('capslogo', s.caps.logo || ''); }
-    if (s.message) {
-      setIfClean('msgtext', s.message.text || '');
-      // The checkbox commits on change, so echoes always agree with it — except
-      // right after a reload, where the sidecar's value is the correct one.
-      $('msgon').checked = !!s.message.enabled;
+    // Ticker Command ran: it is there and it works, and an earlier ticker:error is over.
+    link.noAnswer.delete('Ticker Command');
+    link.runError = null;
+    if (d.command !== '__status') {
+      const hit = echoOf((x) => x.action === 'Ticker Command' && x.command === d.command && x.value === d.value);
+      if (hit) { endEchoWait(hit[0]); armHeartbeat(); } // the sidecar's status is due now
+      showBanner();
+      return;
     }
-    if (s.auto) $('autosched').checked = !!s.auto.enabled;
+    noteSidecarAlive();
+    showBanner();
+    let s; try { s = JSON.parse(d.value); } catch { return; }
+    takeLive('url', s.url || '');
+    const intervalMs = s.intervalMs || 30000;
+    takeLive('interval', Math.round(intervalMs / 1000), intervalMs);
+    takeLive('maxitems', s.maxItems || 20);
+    takeLive('topn', s.topN ?? 0);
+    if (s.caps) { takeLive('capstext', s.caps.text || ''); takeLive('capslogo', s.caps.logo || ''); }
+    if (s.message) {
+      takeLive('msgtext', s.message.text || '');
+      takeLive('msgon', !!s.message.enabled);
+    }
+    if (s.auto) takeLive('autosched', !!s.auto.enabled);
     // Auto-scheduling shows as a third polling state: WAITING while sleeping
     // for the start time, and an explanation when it stopped itself.
     const waiting = s.polling && s.auto?.waitingUntil;
@@ -291,7 +581,9 @@
       if (m.state === 'completed') {
         rows.push(`<div class="m">${rnd}<span class="${m.winner === 1 ? 'win' : ''}">${esc(m.p1?.name)}</span> ${esc(m.p1?.score)}–${esc(m.p2?.score)} <span class="${m.winner === 2 ? 'win' : ''}">${esc(m.p2?.name)}</span></div>`);
       } else if (m.state === 'in_progress') {
-        rows.push(`<div class="m">${rnd}<span class="live">LIVE</span> ${esc(m.p1?.name)} ${m.p1?.score ?? ''}–${m.p2?.score ?? ''} ${esc(m.p2?.name)}</div>`);
+        // Both scores escaped (ZIP-18): a stub: file or another sender's payload is not
+        // normalised, so a score can be any text.
+        rows.push(`<div class="m">${rnd}<span class="live">LIVE</span> ${esc(m.p1?.name)} ${esc(m.p1?.score)}–${esc(m.p2?.score)} ${esc(m.p2?.name)}</div>`);
       } else {
         rows.push(`<div class="m">${rnd}up next · ${esc(m.p1?.name)} vs ${esc(m.p2?.name)}</div>`);
       }
@@ -300,11 +592,12 @@
     $('preview').innerHTML = rows.length ? rows.join('') : '<span class="dim">empty ticker payload</span>';
   });
 
-  // Ask the sidecar for a status snapshot once connected (small delay so the
-  // panel-core connect + subscribe settles first), then re-probe periodically so
-  // the liveness banner stays honest if the sidecar dies while the page is open.
-  setTimeout(() => send('status'), 800);
-  setInterval(() => send('status'), 10000);
+  showBanner();
+  showNotes();
+  // The status probe on every (re)connect is in the sb:connection listener above. This
+  // one re-probes while the page is open, so the banner stays honest if the sidecar
+  // dies meanwhile.
+  setInterval(probe, PROBE_MS);
 })();
 </script>
 </body>
