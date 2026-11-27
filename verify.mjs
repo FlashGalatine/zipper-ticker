@@ -1,15 +1,16 @@
 // Zipper verify suite — no network, no Streamer.bot install, no browser.
 //   1. Platform normalizer tests against recorded fixtures (pure functions).
-//   2. Platform detection/parseId routing (Tally's rows: start.gg admin pages, hosts
-//      that only look right), and normalizeInput (https:// for an address pasted
-//      without it; Tally's answers in linear time), with the control page's copy.
+//   2. Platform detection/parseId routing (Tally's rows: Challonge locale segments and
+//      sub-pages, start.gg admin pages, hosts that only look right), challongeSlug, the
+//      Challonge embed page's address, and normalizeInput (https:// for an address
+//      pasted without it; Tally's answers in linear time), with the control page's copy.
 //   2e. start.gg paging and the event choice, in-process: the real adapter fed fixture
 //      pages through a stand-in for fetch (the early stop at maxItems completed sets,
 //      counted after de-duplication, and its cutShort, every page with topN, the first
 //      page's standings and the standingsAsked that records them, sets de-duplicated by
 //      id, the page limit's pollNotice and what the docs say of it and of the re-fetch
 //      rule, admin-page addresses, several events refused, the query texts pinned by
-//      SHA-256).
+//      SHA-256); the Challonge embed page through its adapter.
 //   2b. The fetch wrapper (platforms/guarded-fetch.js), in-process against a local
 //      server on an OS-assigned port: its timeout (shortened only with ZIPPER_ALLOW_STUB),
 //      size cap, Retry-After and error wording; each adapter's wiring to it (signal,
@@ -320,9 +321,27 @@ async function testDetection() {
     // Row 8.4 (decision 11 c): start.gg admin pages, from Tally's verify-parse.test.mjs:21-22.
     ['https://www.start.gg/admin/tournament/cup/event/singles/seeding', 'startgg', 'cup/singles'],
     ['https://www.start.gg/admin/tournament/cup/dashboard', 'startgg', 'cup'],
+    // Row 8.3 (ZIP-20): Challonge, from Tally's :25-36 (a locale segment, sub-pages, and
+    // Challonge's own pages, which are never a bracket).
+    ['https://challonge.com/mytourney', 'challonge', 'mytourney'],
+    ['https://challonge.com/mytourney/standings', 'challonge', 'mytourney'],
+    ['https://challonge.com/fr/mytourney', 'challonge', 'mytourney'],
+    ['https://challonge.com/pt_BR/mytourney/participants', 'challonge', 'mytourney'],
+    ['https://challonge.com/xy', 'challonge', 'xy'], // a two-letter slug on its own is a slug, not a locale
+    ['https://nfc.challonge.com/weekly42', 'challonge', 'nfc-weekly42'],
+    ['https://www.challonge.com/mytourney', 'challonge', 'mytourney'],
+    ['https://challonge.com/tournaments/123', 'challonge', null],
+    ['https://challonge.com/communities/foo/tournaments/bar', 'challonge', null],
+    ['https://challonge.com/users/someone', 'challonge', null],
+    ['https://challonge.com/', 'challonge', null],
+    ['mytourney', 'challonge', 'mytourney'], // a bare slug
+    ['https://challonge.com/fr/blko42', 'challonge', 'blko42'],
+    ['https://challonge.com/ab/standings', 'challonge', 'ab'],
     // Hosts that only look right, from Tally's :46-51.
     ['https://start.gg.evil.example/tournament/cup/event/singles', null, null],
     ['https://evil.example/start.gg/tournament/cup', null, null],
+    ['https://evilchallonge.com/mytourney', null, null],
+    ['https://challonge.com.evil.example/mytourney', null, null],
     ['https://start.gg@evil.example/tournament/cup', null, null],
     ['https://example.com/not-a-bracket', null, null],
   ];
@@ -332,6 +351,63 @@ async function testDetection() {
       p ? `${p.name}/${p.parseId(input)}` : 'no match');
   }
   check('all platforms expose fetchTicker', PLATFORMS.every((p) => typeof p.fetchTicker === 'function'));
+
+  // Row 8.3 (ZIP-20): Tally's challongeSlug, exported, with its rows (Tally's
+  // verify-parse.test.mjs:74-75 and :145-150).
+  const chl = await import('./platforms/challonge.js');
+  {
+    const rows = [
+      ['http://challonge.com:8443/fr/mytourney', 'mytourney'],
+      ['https://challonge.com/tournaments/1', null],
+      ['https://challonge.com/ab/standings', 'ab'],
+      ['https://challonge.com/ab/participants', 'ab'],
+      ['https://challonge.com/ab', 'ab'],
+      ['https://challonge.com/fr/mytourney', 'mytourney'],
+      ['https://challonge.com/fr/mytourney/standings', 'mytourney'],
+      ['https://challonge.com/pt_BR/mytourney', 'mytourney'],
+    ];
+    const wrong = typeof chl.challongeSlug !== 'function' ? ['challongeSlug is not exported by platforms/challonge.js']
+      : rows.map(([u, want]) => [u, want, chl.challongeSlug(new URL(u))]).filter(([, want, got]) => got !== want).map(([u, want, got]) => `${u} → ${got}, wanted ${want}`);
+    check('row 8.3 (ZIP-20): challongeSlug (Tally\'s, exported) skips a locale segment unless a sub-page follows it, and refuses Challonge\'s own pages: its eight rows from Tally',
+      wrong.length === 0, wrong.join('; '));
+  }
+  // Every word of the two lists, and the forms Tally's rows do not reach (a gate's
+  // finding): each of Challonge's own pages is refused, in lower case and capitalised;
+  // each sub-page after a two-letter bracket keeps that bracket, in both cases; a locale
+  // written with a hyphen or in capitals is skipped.
+  {
+    const reserved = ['tournaments', 'communities', 'users', 'events', 'teams', 'games', 'search',
+      'settings', 'session', 'user_session', 'dashboard', 'about', 'pricing', 'api', 'module'];
+    const subpages = ['standings', 'participants', 'module', 'log', 'discussion', 'stations',
+      'announcements', 'settings', 'matches', 'groups', 'predictions', 'attachments', 'registrations'];
+    const cap = (w) => w[0].toUpperCase() + w.slice(1);
+    const rows = [
+      ...reserved.flatMap((w) => [[`https://challonge.com/${w}/1`, null], [`https://challonge.com/${cap(w)}/1`, null], [`https://challonge.com/${w}`, null]]),
+      ...subpages.flatMap((w) => [[`https://challonge.com/ab/${w}`, 'ab'], [`https://challonge.com/ab/${cap(w)}`, 'ab']]),
+      ['https://challonge.com/pt-BR/mytourney', 'mytourney'],
+      ['https://challonge.com/FR/mytourney', 'mytourney'],
+      ['https://challonge.com/pt-br/mytourney/standings', 'mytourney'],
+      ['https://challonge.com/fra/mytourney', 'fra'],
+    ];
+    const wrong = typeof chl.challongeSlug !== 'function' ? ['challongeSlug is not exported by platforms/challonge.js']
+      : rows.map(([u, want]) => [u, want, chl.challongeSlug(new URL(u))]).filter(([, want, got]) => got !== want).map(([u, want, got]) => `${u} → ${got}, wanted ${want}`);
+    check(`row 8.3 (gate): challongeSlug refuses each of Challonge's ${reserved.length} own pages (lower case, capitalised, alone), keeps a two-letter bracket before each of the ${subpages.length} sub-pages (both cases), and skips a locale with a hyphen or in capitals (${rows.length} rows)`,
+      rows.length === reserved.length * 3 + subpages.length * 2 + 4 && wrong.length === 0, wrong.join('; '));
+  }
+  // The embed page's address: always https and the default port, with the bracket's slug.
+  {
+    const rows = [
+      ['http://challonge.com:8443/fr/blko42', 'blko42', 'https://challonge.com/blko42/module'],
+      ['https://blko.challonge.com/ab/standings', 'blko-ab', 'https://blko.challonge.com/ab/module'],
+      ['https://challonge.com/fr/mytourney/standings', 'mytourney', 'https://challonge.com/mytourney/module'],
+      ['https://challonge.com/blko42', 'blko42', 'https://challonge.com/blko42/module'],
+      ['blko42', 'blko42', 'https://challonge.com/blko42/module'],
+    ];
+    const wrong = typeof chl.deriveModuleUrl !== 'function' ? ['deriveModuleUrl is not exported by platforms/challonge.js']
+      : rows.map(([u, id, want]) => [u, want, chl.deriveModuleUrl(u, id)]).filter(([, want, got]) => got !== want).map(([u, want, got]) => `${u} → ${got}, wanted ${want}`);
+    check('row 8.3 (ZIP-20): the Challonge embed page\'s address is always https on the default port, with the slug past a locale and before a sub-page: http://challonge.com:8443/fr/blko42 → https://challonge.com/blko42/module, https://blko.challonge.com/ab/standings → https://blko.challonge.com/ab/module',
+      wrong.length === 0, wrong.join('; '));
+  }
 
   // Row 8.4 (decision 11 d): input pasted without https:// is given it before platform
   // detection (Tally's normalizeInput, roster-lib.mjs:97-103, and its test rows).
@@ -754,6 +830,7 @@ async function testFetchWrapper() {
 // queries as start.gg's GraphQL does, honours page, perPage and standingsPerPage (8, the
 // query's own default, when none is sent), and records every request. What the adapter
 // gives back is kept for section 6k, which runs it through the sidecar as stub fixtures.
+// The Challonge embed page's address is checked the same way, through the real adapter.
 
 // The two start.gg query texts as they passed start.gg's public proxy at 1.0.11 (its
 // CHANGELOG entry): the proxy may reject a query that is not on its allow-list, so row 8.3
@@ -826,7 +903,7 @@ async function runStartgg(standIn, url, cfg) {
 }
 
 async function testStartggPaging() {
-  console.log('\n[2e] start.gg paging and the event choice, in-process (ZIP-20, rows 8.3 to 8.5)');
+  console.log('\n[2e] start.gg paging and the event choice, in-process (ZIP-20, rows 8.3 to 8.5); the Challonge embed page\'s address');
   const { createHash } = await import('node:crypto');
   const EV = 'https://www.start.gg/tournament/paging-cup/event/singles';
   const all = [];
@@ -1030,6 +1107,24 @@ async function testStartggPaging() {
     }
     check(`row 8.3: the start.gg query texts are the ones that passed the public proxy at 1.0.11 (SHA-256 pinned), and only their declared variables vary (${all.length} requests)`,
       all.length > 20 && wrong.length === 0, [...new Set(wrong)].join('; '));
+  }
+
+  // The Challonge embed page through the real adapter (keyless): the address it asks for.
+  {
+    const { challonge } = await import('./platforms/challonge.js');
+    const asked = [];
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = async (url) => { asked.push(String(url)); return new Response('not here', { status: 404 }); };
+    try {
+      for (const u of ['https://challonge.com/fr/blko42', 'http://challonge.com:8443/fr/blko42', 'https://blko.challonge.com/ab/standings']) {
+        try { await challonge.fetchTicker(challonge.parseId(u), {}, u, new AbortController().signal); } catch {}
+      }
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+    const want = ['https://challonge.com/blko42/module', 'https://challonge.com/blko42/module', 'https://blko.challonge.com/ab/module'];
+    check('row 8.3 (ZIP-20): through the real adapter, with no key, a Challonge URL with a locale segment, another port or a sub-page asks for the bracket\'s own embed page, over https on the default port',
+      JSON.stringify(asked) === JSON.stringify(want), JSON.stringify(asked));
   }
 
   // The docs say when the page limit's notice appears as the code above gives it (review of

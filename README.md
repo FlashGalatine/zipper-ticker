@@ -200,9 +200,11 @@ reports the value you applied; press Esc in it to put back the current value.
 Paste the tournament URL (e.g. `https://challonge.com/blko42` or
 `https://www.start.gg/tournament/…/event/…`), **Set**, **Start polling**. An
 address pasted without `https://` gets it (the box then shows it that way), and
-a start.gg admin page's address works too. A start.gg tournament URL works when
-the tournament has one event; when it has several, the status line says "paste
-a specific event URL" and names them: paste that event's own URL. **Set**
+these work too: a start.gg admin page's address, and a Challonge address in
+another language (`challonge.com/fr/…`) or of a bracket's sub-page
+(`…/standings`). A start.gg tournament URL works when the tournament has one
+event; when it has several, the status line says "paste a specific event URL"
+and names them: paste that event's own URL. **Set**
 with a new URL clears the old tournament's results from the strip at once (the
 end caps and the message stay), so an old bracket never crawls under a new
 event's name; the new results appear with the first good poll. Set
