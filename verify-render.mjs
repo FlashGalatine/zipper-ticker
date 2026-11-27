@@ -6,9 +6,22 @@
 // of its reconnect wait to 0). The refused-port pages get a stand-in WebSocket that never
 // connects (one also hides panel-core's flag from the page, one also keeps panel-core's
 // sb:connection from the page's own listener). Two pages are served the older
-// panel-core.js of 3a8efef, and one a 404 in its place (openPage's route). It runs in a
-// real Chromium (system Edge/Chrome via playwright-core; nothing bundled)
-// against the mock SB server, injects the sample fixture, and asserts the DOM.
+// panel-core.js of 3a8efef, and one a 404 in its place (openPage's route). The overlay
+// pages get more, each named where it is used. The message page and the out-of-order
+// overlay page get crawlDriver, which pauses the crawl and moves a held crawl through the
+// wrap, so their checks do not hang on FADE_THRESHOLD_MS. Most Sprint 7 pages get
+// crawlProbe, which records each change to #track and lets the test pause the crawl and
+// set its currentTime. On top of that: a stand-in WebSocket that never connects (the
+// refused-port overlay page); no ResizeObserver (the no-observer page); style rules of
+// their own (the scaled, placed-seg and long-fade pages); a counter of the img src the
+// page sets, with skewClock (the logo page); a late web font (fontCss, the late-font
+// pages), with the first loop paused (pauseFirstLoop) on all but the first of them, and an
+// announcement on the first update (announceFirst) or the moment the re-measure's fade
+// starts (announceOnFade). Routes serve three test logos (one 1.5 s late, one that fails
+// once) and a system font file 1.5 s late, and the wrap-swap page has every request
+// beyond 127.0.0.1 aborted. It runs in a real Chromium (system Edge/Chrome via
+// playwright-core; nothing bundled) against the mock SB server, injects the sample
+// fixture, and asserts the DOM.
 // The control page is typed into (edits kept until a status carries what was applied,
 // ZIP-03), its banner and notes are read against the mock's missing, silent, throw,
 // queue and kick switches (ZIP-17), its send queue runs under bleed mode (decision
@@ -160,13 +173,67 @@ function noProbeInterval() {
   const realSetInterval = window.setInterval;
   window.setInterval = (fn, ms, ...rest) => (ms === 10000 ? 0 : realSetInterval(fn, ms, ...rest));
 }
+// Lets a check bring new crawl content into an overlay page whatever FADE_THRESHOLD_MS is
+// (the message page and the out-of-order overlay page). The overlay brings a new crawl in
+// under the fade when the loop's wrap is further off than the threshold, and holds it for
+// the wrap otherwise. pauseAt(ms) pauses the loop ms into it, so the wrap is a known time
+// away, and gives how many ticker:update events have come. For each update it records how
+// far the wrap was and the way ticker.js took it: 'fade', 'held' (for the wrap) or 'at
+// once'. throughWrap() moves a held crawl through the wrap and the loop's end by setting
+// the paused loop's currentTime, as the Sprint 7 checks do. Only the pages opened with it
+// get it.
+function crawlDriver() {
+  const T = () => document.getElementById('track');
+  const anim = () => { const t = T(); return t && typeof t.getAnimations === 'function' ? (t.getAnimations().find((x) => x.animationName === 'ticker-scroll') || null) : null; };
+  const frame = () => new Promise((r) => requestAnimationFrame(() => r()));
+  const seen = [];
+  window.addEventListener('ticker:update', () => {
+    const t = T();
+    const a = anim();
+    const tm = a && a.effect ? a.effect.getComputedTiming() : null;
+    const d = tm ? Number(tm.duration) : NaN;
+    const rec = { toWrap: d > 0 ? (1 - (tm.progress == null ? 1 : Number(tm.progress))) * d : null, path: null };
+    const before = t ? t.innerHTML : '';
+    seen.push(rec);
+    // This listener was added before ticker.js's, so it runs first: what ticker.js did is
+    // read once its listener has run.
+    setTimeout(() => {
+      const now = T();
+      rec.path = now.classList.contains('swap-fade') ? 'fade' : now.innerHTML === before ? 'held' : 'at once';
+    }, 0);
+  });
+  window.__drive = {
+    updates: () => seen.length,
+    taken: (k) => (seen[k] && seen[k].path ? { ...seen[k] } : null),
+    async pauseAt(ms) {
+      const a = anim();
+      if (a) { a.pause(); a.currentTime = ms; await frame(); }
+      return seen.length;
+    },
+    async throughWrap() {
+      let a = anim();
+      if (!a) return false;
+      const tm = a.effect.getComputedTiming();
+      const k = Number(tm.currentIteration) || 0;
+      a.pause(); a.currentTime = (k + 1) * Number(tm.duration) + 1; // the wrap: the copies off screen take it
+      await frame(); await frame();
+      a = anim();
+      const end = a && a.effect ? Number(a.effect.getComputedTiming().endTime) : NaN;
+      if (end > 0 && end < Infinity) { a.pause(); a.currentTime = end + 1; await frame(); await frame(); } // the loop's end: every copy takes it
+      return true;
+    },
+  };
+}
 // route, when given, serves one file the page asks for from memory (route.path on this
 // server, with route.body, and route.status or 200), in this page's browser only: the mock
-// and the disk keep theirs. initArg, when given, is handed to init.
-async function openPage(label, viewport, url, { init, initArg, route } = {}) {
+// and the disk keep theirs. init may be one function or several. initArg, when given, is
+// handed to each. setup, when given, is
+// called with the page before it loads (for routes and listeners of its own).
+async function openPage(label, viewport, url, { init, initArg, route, setup } = {}) {
   const page = await browser.newPage({ viewport });
-  if (init) await page.addInitScript(init, initArg);
+  for (const f of [].concat(init || [])) await page.addInitScript(f, initArg);
   if (route) await page.route((u) => u.origin === HTTP && u.pathname === route.path, (r) => r.fulfill({ status: route.status ?? 200, contentType: 'application/javascript', body: route.body }));
+  if (setup) await setup(page);
   const problems = [];
   page.on('pageerror', (err) => problems.push(`page error: ${err.message}`));
   page.on('console', (msg) => {
@@ -186,6 +253,16 @@ async function closePage(p) {
 // The mock gets the shell's environment without the API keys a developer may have set
 // (in any casing: Windows matches environment names without regard to case).
 const mockEnv = Object.fromEntries(Object.entries(process.env).filter(([k]) => !['CHALLONGE_API_KEY', 'STARTGG_API_KEY'].includes(k.toUpperCase())));
+
+// ticker.js's own figures, read from its source, so the crawl checks follow the figures the
+// owner sets. FADE_THRESHOLD_MS: new content waits for the wrap when it is this near, and
+// comes in under the fade when it is further off. NEAR_MS: how far before the wrap the held
+// cases send new content, inside the threshold whatever it is.
+const tickerSrc = await readFile(resolve(__dirname, 'overlay', 'ticker.js'), 'utf-8');
+const constOf = (name) => { const m = new RegExp(`const ${name} = (\\d+);`).exec(tickerSrc); return m ? Number(m[1]) : NaN; };
+const FADE_THRESHOLD_MS = constOf('FADE_THRESHOLD_MS');
+const LOGO_RETRY_MS = constOf('LOGO_RETRY_MS');
+const NEAR_MS = Math.min(5000, Math.floor(FADE_THRESHOLD_MS / 2));
 
 try {
   mock = spawn(process.execPath, [resolve(__dirname, 'mock-sb-server.mjs')], {
@@ -256,6 +333,13 @@ try {
     const p = await openPage('announce page', { width: 1920, height: 72 }, `${HTTP}/zipper-overlay/ticker.html?w=1920&sbport=${WS_PORT}`);
     const { page } = p;
     await page.waitForSelector('.track .seg .item', { timeout: 8000 });
+    // The loop running before the announcement, kept to compare with the one after it. It is
+    // moved 3 s on (and left running), so the place it pauses at is not its start.
+    await page.evaluate(() => {
+      const a = document.getElementById('track').getAnimations().find((x) => x.animationName === 'ticker-scroll') || null;
+      if (a) a.currentTime = 3000;
+      window.__annLoop = a;
+    });
     await fetch(`${HTTP}/mock/announce?text=${encodeURIComponent('Flash is raiding with 42 viewers!')}&kind=raid&duration=4`);
     await page.waitForSelector('.zipper.announcing', { timeout: 5000 });
     await sleep(500); // let the announce-in fade finish before the pixel grab
@@ -266,33 +350,62 @@ try {
     check('announce: kind pill', pill === 'Raid', String(pill));
     const paused = await page.locator('.track').evaluate((el) => getComputedStyle(el).animationPlayState);
     check('announce: crawl paused during takeover', paused === 'paused', paused);
+    const loopAt = () => page.evaluate(() => {
+      const a = document.getElementById('track').getAnimations().find((x) => x.animationName === 'ticker-scroll') || null;
+      return { same: !!a && a === window.__annLoop, t: a ? Number(a.currentTime) : null };
+    });
+    const pausedLoop = await loopAt();
     await page.waitForSelector('.zipper:not(.announcing)', { timeout: 8000 });
     const resumed = await page.locator('.track').evaluate((el) => getComputedStyle(el).animationPlayState);
     check('announce: crawl resumes after duration', resumed === 'running', resumed);
+    const resumedLoop = await loopAt();
+    check('announce: with nothing new, the crawl resumes where it paused: the loop that ran before the announcement runs on after it, from the time it was paused at, not from the start of a new loop',
+      pausedLoop.same === true && resumedLoop.same === true && pausedLoop.t >= 3000 && resumedLoop.t >= pausedLoop.t,
+      JSON.stringify({ pausedLoop, resumedLoop }));
     const items = await page.locator('.track .seg').first().locator('.item').count();
     check('announce: results intact after takeover', items >= 4, String(items));
     await closePage(p);
   }
 
-  // Persistent message mode: the configured lines crawl instead of the results.
+  // Persistent message mode: the configured lines crawl instead of the results. The overlay
+  // brings the message in, and the results back, as it does any new crawl: under the fade
+  // when the loop's wrap is further off than FADE_THRESHOLD_MS, and at the wrap otherwise.
+  // Before each change the loop is paused 1 s in (crawlDriver), so the threshold says which
+  // way it comes, and a crawl held for the wrap is moved through it.
   {
-    const p = await openPage('message page', { width: 1920, height: 72 }, `${HTTP}/zipper-overlay/ticker.html?w=1920&sbport=${WS_PORT}`);
+    const p = await openPage('message page', { width: 1920, height: 72 }, `${HTTP}/zipper-overlay/ticker.html?w=1920&sbport=${WS_PORT}`, { init: crawlDriver });
     const { page } = p;
     await page.waitForSelector('.track .seg .item', { timeout: 8000 });
+
+    // Pushes body through the mock; gives the way ticker.js took it, and the way the
+    // threshold says it takes it.
+    const bringIn = async (body) => {
+      const n = await page.evaluate(() => window.__drive.pauseAt(1000));
+      await fetch(`${HTTP}/mock/push`, { method: 'POST', body });
+      const got = await waitUntil(() => page.evaluate((k) => window.__drive.taken(k), n), 5000);
+      if (got && got.path === 'held') await page.evaluate(() => window.__drive.throughWrap());
+      return { ...(got || { path: '(no update)', toWrap: null }), expected: got && got.toWrap !== null ? (got.toWrap > FADE_THRESHOLD_MS ? 'fade' : 'held') : null };
+    };
+    const firstCopyHas = (sel) => page.waitForFunction((s) => {
+      const t = document.getElementById('track');
+      const seg = t.querySelector('.seg');
+      return !!seg && !!seg.querySelector(s) && !t.classList.contains('swap-fade');
+    }, sel, { timeout: 5000 }).then(() => true, () => false);
 
     const sample = JSON.parse(await readFile(resolve(__dirname, 'platforms', 'fixtures', 'sample-update.json'), 'utf-8'));
     const lines = ['Bracket starts at 8pm ET', '!discord for the lobby code'];
     // Results stay in the payload — the message is expected to cover them.
-    await fetch(`${HTTP}/mock/push`, { method: 'POST', body: JSON.stringify({ ...sample, message: { lines } }) });
-    await page.waitForSelector('.item.message', { timeout: 5000 });
-    await sleep(300);
+    const on = await bringIn(JSON.stringify({ ...sample, message: { lines } }));
+    const onShown = await firstCopyHas('.item.message');
+    await sleep(400); // the fade back in, before the pixel grab
 
     // One item per line, repeated whole until the segment fills the strip (two
-    // short lines don't span 1920px) so the -50% wrap stays seamless.
+    // short lines don't span 1920px), so the loop, which wraps at one copy's width
+    // (--seg-w), stays seamless.
     const msgs = await page.locator('.track .seg').first().locator('.item.message').count();
     check('message: one item per line, repeated to fill the strip',
       msgs >= lines.length && msgs % lines.length === 0, String(msgs));
-    const first = await page.locator('.track .seg .item.message .msg').first().textContent();
+    const first = await page.evaluate(() => { const el = document.querySelector('.track .seg .item.message .msg'); return el ? el.textContent : null; });
     check('message: line text rendered', first === lines[0], String(first));
     const names = await page.locator('.track .name').count();
     check('message: results hidden while the message is up', names === 0, String(names));
@@ -304,12 +417,14 @@ try {
     check('message: crawl animating', parseFloat(dur) > 0, dur);
     await page.screenshot({ path: resolve(__dirname, 'test-render-message.png') });
 
-    // Dropping the message restores results with no re-poll — and leaves the
+    // Dropping the message brings results back with no re-poll, and leaves the
     // mock's stored payload clean for the control-page checks below.
-    await fetch(`${HTTP}/mock/push`, { method: 'POST', body: JSON.stringify(sample) });
-    await page.waitForSelector('.track .seg .item .name', { timeout: 5000 });
+    const off = await bringIn(JSON.stringify(sample));
+    const offShown = await firstCopyHas('.item .name');
     const msgsAfter = await page.locator('.item.message').count();
-    check('message: results return when the message drops', msgsAfter === 0, String(msgsAfter));
+    check('message: results return when the message drops', offShown && msgsAfter === 0, JSON.stringify({ offShown, msgsAfter }));
+    check(`message: the message comes in, and the results go back, the way new results do: under the fade when the wrap is further off than FADE_THRESHOLD_MS (${FADE_THRESHOLD_MS} ms), held for the wrap otherwise (here the loop was paused 1 s in, and a held crawl moved through the wrap)`,
+      onShown && on.path === on.expected && off.path === off.expected, JSON.stringify({ FADE_THRESHOLD_MS, on, onShown, off, offShown }));
     await closePage(p);
   }
 
@@ -328,7 +443,18 @@ try {
       return JSON.stringify(body);
     };
     const push = (body) => fetch(`${HTTP}/mock/push`, { method: 'POST', body });
-    const ov = await openPage('out-of-order overlay page', { width: 1920, height: 72 }, `${HTTP}/zipper-overlay/ticker.html?w=1920&sbport=${WS_PORT}`, { init: skewClock });
+    const ov = await openPage('out-of-order overlay page', { width: 1920, height: 72 }, `${HTTP}/zipper-overlay/ticker.html?w=1920&sbport=${WS_PORT}`, { init: [skewClock, crawlDriver] });
+    // A payload the pages are to apply: the overlay brings it in under the fade, or holds it
+    // for the wrap when that is FADE_THRESHOLD_MS or less away. So before the push its loop
+    // is paused 1 s in, and a crawl held for the wrap is moved through it (crawlDriver):
+    // these checks follow the stamp rule whatever the threshold is.
+    const pushNew = async (body) => {
+      const n = await ov.page.evaluate(() => window.__drive.pauseAt(1000));
+      await push(body);
+      const got = await waitUntil(() => ov.page.evaluate((k) => window.__drive.taken(k), n), 5000);
+      if (got && got.path === 'held') await ov.page.evaluate(() => window.__drive.throughWrap());
+      return got;
+    };
     const ctl = await openPage('out-of-order control page', { width: 700, height: 900 }, `${HTTP}/zipper-shared/control.html?sbport=${WS_PORT}`, { init: skewClock });
     const skew = async (ms) => {
       for (const p of [ov, ctl]) await p.page.evaluate((m) => window.__zipperTestClockSkew(m), ms);
@@ -341,8 +467,8 @@ try {
       return { overlay: track.includes(name), preview: preview.includes(name) };
     };
     const waitBoth = async (name) => {
-      await ov.page.waitForFunction((n) => document.querySelector('.track').textContent.includes(n), name, { timeout: 5000 }).catch(() => {});
-      await ctl.page.waitForFunction((n) => document.getElementById('preview').textContent.includes(n), name, { timeout: 5000 }).catch(() => {});
+      await ov.page.waitForFunction((n) => document.querySelector('.track').textContent.includes(n), name, { timeout: 5000, polling: 50 }).catch(() => {});
+      await ctl.page.waitForFunction((n) => document.getElementById('preview').textContent.includes(n), name, { timeout: 5000, polling: 50 }).catch(() => {});
       return shows(name);
     };
     // A marker each page shows once everything broadcast before it has arrived: an
@@ -357,7 +483,7 @@ try {
       await ctl.page.waitForFunction((t) => document.getElementById('status').textContent.includes(t), text, { timeout: 5000 }).catch(() => {});
     };
 
-    await push(named('2026-07-11T20:20:00Z', 'NewerName'));
+    await pushNew(named('2026-07-11T20:20:00Z', 'NewerName'));
     const newer = await waitBoth('NewerName');
     await push(named('2026-07-11T20:10:00Z', 'OlderName'));
     await marker();
@@ -365,42 +491,44 @@ try {
     const older = await shows('OlderName');
     check('out of order: after a newer payload, a broadcast of an older one (by generatedAt) is ignored: the overlay and the control preview both keep the newer one on screen',
       newer.overlay && newer.preview && kept.overlay && kept.preview && !older.overlay && !older.preview, JSON.stringify({ newer, kept, older }));
-    await push(named('2026-07-11T20:20:00Z', 'EqualName'));
+    await pushNew(named('2026-07-11T20:20:00Z', 'EqualName'));
     const equal = await waitBoth('EqualName');
     check('out of order: a payload with the same stamp and other content is applied on both pages', equal.overlay && equal.preview, JSON.stringify(equal));
     // Past the window: the older one is applied, and the newest is reset to its stamp.
     await skew(5001);
-    await push(named('2026-07-11T20:10:00Z', 'LateOlderName'));
+    await pushNew(named('2026-07-11T20:10:00Z', 'LateOlderName'));
     const late = await waitBoth('LateOlderName');
     await push(named('2026-07-11T20:05:00Z', 'BelowResetName'));
     await marker();
     const belowKept = await shows('LateOlderName');
     const below = await shows('BelowResetName');
-    await push(named('2026-07-11T20:15:00Z', 'AboveResetName'));
+    await pushNew(named('2026-07-11T20:15:00Z', 'AboveResetName'));
     const above = await waitBoth('AboveResetName');
     check('out of order: an older payload that arrives more than 5 s after a page applied its newest is applied on both pages; the newest is reset to its stamp, so one older than that, just after, is ignored, and one newer is applied',
       late.overlay && late.preview && belowKept.overlay && belowKept.preview && !below.overlay && !below.preview && above.overlay && above.preview,
       JSON.stringify({ late, belowKept, below, above }));
     // A far-future stamp ("9999-…") freezes neither page past the window.
-    await push(named('9999-12-31T23:59:59Z', 'FarFutureName'));
+    await pushNew(named('9999-12-31T23:59:59Z', 'FarFutureName'));
     const far = await waitBoth('FarFutureName');
     await push(named('2026-07-11T20:16:00Z', 'FrozenName'));
     await marker();
     const farKept = await shows('FarFutureName');
     const frozen = await shows('FrozenName');
     await skew(5001);
-    await push(named('2026-07-11T20:16:00Z', 'ThawedName'));
+    await pushNew(named('2026-07-11T20:16:00Z', 'ThawedName'));
     const thawed = await waitBoth('ThawedName');
     check('out of order: a far-future stamp ("9999-…") does not freeze the pages: an ordinary payload after it is ignored within the 5 s, and applied on both pages once they have passed',
       far.overlay && far.preview && farKept.overlay && farKept.preview && !frozen.overlay && !frozen.preview && thawed.overlay && thawed.preview,
       JSON.stringify({ far, farKept, frozen, thawed }));
     // Every newer payload starts the window again, as each of the sidecar's pushes does in
     // steady use: past the window once more, a newer payload is applied, and an older one
-    // 4 s after it is ignored on both pages.
+    // 4 s after it is ignored on both pages. The real time the pages took to show the newer
+    // one counts toward the 4 s, so a slow fade cannot carry the older one past the window.
     await skew(6000);
-    await push(named('2026-07-11T20:17:00Z', 'RestartName'));
+    const restartSent = Date.now();
+    await pushNew(named('2026-07-11T20:17:00Z', 'RestartName'));
     const restart = await waitBoth('RestartName');
-    await skew(4000);
+    await skew(Math.max(0, 4000 - (Date.now() - restartSent)));
     await push(named('2026-07-11T20:16:30Z', 'InsideRestartName'));
     await marker();
     const restartKept = await shows('RestartName');
@@ -1454,6 +1582,1040 @@ try {
         && r.clickNote === 'Not connected to Streamer.bot: that click was not sent.' && notFound.length === 1,
       JSON.stringify({ ...r, notFound }));
     await closePage(p);
+  }
+
+  // ── Sprint 7: the crawl does not jump (ZIP-04, decisions 4, 8 and 14), and the overlay's
+  // rendering details (ZIP-19). Time is driven, not waited for: the page's ticker-scroll
+  // animation is paused through its own Animation object and its currentTime is set
+  // (seeking fires animationiteration and animationend in the system browser), and
+  // ticker:update events are dispatched in the page; one case comes through the mock's
+  // push path and one through its connect-sync replay. Each of these pages also records,
+  // after every change to #track (a MutationObserver, so in the same task as the change,
+  // before any frame), which ticker-scroll animation runs, how far in it is, its duration
+  // and the loop's end (--seg-w), and each start of the fade (crawlProbe). Not every frame:
+  // headless Edge runs requestAnimationFrame only 1 to 3 times a second while a composited
+  // transform animation runs, so a frame-by-frame record misses most of what happens; the
+  // two-frame waits in seek() take a second or two for the same reason. The fade threshold is
+  // ticker.js's FADE_THRESHOLD_MS, read from its source: the held cases are NEAR_MS (5 s, or
+  // half the threshold when that is less than 10 s) from the wrap, and the cases that must
+  // take the fade (or must not, with no change) run a loop of about 190 s or more (?speed=10) and
+  // check that it is far longer than the threshold.
+  {
+    const sample = JSON.parse(sampleText);
+    // A crawl other than the sample, as wide as `extra` more matches make it.
+    const crawlOf = (tag, extra = 1, over = {}) => ({
+      ...sample, generatedAt: '2026-07-11T20:16:00Z',
+      matches: [
+        ...Array.from({ length: extra }, (_, i) => ({ id: `s7-${tag}-${i}`, round: 'Grand Final', state: 'completed',
+          p1: { name: `${tag} Player ${i + 1}`, score: 3 }, p2: { name: `${tag} Rival ${i + 1}`, score: 1 }, winner: 1 })),
+        ...sample.matches,
+      ],
+      ...over,
+    });
+    const blankOf = (name) => ({ ...sample, tournament: { ...sample.tournament, name }, matches: [], standings: [] });
+    const crawlProbe = () => {
+      const c = { updates: 0, frames: [], ids: new Map(), next: 1, fades: 0, pips: 0, fadeAt: null, swapAfter: [] };
+      window.__crawl = c;
+      window.addEventListener('ticker:update', () => { c.updates++; });
+      // Every animationiteration that is not the crawl's own (the LIVE pip's blink), wherever it starts.
+      window.addEventListener('animationiteration', (e) => { if (e.animationName !== 'ticker-scroll') c.pips++; }, true);
+      const T = () => document.getElementById('track');
+      const anim = () => { const t = T(); return t && typeof t.getAnimations === 'function' ? (t.getAnimations().find((x) => x.animationName === 'ticker-scroll') || null) : null; };
+      const idOf = (a) => { if (!a) return null; if (!c.ids.has(a)) c.ids.set(a, c.next++); return c.ids.get(a); };
+      let fadingWas = false;
+      const record = (muts) => {
+        const t = T();
+        const a = anim();
+        if (a) {
+          c.frames.push({ id: idOf(a), t: a.currentTime, d: a.effect.getComputedTiming().duration, w: parseFloat(t.style.getPropertyValue('--seg-w')), at: performance.now() });
+          if (c.frames.length > 6000) c.frames.splice(0, 2000);
+        }
+        const fadingNow = t.classList.contains('swap-fade');
+        if (fadingNow && !fadingWas) { c.fades++; c.fadeAt = performance.now(); }
+        fadingWas = fadingNow;
+        // How long after a fade started the copies were replaced (the swap under it).
+        if (c.fadeAt !== null && (muts || []).some((m) => m.type === 'childList')) { c.swapAfter.push(performance.now() - c.fadeAt); c.fadeAt = null; }
+      };
+      // The track exists once the document is parsed; the first crawl comes later, over the socket.
+      document.addEventListener('readystatechange', () => {
+        const t = T();
+        if (!t || t.__s7watched) return;
+        t.__s7watched = true;
+        new MutationObserver(record).observe(t, { attributes: true, attributeFilter: ['style', 'class'], childList: true });
+      });
+      const frame = () => new Promise((r) => requestAnimationFrame(() => r()));
+      const segs = () => Array.from(T().children).filter((e) => e.classList.contains('seg'));
+      window.__zt = {
+        id: () => idOf(anim()),
+        dur: () => { const a = anim(); return a ? a.effect.getComputedTiming().duration : null; },
+        // Pauses the loop ms into its animation, then lets two frames pass for its events.
+        async seek(ms) { const a = anim(); if (!a) return false; a.pause(); a.currentTime = ms; await frame(); await frame(); return true; },
+        // Lets a paused loop run on in real time.
+        async play() { const a = anim(); if (!a) return false; a.play(); await frame(); return true; },
+        // Where the loop now running started, as first recorded (in the task that built it):
+        // its time, duration and end, the px into it (t / d × w), and when.
+        startOf() {
+          const id = idOf(anim());
+          const f = c.frames.find((x) => x.id === id);
+          return f ? { id, t: f.t, d: f.d, w: f.w, px: (f.t / f.d) * f.w, at: f.at } : null;
+        },
+        // As seek, and gives what the page shows the moment the track's own ticker-scroll
+        // event (the wrap, or the loop's end) has been handled: this listener comes after
+        // ticker.js's, so it runs right after it, in the same dispatch, before any timer.
+        async snapAt(ms) {
+          const t = T();
+          let snap = null;
+          const take = (e) => {
+            if (e.target !== t || e.animationName !== 'ticker-scroll' || snap) return;
+            snap = { type: e.type, view: this.view(), copies: this.copies(), fading: this.fading(), othersOff: this.othersOff() };
+          };
+          t.addEventListener('animationiteration', take);
+          t.addEventListener('animationend', take);
+          try { await this.seek(ms); } finally { t.removeEventListener('animationiteration', take); t.removeEventListener('animationend', take); }
+          return snap;
+        },
+        // As seek, and gives where the track is and what is in view when the loop's end
+        // comes, before ticker.js handles it (a capture listener on window runs first): what
+        // the browser would draw if a frame came before that handler.
+        async snapBeforeEnd(ms) {
+          const t = T();
+          let snap = null;
+          const take = (e) => {
+            if (e.target !== t || e.animationName !== 'ticker-scroll' || snap) return;
+            snap = { offset: this.offset(), view: this.view() };
+          };
+          window.addEventListener('animationend', take, true);
+          try { await this.seek(ms); } finally { window.removeEventListener('animationend', take, true); }
+          return snap;
+        },
+        offset: () => new DOMMatrix(getComputedStyle(T()).transform).m41,
+        segW: () => parseFloat(T().style.getPropertyValue('--seg-w')),
+        copies: () => segs().map((e) => e.textContent),
+        widths: () => segs().map((e) => e.getBoundingClientRect().width),
+        wrapW: () => document.getElementById('track-wrap').clientWidth,
+        fading: () => T().classList.contains('swap-fade'),
+        // The opacity transition running on the track, as its start and end values.
+        fadeTransition() {
+          const tr = T().getAnimations().find((x) => x.transitionProperty === 'opacity');
+          if (!tr) return null;
+          const k = tr.effect.getKeyframes();
+          return { from: k[0] && k[0].opacity, to: k[k.length - 1] && k[k.length - 1].opacity };
+        },
+        loopStyle: () => { const cs = getComputedStyle(T()); return { count: cs.animationIterationCount, fill: cs.animationFillMode }; },
+        isStatic: () => T().classList.contains('static'),
+        text: () => T().textContent,
+        // The items in view, inside the edge fades: their text, and where each starts.
+        view() {
+          const wr = document.getElementById('track-wrap').getBoundingClientRect();
+          const lo = wr.left + 24; const hi = wr.right - 24;
+          const out = [];
+          for (const it of T().querySelectorAll('.seg .item')) {
+            const r = it.getBoundingClientRect();
+            if (r.right > lo && r.left < hi) out.push({ text: it.textContent, x: r.left - wr.left });
+          }
+          return out;
+        },
+        // Whether the copies after the first start at or past the strip's right edge.
+        othersOff() { const s = segs(); return s.length > 1 && s[1].getBoundingClientRect().left >= document.getElementById('track-wrap').getBoundingClientRect().right - 24; },
+        // Whether, at the loop's end, the copies after the first cover the strip's middle.
+        coveredAtEnd() { const s = segs(); let rest = 0; for (const e of s.slice(1)) rest += e.getBoundingClientRect().width; return rest >= document.getElementById('track-wrap').clientWidth; },
+        send(payload) { window.dispatchEvent(new CustomEvent('ticker:update', { detail: payload })); },
+        mark() { const s = segs()[0]; s.__s7mark = (s.__s7mark || 0) + 1; return true; },
+        marked: () => { const s = segs()[0]; return !!(s && s.__s7mark); },
+        // Waits for a ticker-scroll animation other than id, then pauses it 1 ms in.
+        async nextAnim(id, ms = 3000) {
+          const end = performance.now() + ms;
+          while (performance.now() < end) {
+            const a = anim();
+            if (a && idOf(a) !== id) {
+              const first = c.frames.find((f) => f.id === idOf(a));
+              a.pause(); a.currentTime = 1; await frame(); await frame();
+              return { id: idOf(a), firstT: first ? first.t : null };
+            }
+            await frame();
+          }
+          return null;
+        },
+        frames: () => c.frames,
+        fades: () => c.fades,
+        pips: () => c.pips,
+        swapAfter: () => c.swapAfter.slice(),
+        // Each copy's width in the strip's own px (a transform on the strip not counted).
+        layoutWidths: () => segs().map((e) => parseFloat(getComputedStyle(e).width)),
+        async settle(n = 3) { for (let k = 0; k < n; k++) await frame(); return true; },
+        updates: () => c.updates,
+      };
+    };
+    // What the records say about the loop: no ticker-scroll animation changed its duration
+    // while it ran, and after every change the loop's end and duration agree with the speed.
+    const loopFrames = (frames, speed) => {
+      const durs = new Map();
+      let changed = 0; let mismatched = 0;
+      for (const f of frames) {
+        if (!durs.has(f.id)) durs.set(f.id, f.d);
+        else if (Math.abs(durs.get(f.id) - f.d) > 0.5) changed++;
+        if (!(Math.abs(f.d - (f.w / speed) * 1000) <= 2)) mismatched++;
+      }
+      return { frames: frames.length, animations: durs.size, changed, mismatched };
+    };
+    const sameView = (a, b) => Array.isArray(a) && Array.isArray(b) && a.length > 0 && a.length === b.length
+      && a.every((v, i) => v.text === b[i].text && Math.abs(v.x - b[i].x) <= 1);
+    const overlayUrl = (w = 1920, extra = '') => `${HTTP}/zipper-overlay/ticker.html?w=${w}&sbport=${WS_PORT}${extra}`;
+    const zt = (page, fn, arg) => page.evaluate(fn, arg);
+    // ticker.js's own figures (FADE_THRESHOLD_MS, LOGO_RETRY_MS) are read from its source at
+    // the top, so the cases below follow the figures the owner sets: the held cases (NEAR_MS
+    // before the wrap) sit inside the threshold and the fade cases far outside it.
+    {
+      // Each doc that gives the threshold in seconds gives ticker.js's figure.
+      const figures = {};
+      for (const f of ['README.md', 'docs/PROTOCOL.md', 'docs/THEMING.md']) {
+        const text = (await readFile(resolve(__dirname, f), 'utf-8')).replace(/\s+/g, ' ');
+        figures[f] = Array.from(text.matchAll(/(\d+) seconds (?:away )?or less/g), (m) => Number(m[1]));
+      }
+      check(`crawl: ticker.js names its fade threshold (FADE_THRESHOLD_MS) and its logo retry wait (LOGO_RETRY_MS); the held cases below (${NEAR_MS / 1000} s from the wrap) sit inside the threshold; README, PROTOCOL and THEMING each give the same threshold in seconds`,
+        FADE_THRESHOLD_MS > 0 && NEAR_MS > 0 && NEAR_MS < FADE_THRESHOLD_MS && LOGO_RETRY_MS > 0
+          && Object.values(figures).every((v) => v.length >= 1 && v.every((s) => s * 1000 === FADE_THRESHOLD_MS)),
+        JSON.stringify({ FADE_THRESHOLD_MS, NEAR_MS, LOGO_RETRY_MS, figures }));
+    }
+
+    // The overlay with a refused ?sbport (the ruling of 2026-11-26): it dials nothing, is
+    // marked offline and keeps its static line. Its WebSocket is a stand-in that never
+    // connects, so it reaches no Streamer.bot even if panel-core dialled one.
+    {
+      const init = () => {
+        window.__dialled = [];
+        class NoSocket {
+          constructor(url) { window.__dialled.push(String(url)); this.readyState = 0; }
+          send() { throw new Error('the stand-in socket never connects'); }
+          close() {}
+        }
+        NoSocket.CONNECTING = 0; NoSocket.OPEN = 1; NoSocket.CLOSING = 2; NoSocket.CLOSED = 3;
+        window.WebSocket = NoSocket;
+      };
+      const p = await openPage('refused-port overlay page', { width: 1920, height: 72 }, `${HTTP}/zipper-overlay/ticker.html?w=1920&sbport=abc`, { init });
+      await p.page.waitForFunction(() => document.readyState === 'complete', null, { timeout: 4000 }).catch(() => {});
+      await sleep(2600); // past the 2 to 2.5 s a closed socket waits before it dials again
+      const r = await p.page.evaluate(() => ({
+        dialled: window.__dialled, offline: document.body.classList.contains('offline'),
+        flag: window.__ZIPPER_SB_PORT_REFUSED ?? null, text: document.getElementById('track').textContent,
+      }));
+      check('overlay (the ruling of 2026-11-26): with a refused ?sbport the overlay dials nothing (its WebSocket is a stand-in here), is marked offline and keeps its static line',
+        r.dialled.length === 0 && r.offline === true && r.flag === true && r.text === 'waiting for results…', JSON.stringify(r));
+      await closePage(p);
+    }
+
+    // The swap at the wrap (decision 8), through the mock's push path. Outbound requests
+    // are blocked on this page, as a guard that the overlay needs no network.
+    {
+      const outbound = [];
+      const setup = (page) => page.route((u) => u.hostname !== '127.0.0.1', (r) => { outbound.push(r.request().url()); return r.abort(); });
+      const p = await openPage('wrap-swap overlay page', { width: 1920, height: 72 }, overlayUrl(), { init: crawlProbe, setup });
+      const { page } = p;
+      await page.waitForSelector('.track .seg .item', { timeout: 8000 });
+      await sleep(300);
+      const d = await zt(page, () => window.__zt.dur());
+      const id0 = await zt(page, () => window.__zt.id());
+      await zt(page, (t) => window.__zt.seek(t), d - NEAR_MS); // NEAR_MS before the wrap
+      const before = await zt(page, () => ({ offset: window.__zt.offset(), view: window.__zt.view(), copies: window.__zt.copies() }));
+      const updates = await zt(page, () => window.__zt.updates());
+      await fetch(`${HTTP}/mock/push`, { method: 'POST', body: JSON.stringify(crawlOf('WrapNew', 2)) });
+      await page.waitForFunction((n) => window.__zt.updates() > n, updates, { timeout: 5000 }).catch(() => {});
+      const arrived = await zt(page, () => ({ updates: window.__zt.updates(), offset: window.__zt.offset(), view: window.__zt.view(), copies: window.__zt.copies(), id: window.__zt.id(), fading: window.__zt.fading() }));
+      check(`crawl (ZIP-04): a new result that arrives ${NEAR_MS / 1000} s before the wrap, through the mock's push path, does not move the track or change the text in view; it is held: no copy holds it yet, no fade, the same loop runs`,
+        d > 10000 && arrived.updates > updates && arrived.offset === before.offset && sameView(arrived.view, before.view)
+          && JSON.stringify(arrived.copies) === JSON.stringify(before.copies) && !arrived.copies.join('').includes('WrapNew') && arrived.id === id0 && arrived.fading === false,
+        JSON.stringify({ d, updates, arrivedUpdates: arrived.updates, before: before.offset, after: arrived.offset, copies: arrived.copies.map((c) => c.slice(0, 40)), id0, id: arrived.id, fading: arrived.fading }));
+      // The LIVE pip blinks every 1.2 s and its animationiteration bubbles to the track:
+      // it must not pass for the wrap. Animation events come only with frames, which come
+      // seldom here, so the check waits until at least two pip events have come.
+      const pip0 = await zt(page, () => ({ pips: window.__zt.pips(), fades: window.__zt.fades() }));
+      await page.waitForFunction((n) => window.__zt.pips() >= n + 2, pip0.pips, { timeout: 8000 }).catch(() => {});
+      const afterPip = await zt(page, () => ({ copies: window.__zt.copies(), id: window.__zt.id(), pips: window.__zt.pips(), fading: window.__zt.fading(), fades: window.__zt.fades() }));
+      check('crawl (decision 8): the LIVE pip\'s blink, whose animationiteration bubbles up to the track, does not pass for the wrap: after two of its events the held result is still in no copy, the same loop runs, and no fade started',
+        afterPip.pips >= pip0.pips + 2 && !afterPip.copies.join('').includes('WrapNew') && afterPip.id === id0
+          && afterPip.fading === false && afterPip.fades === pip0.fades,
+        JSON.stringify({ pip0, afterPip: { ...afterPip, copies: afterPip.copies.map((c) => c.slice(0, 40)) } }));
+      await zt(page, (t) => window.__zt.seek(t), d - 1);
+      const v1 = await zt(page, () => ({ view: window.__zt.view(), copies: window.__zt.copies() }));
+      await zt(page, (t) => window.__zt.seek(t), d + 1); // across the wrap
+      const v2 = await zt(page, () => ({ view: window.__zt.view(), copies: window.__zt.copies(), id: window.__zt.id(), othersOff: window.__zt.othersOff(), segW: window.__zt.segW(), widths: window.__zt.widths() }));
+      check('crawl (decision 8): at the wrap the text in view does not change, while the copy off screen already holds the new items: the first copy keeps the old ones, the loop runs on and still ends at the old copy\'s width',
+        sameView(v1.view, v2.view) && !v1.copies.join('').includes('WrapNew')
+          && !v2.copies[0].includes('WrapNew') && v2.copies.slice(1).length >= 1 && v2.copies.slice(1).every((c) => c.includes('WrapNew'))
+          && v2.othersOff === true && v2.id === id0 && Math.abs(v2.segW - v2.widths[0]) <= 0.5,
+        JSON.stringify({ v1: v1.view.map((v) => [v.text.slice(0, 24), Math.round(v.x)]), v2: v2.view.map((v) => [v.text.slice(0, 24), Math.round(v.x)]), copies: v2.copies.map((c) => c.slice(0, 40)), othersOff: v2.othersOff, id: v2.id, segW: v2.segW, widths: v2.widths }));
+      await zt(page, (t) => window.__zt.seek(t), 2 * d - 1);
+      const v3 = await zt(page, () => ({ view: window.__zt.view(), offset: window.__zt.offset(), widths: window.__zt.widths() }));
+      const atEnd = await zt(page, (t) => window.__zt.snapBeforeEnd(t), 2 * d + 1); // the next wrap
+      const next = await zt(page, (id) => window.__zt.nextAnim(id), id0);
+      const v4 = await zt(page, () => ({ view: window.__zt.view(), copies: window.__zt.copies(), segW: window.__zt.segW(), widths: window.__zt.widths(), dur: window.__zt.dur(), frames: window.__zt.frames(), loop: window.__zt.loopStyle() }));
+      const lf = loopFrames(v4.frames, 80);
+      check('crawl (decision 8): at the next wrap every copy holds the new items and the loop starts again at offset 0, in the frame that sets its new end and duration, and repeats for good again; just before it, the loop had moved by the old copy\'s width (not half the track), and at its end it is held there until the overlay handles it, so the copy in view is the new one whichever comes first; the text in view does not change; no loop changed its duration while it ran',
+        !!next && next.firstT !== null && next.firstT === 0 && sameView(v3.view, v4.view)
+          && Math.abs(v3.offset + (v3.widths[0] - 0.08)) <= 1 && Math.abs(v3.widths[0] - v3.widths[1]) > 50
+          && !!atEnd && Math.abs(atEnd.offset + v3.widths[0]) <= 1 && sameView(atEnd.view, v3.view)
+          && v4.loop.count === 'infinite' && v4.loop.fill === 'none'
+          && v4.copies.every((c) => c.includes('WrapNew')) && Math.abs(v4.segW - v4.widths[0]) <= 0.5
+          && Math.abs(v4.dur - (v4.segW / 80) * 1000) <= 2 && lf.changed === 0 && lf.mismatched === 0 && lf.animations >= 2,
+        JSON.stringify({ next, atEnd: atEnd && { offset: atEnd.offset, view: atEnd.view.map((v) => [v.text.slice(0, 24), Math.round(v.x)]) }, v3: v3.view.map((v) => [v.text.slice(0, 24), Math.round(v.x)]), v3offset: v3.offset, v3widths: v3.widths, v4: v4.view.map((v) => [v.text.slice(0, 24), Math.round(v.x)]), segW: v4.segW, widths: v4.widths, dur: v4.dur, loop: v4.loop, lf }));
+      check('overlay: with outbound requests blocked the page painted and crawled; it asked for nothing beyond 127.0.0.1',
+        outbound.length === 0 && v4.copies.length >= 2, JSON.stringify(outbound));
+      await closePage(p);
+      // The store as it was: the sample.
+      await fetch(`${HTTP}/mock/push`, { method: 'POST', body: sampleText });
+    }
+
+    // The fade (decisions 4 and 8): a loop far longer than the threshold (?speed=10), and a
+    // result that arrives about 190 s before the wrap. Then unchanged content, and caps.
+    {
+      const p = await openPage('fade overlay page', { width: 1920, height: 72 }, overlayUrl(1920, '&speed=10'), { init: crawlProbe });
+      const { page } = p;
+      await page.waitForSelector('.track .seg .item', { timeout: 8000 });
+      await sleep(300);
+      const d = await zt(page, () => window.__zt.dur());
+      const id0 = await zt(page, () => window.__zt.id());
+      await zt(page, () => window.__zt.seek(1000));
+      const at = await zt(page, (payload) => {
+        const before = { offset: window.__zt.offset(), view: window.__zt.view(), copies: window.__zt.copies() };
+        window.__zt.send(payload);
+        return { before, after: { offset: window.__zt.offset(), view: window.__zt.view(), copies: window.__zt.copies(), fading: window.__zt.fading(), transition: window.__zt.fadeTransition() } };
+      }, crawlOf('FadeNew', 3));
+      check('crawl (ZIP-04): a new result that arrives far from the wrap (the loop is slowed with ?speed=10, so the wrap is well past the threshold) does not move the track or change the text at the moment it arrives; the track starts to fade (an opacity transition to 0)',
+        d - 1000 > FADE_THRESHOLD_MS + 10000 && at.after.offset === at.before.offset && sameView(at.after.view, at.before.view)
+          && JSON.stringify(at.after.copies) === JSON.stringify(at.before.copies) && at.after.fading === true
+          && !!at.after.transition && String(at.after.transition.to) === '0',
+        JSON.stringify({ d, before: at.before.offset, after: at.after.offset, fading: at.after.fading, transition: at.after.transition, copies: at.after.copies.map((c) => c.slice(0, 40)) }));
+      await sleep(700); // past the fade's two halves
+      const faded = await zt(page, () => ({ copies: window.__zt.copies(), fading: window.__zt.fading(), segW: window.__zt.segW(), widths: window.__zt.widths(), dur: window.__zt.dur(), frames: window.__zt.frames(), fades: window.__zt.fades() }));
+      const fadedId = await zt(page, () => window.__zt.id());
+      const firstNew = faded.frames.find((f) => f.id === fadedId);
+      const lf = loopFrames(faded.frames, 10);
+      // The old loop was paused 1 s in, so it stood at 10 px through the fade: the new loop
+      // starts there (the owner's ruling of 2026-11-26), as px into it (time ÷ duration × end).
+      const startPx = firstNew ? (firstNew.t / firstNew.d) * firstNew.w : NaN;
+      check('crawl (decision 4, the owner\'s ruling of 2026-11-26): under the fade the swap is at once: every copy holds the new items, a new loop started with its new end and duration at the place the old one stood (10 px in), the fade is over, and no loop changed its duration while it ran',
+        faded.copies.every((c) => c.includes('FadeNew')) && faded.fading === false && faded.fades === 1 && fadedId !== id0
+          && !!firstNew && -at.before.offset > 5 && Math.abs(startPx - -at.before.offset) <= 0.5
+          && Math.abs(faded.segW - faded.widths[0]) <= 0.5 && Math.abs(faded.dur - (faded.segW / 10) * 1000) <= 2
+          && lf.changed === 0 && lf.mismatched === 0,
+        JSON.stringify({ copies: faded.copies.map((c) => c.slice(0, 40)), fading: faded.fading, fades: faded.fades, id0, fadedId, firstNew, startPx, before: at.before.offset, segW: faded.segW, widths: faded.widths, dur: faded.dur, lf }));
+      // Unchanged content does nothing (decision 14), and a cap change applies at once
+      // without touching the crawl.
+      await zt(page, () => { window.__zt.mark(); return true; });
+      const fades0 = await zt(page, () => window.__zt.fades());
+      const same = await zt(page, (payload) => {
+        const offset = window.__zt.offset();
+        window.__zt.send(JSON.parse(JSON.stringify(payload)));
+        return { offsetSame: window.__zt.offset() === offset, fading: window.__zt.fading() };
+      }, crawlOf('FadeNew', 3));
+      const caps = await zt(page, (payload) => {
+        const offset = window.__zt.offset();
+        window.__zt.send(payload);
+        return { offsetSame: window.__zt.offset() === offset, fading: window.__zt.fading(), cap: document.getElementById('cap-right').textContent };
+      }, crawlOf('FadeNew', 3, { caps: { text: '@NewCapText', logo: '' } }));
+      await sleep(400);
+      const after = await zt(page, () => ({ marked: window.__zt.marked(), id: window.__zt.id(), fades: window.__zt.fades(), copies: window.__zt.copies() }));
+      check('crawl (decision 14): an update with the same crawl does nothing to the track (the same copies, the same loop, no fade), and a right-cap change in it shows at once without touching the crawl',
+        same.offsetSame && same.fading === false && caps.offsetSame && caps.fading === false && caps.cap === '@NewCapText'
+          && after.marked === true && after.id === fadedId && after.fades === fades0 && after.copies.every((c) => c.includes('FadeNew')),
+        JSON.stringify({ same, caps, after: { ...after, copies: after.copies.length } }));
+      await closePage(p);
+    }
+
+    // The fade keeps the crawl's place (the owner's ruling of 2026-11-26): the new loop starts
+    // at the offset the old one had reached, modulo the new copy's width, so updates that come
+    // often do not keep the end of a long list out of view. A long loop (?speed=10).
+    {
+      const p = await openPage('fade-place overlay page', { width: 1920, height: 72 }, overlayUrl(1920, '&speed=10'), { init: crawlProbe });
+      const { page } = p;
+      await page.waitForSelector('.track .seg .item', { timeout: 8000 });
+      await sleep(300);
+      const SPEED = 10;
+      // How far the page's own clock for the crawl (its frame time, which here moves on only
+      // 1 to 3 times a second) may lag a reading by, as px of crawl, plus rounding.
+      const LAG_PX = SPEED * 1.2 + 1;
+      // Sends payload (the loop as it is: running, or paused) and waits for the fade's swap.
+      // before: the loop's id, how far into it the track is (px), its end, when, and the fades
+      // so far. after: the new loop's start (startOf), the fades, the copies.
+      const fadeIn = async (payload, moveTo = null) => {
+        const before = await zt(page, (a) => {
+          const r = { id: window.__zt.id(), px: -window.__zt.offset(), w: window.__zt.segW(), at: performance.now(), fades: window.__zt.fades() };
+          window.__zt.send(a.payload);
+          if (a.moveTo !== null) {
+            // The paused loop moves on while the track fades out.
+            const an = document.getElementById('track').getAnimations().find((x) => x.animationName === 'ticker-scroll');
+            an.currentTime = a.moveTo;
+            r.movedPx = -window.__zt.offset();
+          }
+          return r;
+        }, { payload, moveTo });
+        await page.waitForFunction((id) => window.__zt.id() !== id && !window.__zt.fading(), before.id, { timeout: 4000, polling: 50 }).catch(() => {});
+        const after = await zt(page, () => ({ start: window.__zt.startOf(), fades: window.__zt.fades(), copies: window.__zt.copies() }));
+        return { before, after, toWrap: before.w > 0 ? ((before.w - before.px) / SPEED) * 1000 : NaN };
+      };
+      // (1) A shorter crawl (one message line, repeated to fill the strip) from far into a long
+      // running loop (the sample and four more matches, from the static line so at once): the
+      // new loop starts at the offset the old one had by the swap (the offset just before plus
+      // the crawl in the time the fade took, if the loop moved on), modulo its own width.
+      await zt(page, (pl) => { window.__zt.send(pl.blank); window.__zt.send(pl.long); return true; }, { blank: blankOf('Sprint7 Place'), long: crawlOf('PlaceOld', 4) });
+      await sleep(300);
+      const d0 = await zt(page, () => window.__zt.dur());
+      await zt(page, (t) => window.__zt.seek(t), Math.min(d0 - FADE_THRESHOLD_MS - 10000, 300000));
+      await zt(page, () => window.__zt.play());
+      const one = await fadeIn({ ...sample, message: { lines: ['The fade keeps its place'] } });
+      const s1 = one.after.start;
+      const took1 = s1 ? s1.at - one.before.at : NaN;
+      const want1 = s1 ? (one.before.px + (SPEED * took1) / 1000) % s1.w : NaN;
+      check('crawl (the owner\'s ruling of 2026-11-26): a shorter crawl that arrives far from the wrap of a long running loop comes in under one fade, and the new loop starts at the offset the old one had reached by the swap (the offset just before, plus the crawl while the fade ran), modulo the new copy\'s width, give or take the page\'s frame clock',
+        one.toWrap > FADE_THRESHOLD_MS + 5000 && !!s1 && s1.id !== one.before.id && one.after.fades === one.before.fades + 1
+          && one.before.px > s1.w && want1 > 50 && want1 < s1.w - 50 && Math.abs(s1.px - want1) <= LAG_PX
+          && one.after.copies.length >= 2 && one.after.copies.every((c) => c.includes('The fade keeps its place')),
+        JSON.stringify({ d0, before: one.before, toWrap: one.toWrap, start: s1, took1, want1, LAG_PX }));
+      // (2) The offset is read at the swap, with the track out of sight: the loop is paused, the
+      // crawl sent, and the paused loop moved on by half its length while the track fades out.
+      await sleep(400);
+      const d1 = await zt(page, () => window.__zt.dur());
+      await zt(page, (t) => window.__zt.seek(t), 0.1 * d1);
+      const two = await fadeIn(crawlOf('ReadAtSwap', 3), 0.6 * d1);
+      const s2 = two.after.start;
+      const want2 = s2 ? two.before.movedPx % s2.w : NaN;
+      check('crawl (the owner\'s ruling of 2026-11-26): the offset the new loop starts at is read at the swap, while the track is faded out: a paused loop moved on during the fade starts the new loop where it was moved to, not where it was when the crawl arrived',
+        two.toWrap > FADE_THRESHOLD_MS + 5000 && !!s2 && s2.id !== two.before.id && two.after.fades === two.before.fades + 1
+          && Math.abs(two.before.movedPx - two.before.px) > 300 && Math.abs(s2.px - want2) <= 0.5
+          && two.after.copies.every((c) => c.includes('ReadAtSwap Player')),
+        JSON.stringify({ d1, before: two.before, toWrap: two.toWrap, start: s2, want2 }));
+      // (3) Three updates, each far from the wrap of a long loop, with the crawl moved on by
+      // 30 s (300 px) before each: each comes in under a fade of its own, and the offset keeps
+      // growing (it never goes back to the start of the loop). Time is driven here: a new loop
+      // in this headless browser may wait for a frame before it moves at all.
+      const runs = [];
+      for (const tag of ['GrowOne', 'GrowTwo', 'GrowThree']) {
+        await sleep(400);
+        const s = await zt(page, () => window.__zt.startOf());
+        await zt(page, (t) => window.__zt.seek(t), (s ? s.t : 0) + 30000);
+        runs.push(await fadeIn(crawlOf(tag, 3)));
+      }
+      const each = runs.map((r, i) => {
+        const s = r.after.start;
+        return { tag: ['GrowOne', 'GrowTwo', 'GrowThree'][i], beforePx: r.before.px, toWrap: r.toWrap, startPx: s ? s.px : null, want: s ? r.before.px % s.w : null, fade: r.after.fades === r.before.fades + 1 && !!s && s.id !== r.before.id };
+      });
+      check('crawl (the owner\'s ruling of 2026-11-26): three updates, each far from the wrap of a long loop, with the crawl moved on 300 px before each, come in under a fade each, and the offset keeps growing: each new loop starts where the old one had got to, 300 px on from the one before',
+        each.every((e) => e.fade && e.toWrap > FADE_THRESHOLD_MS + 5000 && Math.abs(e.startPx - e.want) <= 0.5)
+          && Math.abs(each[1].startPx - each[0].startPx - 300) <= 1 && Math.abs(each[2].startPx - each[1].startPx - 300) <= 1
+          && each[0].startPx > 500 && runs[2].after.copies.every((c) => c.includes('GrowThree Player')),
+        JSON.stringify({ each }));
+      await closePage(p);
+    }
+
+    // A second page connecting mid-loop: the mock replays the stored payload to every
+    // subscriber, so the first overlay gets a payload identical to the one on screen. The
+    // loop is slowed (?speed=10) so the wrap is far past the threshold: a replay taken for
+    // new content would fade at once, rather than wait for the wrap out of sight of the check.
+    {
+      const p = await openPage('replay overlay page', { width: 1920, height: 72 }, overlayUrl(1920, '&speed=10'), { init: crawlProbe });
+      const { page } = p;
+      await page.waitForSelector('.track .seg .item', { timeout: 8000 });
+      await sleep(300);
+      await zt(page, () => window.__zt.seek(4000));
+      await zt(page, () => { window.__zt.mark(); return true; });
+      const before = await zt(page, () => ({ offset: window.__zt.offset(), id: window.__zt.id(), updates: window.__zt.updates(), fades: window.__zt.fades(), d: window.__zt.dur() }));
+      const second = await openPage('second overlay page', { width: 1920, height: 72 }, overlayUrl());
+      await second.page.waitForSelector('.track .seg .item', { timeout: 8000 });
+      await page.waitForFunction((n) => window.__zt.updates() > n, before.updates, { timeout: 5000 }).catch(() => {});
+      await sleep(400);
+      const after = await zt(page, () => ({ offset: window.__zt.offset(), id: window.__zt.id(), updates: window.__zt.updates(), fades: window.__zt.fades(), marked: window.__zt.marked() }));
+      check('crawl (decision 14): a second overlay connecting mid-loop sends the first the payload already on screen; it causes no swap and no fade, and the track offset is unchanged (the wrap was far past the threshold, so new content would have faded)',
+        before.d - 4000 > FADE_THRESHOLD_MS + 10000
+          && after.updates > before.updates && after.offset === before.offset && after.id === before.id && after.fades === before.fades && after.marked === true,
+        JSON.stringify({ before, after }));
+      await closePage(second);
+      await closePage(p);
+    }
+
+    // One held payload, and the newest wins (row 7.1), on a slow loop (?speed=10), so the
+    // wrap is far past the threshold except where a case seeks near it. The sends of each
+    // case run in one evaluate, so nothing happens in between.
+    {
+      const p = await openPage('held-payload overlay page', { width: 1920, height: 72 }, overlayUrl(1920, '&speed=10'), { init: crawlProbe });
+      const { page } = p;
+      await page.waitForSelector('.track .seg .item', { timeout: 8000 });
+      await sleep(300);
+      const short = (cs) => cs.map((c) => c.slice(0, 36));
+      // (1) Far from the wrap, two payloads at once: one fade, and its swap shows the newer.
+      await zt(page, (pl) => { window.__zt.send(pl.blank); window.__zt.send(pl.one); return true; }, { blank: blankOf('Sprint7 Held'), one: crawlOf('HOne', 1) });
+      await zt(page, () => window.__zt.seek(1000));
+      const d0 = await zt(page, () => window.__zt.dur());
+      const fades0 = await zt(page, () => window.__zt.fades());
+      await zt(page, (pl) => { window.__zt.send(pl.b); window.__zt.send(pl.c); return true; }, { b: crawlOf('HTwo', 1), c: crawlOf('HThree', 1) });
+      await sleep(800);
+      const one = await zt(page, () => ({ copies: window.__zt.copies(), fades: window.__zt.fades(), fading: window.__zt.fading() }));
+      check('crawl (row 7.1): two payloads that arrive together far from the wrap take one fade, and its swap puts the newer one in every copy',
+        d0 - 1000 > FADE_THRESHOLD_MS + 10000 && one.fades === fades0 + 1 && one.fading === false
+          && one.copies.length >= 2 && one.copies.every((c) => c.includes('HThree Player') && !c.includes('HTwo Player')),
+        JSON.stringify({ d0, fades0, one: { ...one, copies: short(one.copies) } }));
+      // (2) Near the wrap a payload is held; then the content on screen comes again. The
+      // held one is no longer wanted: at the wrap no copy takes it.
+      const d = await zt(page, () => window.__zt.dur());
+      const id1 = await zt(page, () => window.__zt.id());
+      await zt(page, (t) => window.__zt.seek(t), d - NEAR_MS);
+      const two = await zt(page, (pl) => {
+        window.__zt.send(pl.b);
+        const held = { copies: window.__zt.copies(), fading: window.__zt.fading() };
+        window.__zt.send(pl.a);
+        return held;
+      }, { b: crawlOf('HFour', 1), a: crawlOf('HThree', 1) });
+      await zt(page, (t) => window.__zt.seek(t), d - 1);
+      const s2 = (await zt(page, (t) => window.__zt.snapAt(t), d + 1)) || { type: null, copies: [], fading: null };
+      const two2 = await zt(page, () => ({ id: window.__zt.id(), fades: window.__zt.fades() }));
+      check('crawl (row 7.1): a payload held for the wrap, then the content on screen again: at the wrap no copy takes the held one, no fade, and the same loop runs on',
+        two.fading === false && !two.copies.join('').includes('HFour Player')
+          && s2.type === 'animationiteration' && s2.copies.length >= 2 && !s2.copies.join('').includes('HFour Player') && s2.fading === false
+          && two2.id === id1 && two2.fades === fades0 + 1,
+        JSON.stringify({ two: { ...two, copies: short(two.copies) }, s2: { type: s2.type, copies: short(s2.copies), fading: s2.fading }, two2, id1 }));
+      // (3) Near the next wrap, two payloads held: the newer goes into the copies off screen.
+      await zt(page, (t) => window.__zt.seek(t), 2 * d - NEAR_MS);
+      await zt(page, (pl) => { window.__zt.send(pl.b); window.__zt.send(pl.c); return true; }, { b: crawlOf('HFive', 1), c: crawlOf('HSix', 1) });
+      await zt(page, (t) => window.__zt.seek(t), 2 * d - 1);
+      const s3 = (await zt(page, (t) => window.__zt.snapAt(t), 2 * d + 1)) || { type: null, copies: [], fading: null };
+      check('crawl (row 7.1): of two payloads held for the same wrap, the newer goes into the copies off screen and the older into none; the first copy keeps what is on screen; no fade',
+        s3.type === 'animationiteration' && s3.copies.length >= 2 && s3.copies[0].includes('HThree Player')
+          && s3.copies.slice(1).every((c) => c.includes('HSix Player')) && !s3.copies.join('').includes('HFive Player') && s3.fading === false,
+        JSON.stringify({ type: s3.type, copies: short(s3.copies), fading: s3.fading }));
+      // (4) The content going into the copies off screen comes again, with the loop's end a
+      // whole loop away (far past the threshold): it does nothing.
+      await zt(page, () => { window.__zt.mark(); return true; });
+      const f4 = await zt(page, () => window.__zt.fades());
+      const again = await zt(page, (pl) => { window.__zt.send(pl); return { fading: window.__zt.fading() }; }, crawlOf('HSix', 1));
+      await sleep(500);
+      const four = await zt(page, () => ({ fades: window.__zt.fades(), fading: window.__zt.fading(), marked: window.__zt.marked(), id: window.__zt.id(), copies: window.__zt.copies() }));
+      check('crawl (row 7.1, decision 14): the content going into the copies off screen, sent again with the loop\'s end a whole loop away, does nothing: no fade, the same copies, the same loop',
+        again.fading === false && four.fades === f4 && four.fading === false && four.marked === true && four.id === id1
+          && four.copies[0].includes('HThree Player') && four.copies.slice(1).every((c) => c.includes('HSix Player')),
+        JSON.stringify({ again, f4, four: { ...four, copies: short(four.copies) } }));
+      // (5) A payload held while that content is going in: at the loop's end every copy takes
+      // that content and the held one goes straight into the copies off screen.
+      await zt(page, (t) => window.__zt.seek(t), 3 * d - NEAR_MS);
+      await zt(page, (pl) => { window.__zt.send(pl); return true; }, crawlOf('HSeven', 1));
+      await zt(page, (t) => window.__zt.seek(t), 3 * d - 1);
+      const s5 = (await zt(page, (t) => window.__zt.snapAt(t), 3 * d + 1)) || { type: null, copies: [], fading: null };
+      const five = await zt(page, () => ({ id: window.__zt.id(), fades: window.__zt.fades() }));
+      check('crawl (row 7.1): a payload that arrives while other content is going into the copies off screen goes into them itself at the loop\'s end, while the first copy takes the content before it; no fade',
+        s5.type === 'animationend' && s5.copies.length >= 2 && s5.copies[0].includes('HSix Player')
+          && s5.copies.slice(1).every((c) => c.includes('HSeven Player')) && s5.fading === false && five.id !== id1 && five.fades === f4,
+        JSON.stringify({ type: s5.type, copies: short(s5.copies), fading: s5.fading, five }));
+      await closePage(p);
+    }
+
+    // A strip scaled by a theme or OBS Custom CSS (.zipper { transform: scale(1.5) }): the
+    // loop is measured in the strip's own px, so it still wraps where the next copy starts.
+    {
+      const scaled = () => {
+        const add = () => { const s = document.createElement('style'); s.textContent = '.zipper { transform: scale(1.5); transform-origin: 0 0; }'; (document.head || document.documentElement).appendChild(s); };
+        if (document.documentElement) add(); else document.addEventListener('readystatechange', add, { once: true });
+      };
+      const p = await openPage('scaled overlay page', { width: 1920, height: 72 }, overlayUrl(), { init: [crawlProbe, scaled] });
+      const { page } = p;
+      await page.waitForSelector('.track .seg .item', { timeout: 8000 });
+      await sleep(300);
+      const d = await zt(page, () => window.__zt.dur());
+      await zt(page, (t) => window.__zt.seek(t), d - 1);
+      const v1 = await zt(page, () => ({ view: window.__zt.view(), segW: window.__zt.segW(), layout: window.__zt.layoutWidths(), rect: window.__zt.widths(), wrap: window.__zt.wrapW() }));
+      const v2 = (await zt(page, (t) => window.__zt.snapAt(t), d + 1)) || { type: null, view: [] };
+      check('crawl: on a strip scaled by custom CSS (1.5 times) the loop is measured in the strip\'s own px: it ends at the first copy\'s width (1.5 times that on screen), the copies cover the middle, and at the wrap the text in view does not move',
+        Math.abs(v1.rect[0] - 1.5 * v1.layout[0]) <= 1 && Math.abs(v1.segW - v1.layout[0]) <= 0.5 && v1.layout[0] >= v1.wrap
+          && v2.type === 'animationiteration' && sameView(v1.view, v2.view),
+        JSON.stringify({ d, segW: v1.segW, layout: v1.layout, rect: v1.rect, wrap: v1.wrap, type: v2.type, v1: v1.view.map((v) => [v.text.slice(0, 20), Math.round(v.x)]), v2: v2.view.map((v) => [v.text.slice(0, 20), Math.round(v.x)]) }));
+      await closePage(p);
+    }
+
+    // A theme that styles a .seg by its place (here .seg + .seg gets a border, to mark where
+    // the loop repeats): the loop's end is read from the first copy in place, so a swap under
+    // the fade is measured right and is not followed by fade after fade.
+    {
+      const placed = () => {
+        const add = () => { const s = document.createElement('style'); s.textContent = '.seg + .seg { border-left: 2px solid #ffd166; }'; (document.head || document.documentElement).appendChild(s); };
+        if (document.documentElement) add(); else document.addEventListener('readystatechange', add, { once: true });
+      };
+      const p = await openPage('placed-seg overlay page', { width: 1920, height: 72 }, overlayUrl(1920, '&speed=10'), { init: [crawlProbe, placed] });
+      const { page } = p;
+      await page.waitForSelector('.track .seg .item', { timeout: 8000 });
+      await sleep(300);
+      await zt(page, () => window.__zt.seek(1000));
+      const fades0 = await zt(page, () => window.__zt.fades());
+      await zt(page, (pl) => { window.__zt.send(pl); return true; }, crawlOf('Placed', 2));
+      await sleep(2500);
+      const r = await zt(page, () => ({ fades: window.__zt.fades(), fading: window.__zt.fading(), segW: window.__zt.segW(), widths: window.__zt.widths(), copies: window.__zt.copies() }));
+      check('crawl: with a theme rule for .seg + .seg, a swap under the fade takes one fade, the loop ends at the first copy\'s width, and no fade follows it',
+        r.fades === fades0 + 1 && r.fading === false && Math.abs(r.segW - r.widths[0]) <= 0.5 && r.copies.every((c) => c.includes('Placed Player')),
+        JSON.stringify({ fades0, ...r, copies: r.copies.map((c) => c.slice(0, 30)) }));
+      await closePage(p);
+    }
+
+    // A theme that gives the track a longer fade (1 s): the swap waits for it, so the copies
+    // are never replaced while the track is still partly in sight.
+    {
+      const longFade = () => {
+        const add = () => { const s = document.createElement('style'); s.textContent = '#track.track { transition: opacity 1s linear; }'; (document.head || document.documentElement).appendChild(s); };
+        if (document.documentElement) add(); else document.addEventListener('readystatechange', add, { once: true });
+      };
+      const p = await openPage('long-fade overlay page', { width: 1920, height: 72 }, overlayUrl(1920, '&speed=10'), { init: [crawlProbe, longFade] });
+      const { page } = p;
+      await page.waitForSelector('.track .seg .item', { timeout: 8000 });
+      await sleep(300);
+      await zt(page, () => window.__zt.seek(1000));
+      const n0 = (await zt(page, () => window.__zt.swapAfter())).length;
+      await zt(page, (pl) => { window.__zt.send(pl); return true; }, crawlOf('LongFade', 2));
+      await sleep(2600); // 1 s out, then 1 s back in
+      const r = await zt(page, () => ({ swapAfter: window.__zt.swapAfter(), fading: window.__zt.fading(), copies: window.__zt.copies() }));
+      const after = r.swapAfter.slice(n0);
+      check('crawl: with a theme\'s 1 s fade on .track, the swap under the fade waits until the track has faded out (1 s or more after the fade starts), and the new content is in every copy',
+        after.length === 1 && after[0] >= 1000 && after[0] < 2500 && r.fading === false && r.copies.every((c) => c.includes('LongFade Player')),
+        JSON.stringify({ after, fading: r.fading, copies: r.copies.map((c) => c.slice(0, 30)) }));
+      await closePage(p);
+    }
+
+    // During an announcement: a held result is swapped in when the announcement hides the
+    // track, and one that arrives while it is up is swapped in at once. Either swap starts its
+    // loop at offset 0: the owner's ruling of 2026-11-26 is about the fade, and the
+    // announcement path keeps what it did before it.
+    {
+      const p = await openPage('announce swap overlay page', { width: 1920, height: 72 }, overlayUrl(), { init: crawlProbe });
+      const { page } = p;
+      await page.waitForSelector('.track .seg .item', { timeout: 8000 });
+      await sleep(300);
+      const d = await zt(page, () => window.__zt.dur());
+      await zt(page, (t) => window.__zt.seek(t), d - NEAR_MS);
+      const fades0 = await zt(page, () => window.__zt.fades());
+      // Sent and read in one go: held, so in no copy, not fading, and no fade started. Also
+      // how far in the loop is (px) and which loop it is.
+      const heldNow = await zt(page, (payload) => { window.__zt.send(payload); return { copies: window.__zt.copies(), fading: window.__zt.fading(), fades: window.__zt.fades(), px: -window.__zt.offset(), id: window.__zt.id() }; }, crawlOf('AnnHeld', 1));
+      // 10 s, so the steps below run well inside it; the page is closed right after.
+      await fetch(`${HTTP}/mock/announce?text=${enc('Sprint 7 hides the track')}&kind=custom&duration=10`);
+      await page.waitForSelector('.zipper.announcing', { timeout: 5000 }).catch(() => {});
+      const during = await zt(page, () => ({ copies: window.__zt.copies(), announcing: document.querySelector('.zipper').classList.contains('announcing'), fades: window.__zt.fades(), start: window.__zt.startOf() }));
+      // The loop the bar has paused, moved 3 s in, so a swap that kept the crawl's place would show.
+      await zt(page, () => window.__zt.seek(3000));
+      const liveAt = await zt(page, () => ({ px: -window.__zt.offset(), id: window.__zt.id() }));
+      await zt(page, (payload) => { window.__zt.send(payload); return true; }, crawlOf('AnnLive', 2));
+      const live = await zt(page, () => ({ copies: window.__zt.copies(), announcing: document.querySelector('.zipper').classList.contains('announcing'), fading: window.__zt.fading(), fades: window.__zt.fades(), start: window.__zt.startOf() }));
+      check('crawl (row 7.1): a result held for the wrap (in no copy, no fade) is swapped in when an announcement hides the track, and one that arrives during the announcement is swapped in at once, with no fade',
+        !heldNow.copies.join('').includes('AnnHeld') && heldNow.fading === false && heldNow.fades === fades0
+          && during.announcing && during.copies.every((c) => c.includes('AnnHeld')) && during.fades === fades0
+          && live.announcing && live.copies.every((c) => c.includes('AnnLive')) && live.fading === false && live.fades === fades0,
+        JSON.stringify({ fades0, heldNow: { ...heldNow, copies: heldNow.copies.map((c) => c.slice(0, 30)) }, during: { ...during, copies: during.copies.map((c) => c.slice(0, 30)) }, live: { ...live, copies: live.copies.map((c) => c.slice(0, 30)) } }));
+      check('crawl (row 7.1, the announcement path): both swaps under the announcement start the new loop at offset 0, not at the crawl\'s place: the held result put in as the bar came (the loop over 100 px in), and the result that came while it was up (the paused loop moved 3 s in)',
+        heldNow.px >= 100 && !!during.start && during.start.id !== heldNow.id && Math.abs(during.start.px) <= 0.5
+          && liveAt.px >= 100 && !!live.start && live.start.id !== liveAt.id && Math.abs(live.start.px) <= 0.5,
+        JSON.stringify({ heldAt: heldNow.px, heldId: heldNow.id, during: during.start, liveAt, live: live.start }));
+      await closePage(p);
+    }
+
+    // Applied at once: the blank strip (decision 5), and the first crawl after a static
+    // line. Then the rendering details of ZIP-19: null entries, and a completed match with
+    // no scores and no winner. Each of those is sent after a blank strip, so it is the
+    // first crawl after a static line and is drawn at once.
+    {
+      const p = await openPage('static overlay page', { width: 1920, height: 72 }, overlayUrl(), { init: crawlProbe });
+      const { page } = p;
+      await page.waitForSelector('.track .seg .item', { timeout: 8000 });
+      await sleep(300);
+      const d = await zt(page, () => window.__zt.dur());
+      await zt(page, (t) => window.__zt.seek(t), d - NEAR_MS);
+      const blank = await zt(page, (payload) => { window.__zt.send(payload); return { isStatic: window.__zt.isStatic(), text: window.__zt.text() }; }, blankOf('Sprint7 Open'));
+      const first = await zt(page, (payload) => { window.__zt.send(payload); return { copies: window.__zt.copies(), fading: window.__zt.fading(), isStatic: window.__zt.isStatic() }; }, crawlOf('FirstAfter', 1));
+      check('crawl (row 7.1): the blank strip after a new URL is applied at once, even near the wrap, and so is the first crawl after it, with no fade',
+        blank.isStatic === true && blank.text === 'Sprint7 Open — waiting for results…'
+          && first.isStatic === false && first.copies.length >= 2 && first.copies.every((c) => c.includes('FirstAfter')) && first.fading === false,
+        JSON.stringify({ blank, first: { ...first, copies: first.copies.map((c) => c.slice(0, 30)) } }));
+      const at = (payload) => zt(page, (pl) => {
+        window.__zt.send(pl.blank);
+        window.__zt.send(pl.payload);
+        const seg = document.querySelector('.track .seg');
+        return { isStatic: window.__zt.isStatic(), items: seg ? Array.from(seg.querySelectorAll('.item')).map((e) => e.textContent) : [], wins: seg ? seg.querySelectorAll('.win').length : -1 };
+      }, { blank: blankOf('Sprint7 Null'), payload });
+      const m = sample.matches;
+      const nullMatch = await at({ ...sample, matches: [null, m[0], m[1]] });
+      const nullStanding = await at({ ...sample, matches: [], standings: [null, { placement: 1, name: 'Standing One' }, { placement: 2, name: 'Standing Two' }] });
+      check('overlay (ZIP-19): a payload with a null match still draws the other matches, and one with a null standing still draws the other standings',
+        !nullMatch.isStatic && nullMatch.items.length >= 2 && nullMatch.items.some((t) => t.includes('Zangief Main')) && nullMatch.items.some((t) => t.includes('Newbie'))
+          && !nullStanding.isStatic && nullStanding.items.some((t) => t.includes('Standing One')) && nullStanding.items.some((t) => t.includes('Standing Two')),
+        JSON.stringify({ nullMatch, nullStanding }));
+      const vs = await at({ ...sample, matches: [{ id: 'vs1', round: 'Pools', state: 'completed', p1: { name: 'Alpha', score: null }, p2: { name: 'Bravo', score: null }, winner: 0 }] });
+      check('overlay (ZIP-19): a completed match with no scores and no winner reads "Alpha vs Bravo", with no one marked as the winner',
+        vs.items.length >= 1 && vs.items[0] === 'PoolsAlphavsBravo' && vs.wins === 0, JSON.stringify(vs));
+      // The score's dash has a thin space (U+2009) on each side, as it had before this sprint.
+      const scores = await zt(page, (pl) => {
+        window.__zt.send(pl.blank);
+        window.__zt.send(pl.payload);
+        return Array.from(document.querySelectorAll('.track .seg:first-child .score'), (e) => e.textContent);
+      }, { blank: blankOf('Sprint7 Score'), payload: sample });
+      check('overlay: the scores read "2 – 1" (completed) and "1 – 1" (LIVE), with a thin space (U+2009) on each side of the dash',
+        scores.length >= 2 && scores[0] === '2 – 1' && scores.includes('1 – 1') && scores.every((s) => !s.includes(' ')),
+        JSON.stringify(scores.map((s) => Array.from(s, (ch) => ch.codePointAt(0).toString(16)).join(' '))));
+      await closePage(p);
+    }
+
+    // The logo (ZIP-19): one img, its src set only when the logo changes; a logo that does
+    // not load (here an address holding a key's label, which the mock answers 404) hides the
+    // left cap, and a later logo that loads shows it again; a logo that loads late, and the
+    // failed one, leave the crawl seamless.
+    {
+      const svg = (wpx) => `<svg xmlns="http://www.w3.org/2000/svg" width="${wpx}" height="40"><rect width="${wpx}" height="40" fill="#ffd166"/></svg>`;
+      const logoReqs = [];
+      const setup = async (page) => {
+        page.on('request', (r) => { const u = new URL(r.url()); if (u.pathname.startsWith('/zipper-overlay/__s7-') || u.pathname.includes('Challonge')) logoReqs.push(decodeURIComponent(u.pathname)); });
+        await page.route((u) => u.origin === HTTP && u.pathname === '/zipper-overlay/__s7-logo.svg', (r) => r.fulfill({ status: 200, contentType: 'image/svg+xml', body: svg(40) }));
+        await page.route((u) => u.origin === HTTP && u.pathname === '/zipper-overlay/__s7-late-logo.svg', async (r) => { await sleep(1500); await r.fulfill({ status: 200, contentType: 'image/svg+xml', body: svg(200) }); });
+        // A host that fails the first request (503) and answers every one after it.
+        let flakyHits = 0;
+        await page.route((u) => u.origin === HTTP && u.pathname === '/zipper-overlay/__s7-flaky-logo.svg', (r) => (++flakyHits === 1
+          ? r.fulfill({ status: 503, contentType: 'text/plain', body: 'down for a moment' })
+          : r.fulfill({ status: 200, contentType: 'image/svg+xml', body: svg(60) })));
+      };
+      // Counts every src the page gives an img, through the property or setAttribute, the
+      // img in the document or not yet.
+      const init = () => {
+        window.__srcSets = 0;
+        const prop = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, 'src');
+        Object.defineProperty(HTMLImageElement.prototype, 'src', { configurable: true, enumerable: prop.enumerable, get() { return prop.get.call(this); }, set(v) { window.__srcSets++; prop.set.call(this, v); } });
+        const setAttr = Element.prototype.setAttribute;
+        Element.prototype.setAttribute = function (name, value) {
+          if (this instanceof HTMLImageElement && String(name).toLowerCase() === 'src') window.__srcSets++;
+          return setAttr.call(this, name, value);
+        };
+      };
+      // skewClock: the logo's retry wait (LOGO_RETRY_MS) is passed by moving the page's clock on.
+      const p = await openPage('logo overlay page', { width: 1920, height: 72 }, overlayUrl(), { init: [crawlProbe, init, skewClock], setup });
+      const { page } = p;
+      await page.waitForSelector('.track .seg .item', { timeout: 8000 });
+      await sleep(300);
+      const capOf = () => page.evaluate(() => {
+        const c = document.getElementById('cap-left');
+        const img = c.querySelector('img');
+        return { on: c.classList.contains('on'), shown: getComputedStyle(c).display !== 'none', width: c.getBoundingClientRect().width, imgs: c.querySelectorAll('img').length, src: img ? img.getAttribute('src') : null, sets: window.__srcSets, kept: !!(img && img.__s7) };
+      });
+      const withLogo = (logo) => ({ ...sample, caps: { text: '@FlashGalatine', logo } });
+      await zt(page, (pl) => { window.__zt.send(pl); return true; }, withLogo('/zipper-overlay/__s7-logo.svg'));
+      await page.waitForFunction(() => { const i = document.querySelector('#cap-left img'); return !!(i && i.complete && i.naturalWidth > 0); }, null, { timeout: 4000 }).catch(() => {});
+      await page.evaluate(() => { const i = document.querySelector('#cap-left img'); if (i) i.__s7 = true; });
+      const one = await capOf();
+      await zt(page, (pl) => { window.__zt.send(pl); return true; }, withLogo(' /zipper-overlay/__s7-logo.svg '));
+      await zt(page, (pl) => { window.__zt.send(pl); return true; }, withLogo('/zipper-overlay/__s7-logo.svg'));
+      await sleep(300);
+      const two = await capOf();
+      check('overlay (ZIP-19): the logo img is kept across updates and its src is set only when the logo changes (the same logo, trimmed or not, sets nothing and asks for nothing again)',
+        one.on && one.imgs === 1 && one.sets === 1 && two.on && two.imgs === 1 && two.kept === true && two.sets === 1
+          && logoReqs.filter((x) => x === '/zipper-overlay/__s7-logo.svg').length === 1,
+        JSON.stringify({ one, two, logoReqs }));
+      // A logo that does not load hides the left cap; the same logo again keeps it hidden.
+      const labelLogo = '/zipper-overlay/assets/[Challonge key].png';
+      const id0 = await zt(page, () => window.__zt.id());
+      const fades0 = await zt(page, () => window.__zt.fades());
+      await zt(page, (pl) => { window.__zt.send(pl); return true; }, withLogo(labelLogo));
+      // Read as soon as the failure is in, before any later update could fold it into the cap.
+      await page.waitForFunction(() => { const i = document.querySelector('#cap-left img'); return !!(i && i.complete && i.naturalWidth === 0); }, null, { timeout: 4000 }).catch(() => {});
+      await sleep(100);
+      const failedNow = await capOf();
+      await zt(page, (pl) => { window.__zt.send(pl); return true; }, withLogo(labelLogo));
+      await sleep(300);
+      const failed = await capOf();
+      const failedLoop = await zt(page, () => ({ id: window.__zt.id(), fades: window.__zt.fades(), segW: window.__zt.segW(), widths: window.__zt.widths(), covered: window.__zt.coveredAtEnd() }));
+      await zt(page, (pl) => { window.__zt.send(pl); return true; }, withLogo('/zipper-overlay/__s7-logo.svg'));
+      await page.waitForFunction(() => document.getElementById('cap-left').classList.contains('on'), null, { timeout: 4000 }).catch(() => {});
+      const back = await capOf();
+      check('overlay (ZIP-19): a logo that does not load (an address holding a key\'s label, answered 404) hides the left cap as soon as it fails, with no other update; the same logo in a later update keeps it hidden and asks for nothing again; a logo that loads shows it again',
+        failedNow.on === false && failedNow.shown === false && failedNow.src === labelLogo
+          && failed.on === false && failed.shown === false && failed.src === labelLogo && failed.sets === failedNow.sets
+          && logoReqs.filter((x) => x === '/zipper-overlay/assets/[Challonge key].png').length === 1
+          && back.on === true && back.shown === true,
+        JSON.stringify({ failedNow, failed, back, logoReqs }));
+      check('overlay (ZIP-19): when the failed logo hides the left cap and the strip\'s middle grows, the crawl stays seamless: the same loop, no fade, its end still the first copy\'s width, and the copies after it still cover the middle',
+        failedLoop.id === id0 && failedLoop.fades === fades0 && Math.abs(failedLoop.segW - failedLoop.widths[0]) <= 0.5 && failedLoop.covered === true,
+        JSON.stringify({ id0, fades0, failedLoop }));
+      // A logo that loads late (1.5 s): the cap widens when it comes, and the crawl is untouched.
+      const id1 = await zt(page, () => window.__zt.id());
+      const fades1 = await zt(page, () => window.__zt.fades());
+      await zt(page, (pl) => { window.__zt.send(pl); return true; }, withLogo('/zipper-overlay/__s7-late-logo.svg'));
+      const early = await capOf();
+      await page.waitForFunction(() => { const i = document.querySelector('#cap-left img'); return !!(i && i.complete && i.naturalWidth > 0); }, null, { timeout: 5000 }).catch(() => {});
+      await sleep(300);
+      const late = await capOf();
+      const lateLoop = await zt(page, () => ({ id: window.__zt.id(), fades: window.__zt.fades(), segW: window.__zt.segW(), widths: window.__zt.widths(), covered: window.__zt.coveredAtEnd(), frames: window.__zt.frames() }));
+      const lf = loopFrames(lateLoop.frames, 80);
+      check('overlay (ZIP-19): a logo that loads late widens the left cap when it comes, and the crawl stays seamless: the same loop, no fade, its end still the first copy\'s width, the middle still covered; no loop changed its duration while it ran',
+        late.on && late.width > early.width + 100 && lateLoop.id === id1 && lateLoop.fades === fades1
+          && Math.abs(lateLoop.segW - lateLoop.widths[0]) <= 0.5 && lateLoop.covered === true && lf.changed === 0 && lf.mismatched === 0,
+        JSON.stringify({ early, late, id1, lateLoop: { ...lateLoop, frames: undefined }, lf }));
+      // A logo whose host fails once (503) and then answers: the failure hides the left cap;
+      // an update inside LOGO_RETRY_MS asks for nothing; the first update after it asks for
+      // the same address again, and once that loads the cap is back.
+      const flaky = '/zipper-overlay/__s7-flaky-logo.svg';
+      const flakyReqs = () => logoReqs.filter((x) => x === flaky).length;
+      await zt(page, (pl) => { window.__zt.send(pl); return true; }, withLogo(flaky));
+      await page.waitForFunction(() => { const i = document.querySelector('#cap-left img'); return !!(i && i.complete && i.naturalWidth === 0); }, null, { timeout: 4000 }).catch(() => {});
+      await sleep(100);
+      const flakyFailed = await capOf();
+      await zt(page, (pl) => { window.__zt.send(pl); return true; }, withLogo(flaky));
+      await sleep(300);
+      const flakyInside = { ...(await capOf()), reqs: flakyReqs() };
+      await page.evaluate((ms) => window.__zipperTestClockSkew(ms), LOGO_RETRY_MS + 1000);
+      await zt(page, (pl) => { window.__zt.send(pl); return true; }, withLogo(flaky));
+      await page.waitForFunction(() => document.getElementById('cap-left').classList.contains('on'), null, { timeout: 4000 }).catch(() => {});
+      const flakyBack = await capOf();
+      await zt(page, (pl) => { window.__zt.send(pl); return true; }, withLogo(flaky));
+      await sleep(300);
+      const reqsAfter = flakyReqs();
+      check('overlay (ZIP-19): a logo whose host fails once (503) hides the left cap; an update inside the retry wait asks for nothing; the first update after LOGO_RETRY_MS asks for the same address again, and once it loads the cap is back; a later update asks for nothing more',
+        flakyFailed.on === false && flakyFailed.shown === false && flakyInside.on === false && flakyInside.reqs === 1
+          && flakyBack.on === true && flakyBack.shown === true && flakyBack.src === flaky && reqsAfter === 2,
+        JSON.stringify({ flakyFailed, flakyInside, flakyBack, reqsAfter }));
+      // The problems this page is expected to have: the browser's own console lines for the
+      // logo that answered 404 and for the one whose host failed once (503).
+      const decoded = (x) => { try { return decodeURIComponent(x); } catch { return x; } };
+      const notFound = p.problems.filter((x) => x.startsWith('console error: ') && x.includes('404') && decoded(x).includes('[Challonge key]'));
+      const unavailable = p.problems.filter((x) => x.startsWith('console error: ') && x.includes('503') && x.includes('__s7-flaky-logo.svg'));
+      p.problems = p.problems.filter((x) => !notFound.includes(x) && !unavailable.includes(x));
+      check('overlay: the logos that did not load are the only things the browser complained about on that page (the 404 and the one 503, each logged once by the browser)',
+        notFound.length === 1 && unavailable.length === 1, JSON.stringify({ notFound, unavailable }));
+      await closePage(p);
+    }
+
+    // A long right cap at 640 px (ZIP-19): the cap stops at its maximum width and its text
+    // ends in an ellipsis, leaving room for the crawl.
+    {
+      const p = await openPage('long-cap overlay page', { width: 640, height: 72 }, overlayUrl(640), { init: crawlProbe });
+      const { page } = p;
+      await page.waitForSelector('.track .seg .item', { timeout: 8000 });
+      const text = 'Follow @FlashGalatine on every platform for brackets, results, schedules and the Discord lobby code each week!!';
+      await zt(page, (pl) => { window.__zt.send(pl); return true; }, { ...sample, caps: { text, logo: '' } });
+      await sleep(200);
+      const r = await page.evaluate(() => {
+        const cap = document.getElementById('cap-right');
+        const span = cap.querySelector('.cap-text') || cap;
+        return { cap: cap.getBoundingClientRect().width, text: cap.textContent, overflow: getComputedStyle(span).textOverflow, cut: span.scrollWidth > span.clientWidth, wrap: document.getElementById('track-wrap').clientWidth };
+      });
+      check('overlay (ZIP-19): at 640 px a long right cap (110 characters) stops at 40% of the strip and ends in an ellipsis, so the crawl keeps the rest',
+        r.text === text && r.cap <= 640 * 0.4 + 0.5 && r.overflow === 'ellipsis' && r.cut === true && r.wrap >= 640 * 0.6 - 1,
+        JSON.stringify(r));
+      await closePage(p);
+    }
+
+    // The strip's middle grows past a short crawl (here the strip is widened from 1280 to
+    // 1920 px, with no new payload): the loop must not run past its last copy.
+    {
+      const p = await openPage('widened overlay page', { width: 1920, height: 72 }, overlayUrl(1280), { init: crawlProbe });
+      const { page } = p;
+      await page.waitForSelector('.track .seg .item', { timeout: 8000 });
+      await zt(page, (pl) => { window.__zt.send(pl.blank); window.__zt.send(pl.msg); return true; }, { blank: blankOf('Sprint7 Short'), msg: { ...sample, caps: { text: '', logo: '' }, message: { lines: ['Back soon'] } } });
+      await sleep(300);
+      const id0 = await zt(page, () => window.__zt.id());
+      const fades0 = await zt(page, () => window.__zt.fades());
+      // The first copy's own ResizeObserver gives its first notice a frame or more after the
+      // build; let that pass, so only the observer on #track-wrap can see the widening.
+      await zt(page, () => window.__zt.settle(3));
+      const before = await zt(page, () => ({ wrap: window.__zt.wrapW(), widths: window.__zt.widths() }));
+      await page.evaluate(() => document.documentElement.style.setProperty('--ticker-width', '1920px'));
+      await sleep(400);
+      const d = await zt(page, () => window.__zt.dur());
+      await zt(page, (t) => window.__zt.seek(t), d - 1); // the loop's end, where the view reaches furthest
+      const r = await page.evaluate(() => {
+        const wr = document.getElementById('track-wrap').getBoundingClientRect();
+        const last = document.getElementById('track').lastElementChild.getBoundingClientRect();
+        return { wrap: wr.width, gap: Math.max(0, wr.right - last.right), copies: window.__zt.copies().length, id: window.__zt.id(), fades: window.__zt.fades(), segW: window.__zt.segW(), widths: window.__zt.widths() };
+      });
+      check('crawl (ZIP-19): when the strip\'s middle grows past a short crawl with no new payload, the loop shows no gap at its end (copies are added off screen), with no fade and no restart',
+        before.wrap < 1300 && r.wrap > 1800 && r.gap === 0 && r.id === id0 && r.fades === fades0 && Math.abs(r.segW - r.widths[0]) <= 0.5,
+        JSON.stringify({ before, r }));
+      // Now the copy after the first is in view at the wrap (the middle is wider than one
+      // copy), so it cannot take new content there. At this loop's end every copy is built
+      // again for the wider middle (row 7.2: the re-measure goes through the swap path),
+      // with nothing in view changing, and the content held for the wrap goes into the
+      // copies off screen then, so it scrolls in from the right. No fade (decision 8).
+      const noWrap = { type: null, view: [], copies: ['(no wrap event)'], fading: null, othersOff: null };
+      await zt(page, (t) => window.__zt.seek(t), d - Math.min(2000, NEAR_MS));
+      const fadesW = await zt(page, () => window.__zt.fades());
+      await zt(page, (pl) => { window.__zt.send(pl); return true; }, { ...sample, caps: { text: '', logo: '' }, message: { lines: ['Back in five'] } });
+      await zt(page, (t) => window.__zt.seek(t), d - 1);
+      const w1 = await zt(page, () => ({ view: window.__zt.view(), copies: window.__zt.copies() }));
+      const w2 = (await zt(page, (t) => window.__zt.snapAt(t), d + 1)) || noWrap;
+      const w2b = await zt(page, () => ({ id: window.__zt.id(), widths: window.__zt.widths(), wrap: window.__zt.wrapW(), segW: window.__zt.segW(), dur: window.__zt.dur(), fading: window.__zt.fading() }));
+      await zt(page, (t) => window.__zt.seek(t), w2b.dur - 1);
+      const w3a = await zt(page, () => ({ view: window.__zt.view() }));
+      const w3 = (await zt(page, (t) => window.__zt.snapAt(t), w2b.dur + 1)) || noWrap;
+      const w4 = await zt(page, () => ({ fades: window.__zt.fades(), fading: window.__zt.fading() }));
+      check('crawl (decision 8, ZIP-19): when the copy after the first is in view at the wrap, held content does not go into it there; at that loop\'s end every copy is built again for the wider middle with nothing in view changing, and the held content goes into the copies off screen; at the next wrap every copy holds it, again with nothing in view changing; no fade at any point',
+        w2.type === 'animationend' && sameView(w1.view, w2.view) && w2.fading === false && w2.othersOff === true
+          && !w2.copies[0].includes('Back in five') && w2.copies.length >= 2 && w2.copies.slice(1).every((c) => c.includes('Back in five'))
+          && w2b.id !== id0 && w2b.widths[0] >= w2b.wrap && Math.abs(w2b.segW - w2b.widths[0]) <= 0.5 && w2b.fading === false
+          && w3.type === 'animationend' && sameView(w3a.view, w3.view) && w3.copies.every((c) => c.includes('Back in five'))
+          && w4.fades === fadesW && w4.fading === false,
+        JSON.stringify({ w1: w1.view.map((v) => [v.text.slice(0, 16), Math.round(v.x)]), w2: { ...w2, view: w2.view.map((v) => [v.text.slice(0, 16), Math.round(v.x)]), copies: w2.copies.map((c) => c.slice(0, 20)) }, w2b, w3: { ...w3, view: w3.view.map((v) => [v.text.slice(0, 16), Math.round(v.x)]), copies: w3.copies.map((c) => c.slice(0, 20)) }, w4, fadesW }));
+      await closePage(p);
+    }
+
+    // The copy after the first in view at the wrap (decision 8). This page has no
+    // ResizeObserver (ticker.js runs without one), so a strip widened after the build is not
+    // measured again, and at the wrap the copy after the first is in view. Held content must
+    // not go into a copy in view: it comes in under the fade instead.
+    {
+      const noResizeObserver = () => { try { delete window.ResizeObserver; } catch { /* kept */ } window.ResizeObserver = undefined; };
+      const p = await openPage('no-observer overlay page', { width: 1920, height: 72 }, overlayUrl(1280), { init: [noResizeObserver, crawlProbe] });
+      const { page } = p;
+      await page.waitForSelector('.track .seg .item', { timeout: 8000 });
+      await zt(page, (pl) => { window.__zt.send(pl.blank); window.__zt.send(pl.msg); return true; }, { blank: blankOf('Sprint7 NoObserver'), msg: { ...sample, caps: { text: '', logo: '' }, message: { lines: ['Back soon'] } } });
+      await sleep(300);
+      const NEW = 'Back in five';
+      const d = await zt(page, () => window.__zt.dur());
+      await zt(page, (t) => window.__zt.seek(t), d - NEAR_MS);
+      const fades0 = await zt(page, () => window.__zt.fades());
+      const held = await zt(page, (pl) => { window.__zt.send(pl); return { copies: window.__zt.copies(), fading: window.__zt.fading() }; }, { ...sample, caps: { text: '', logo: '' }, message: { lines: [NEW] } });
+      await page.evaluate(() => document.documentElement.style.setProperty('--ticker-width', '1920px'));
+      await sleep(300);
+      const wide = await zt(page, () => ({ wrap: window.__zt.wrapW(), widths: window.__zt.widths(), ro: typeof window.ResizeObserver, fades: window.__zt.fades() }));
+      await zt(page, (t) => window.__zt.seek(t), d - 1);
+      const snap = (await zt(page, (t) => window.__zt.snapAt(t), d + 1)) || { type: null, view: [], copies: [], fading: null, othersOff: null };
+      await sleep(900);
+      const after = await zt(page, () => ({ fades: window.__zt.fades(), fading: window.__zt.fading(), copies: window.__zt.copies() }));
+      check('crawl (decision 8): when the copy after the first is in view at the wrap (the strip widened on a page with no ResizeObserver, so nothing measured it again), held content does not go into it: at the wrap no copy and no item in view holds it and the fade starts, and the fade then puts it in every copy',
+        wide.ro === 'undefined' && wide.widths[0] < wide.wrap && wide.fades === fades0 && held.fading === false && !held.copies.join('').includes(NEW)
+          && snap.type === 'animationiteration' && snap.othersOff === false && snap.view.length > 0
+          && snap.view.every((v) => !v.text.includes(NEW)) && snap.copies.every((c) => !c.includes(NEW)) && snap.fading === true
+          && after.fades === fades0 + 1 && after.fading === false && after.copies.length >= 2 && after.copies.every((c) => c.includes(NEW)),
+        JSON.stringify({ d, fades0, wide, held: { ...held, copies: held.copies.map((c) => c.slice(0, 20)) }, snap: { type: snap.type, othersOff: snap.othersOff, fading: snap.fading, view: snap.view.map((v) => [v.text.slice(0, 16), Math.round(v.x)]), copies: snap.copies.map((c) => c.slice(0, 20)) }, after: { ...after, copies: after.copies.map((c) => c.slice(0, 20)) } }));
+      await closePage(p);
+    }
+
+    // A web font served late (1.5 s, a delayed route), as a font set through OBS Custom CSS
+    // would be: the loop was measured with the fallback font, and is measured again when
+    // the font arrives, so it has no gap or jump at the wrap and keeps its speed. The font
+    // file is one of the system's, read from disk and served from this page's route only.
+    // The page has no end caps, so the font triggers are what must see the change.
+    {
+      const candidates = ['C:/Windows/Fonts/consola.ttf', 'C:/Windows/Fonts/cour.ttf', '/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf', '/System/Library/Fonts/Courier.dfont'];
+      let font = null;
+      for (const f of candidates) { try { font = await readFile(f); break; } catch { /* next */ } }
+      if (!font) {
+        check('crawl (ZIP-19): a system font file to serve late was found', false, candidates.join(', '));
+      } else {
+        const setup = (page) => page.route((u) => u.origin === HTTP && u.pathname === '/zipper-overlay/__s7-font.ttf', async (r) => { await sleep(1500); await r.fulfill({ status: 200, contentType: 'font/ttf', body: font }); });
+        const fontCss = () => {
+          const add = () => {
+            const s = document.createElement('style');
+            s.textContent = "@font-face { font-family: 'ZipperS7Late'; src: url('/zipper-overlay/__s7-font.ttf') format('truetype'); font-display: swap; } :root { --ticker-font: 'ZipperS7Late', 'Segoe UI', sans-serif; }";
+            (document.head || document.documentElement).appendChild(s);
+          };
+          if (document.documentElement) add(); else document.addEventListener('readystatechange', add, { once: true });
+          // Whether the font had arrived when the first crawl was built (it must not have).
+          window.addEventListener('ticker:update', () => {
+            if (window.__fontAtFirstCrawl === undefined) window.__fontAtFirstCrawl = Array.from(document.fonts).some((f) => f.family.includes('ZipperS7Late') && f.status === 'loaded');
+          });
+        };
+        await fetch(`${HTTP}/mock/push`, { method: 'POST', body: JSON.stringify({ ...sample, caps: { text: '', logo: '' } }) });
+        const p = await openPage('late-font overlay page', { width: 1920, height: 72 }, overlayUrl(), { init: [crawlProbe, fontCss], setup });
+        const { page } = p;
+        await page.waitForSelector('.track .seg .item', { timeout: 8000 });
+        // page.goto waits for the load event, which here waits for the font: the loop as
+        // first built is read from the page's first record.
+        const early = await zt(page, () => { const f = window.__zt.frames()[0]; return { segW: f ? f.w : null, d: f ? f.d : null, loaded: window.__fontAtFirstCrawl ?? null }; });
+        await page.waitForFunction(() => Array.from(document.fonts).some((f) => f.family.includes('ZipperS7Late') && f.status === 'loaded'), null, { timeout: 6000 }).catch(() => {});
+        await sleep(900); // the re-measure, and the fade it takes
+        const r = await zt(page, () => ({ segW: window.__zt.segW(), widths: window.__zt.widths(), dur: window.__zt.dur(), fading: window.__zt.fading(), fades: window.__zt.fades(), copies: window.__zt.copies(), covered: window.__zt.coveredAtEnd(), frames: window.__zt.frames() }));
+        const lf = loopFrames(r.frames, 80);
+        // The first crawl is built from the static line with no fade, so the font's
+        // re-measure is the one fade on this page.
+        check('crawl (ZIP-19): a web font served 1.5 s late re-measures the loop: its end is again the first copy\'s width (no gap or jump at the wrap) and its duration keeps the speed; it was swapped under the fade (one fade, and it is over), and no loop changed its duration while it ran',
+          early.loaded === false && Math.abs(r.segW - early.segW) > 1 && Math.abs(r.segW - r.widths[0]) <= 0.5
+            && Math.abs(r.dur - (r.segW / 80) * 1000) <= 2 && r.fading === false && r.fades === 1 && r.covered === true
+            && r.copies.every((c) => c === r.copies[0]) && lf.changed === 0 && lf.mismatched === 0,
+          JSON.stringify({ early, segW: r.segW, widths: r.widths, dur: r.dur, fading: r.fading, fades: r.fades, covered: r.covered, lf }));
+        await closePage(p);
+
+        // The first loop paused 1.5 s in (120 px at 80 px a second) as soon as it is built,
+        // before the font comes, so a swap that keeps the crawl's place starts at 120 px and
+        // one that starts again starts at 0.
+        const pauseFirstLoop = () => {
+          window.addEventListener('ticker:update', () => {
+            if (window.__s7paused) return;
+            window.__s7paused = true;
+            setTimeout(() => {
+              const t = document.getElementById('track');
+              const a = t && t.getAnimations().find((x) => x.animationName === 'ticker-scroll');
+              if (a) { a.pause(); a.currentTime = 1500; }
+              window.__s7pausedPx = a ? -new DOMMatrix(getComputedStyle(t).transform).m41 : null;
+            }, 0);
+          });
+        };
+
+        // The same late font while an announcement hides the track: the re-measure is
+        // swapped in at once, with no fade (the track is out of sight), and with nothing
+        // new its loop keeps the crawl's place (the owner's ruling of 2026-11-27). The announcement is started the
+        // moment the first crawl is built, before the font comes, right after the first loop
+        // is paused 120 px in (pauseFirstLoop's timer is set first, so it runs first).
+        const announceFirst = () => {
+          window.addEventListener('ticker:update', () => {
+            if (window.__s7announced) return;
+            window.__s7announced = true;
+            setTimeout(() => window.dispatchEvent(new CustomEvent('ticker:announce', { detail: { kind: 'custom', text: 'Sprint 7 font test', duration: 15 } })), 0);
+          });
+        };
+        const p2 = await openPage('late-font announcement overlay page', { width: 1920, height: 72 }, overlayUrl(), { init: [crawlProbe, fontCss, pauseFirstLoop, announceFirst], setup });
+        await p2.page.waitForSelector('.track .seg .item', { state: 'attached', timeout: 8000 }); // hidden by the announcement
+        const early2 = await zt(p2.page, () => { const f = window.__zt.frames()[0]; return { segW: f ? f.w : null, loaded: window.__fontAtFirstCrawl ?? null }; });
+        await p2.page.waitForFunction(() => Array.from(document.fonts).some((f) => f.family.includes('ZipperS7Late') && f.status === 'loaded'), null, { timeout: 6000 }).catch(() => {});
+        await sleep(600);
+        const r2 = await zt(p2.page, () => ({ segW: window.__zt.segW(), widths: window.__zt.widths(), fading: window.__zt.fading(), fades: window.__zt.fades(), announcing: document.querySelector('.zipper').classList.contains('announcing'), pausedPx: window.__s7pausedPx ?? null, first: window.__zt.frames()[0] || null, start: window.__zt.startOf() }));
+        check('crawl (ZIP-19, the announcement path): a web font that arrives while an announcement hides the track re-measures the loop at once (its end is again the first copy\'s width), with no fade, and with nothing new the new loop starts at the 120 px the first loop was paused at, not at offset 0',
+          early2.loaded === false && r2.announcing === true && Math.abs(r2.segW - early2.segW) > 1 && Math.abs(r2.segW - r2.widths[0]) <= 0.5
+            && r2.fades === 0 && r2.fading === false
+            && Math.abs(r2.pausedPx - 120) <= 0.5 && !!r2.first && !!r2.start && r2.start.id !== r2.first.id && Math.abs(r2.start.px - (r2.pausedPx % r2.start.w)) <= 0.5,
+          JSON.stringify({ early2, r2 }));
+        await closePage(p2);
+
+        // The same late font, with the first loop paused 120 px in: the re-measure's swap
+        // under the fade keeps the crawl's place too (the owner's ruling of 2026-11-26).
+        const p3 = await openPage('late-font place overlay page', { width: 1920, height: 72 }, overlayUrl(), { init: [crawlProbe, fontCss, pauseFirstLoop], setup });
+        await p3.page.waitForSelector('.track .seg .item', { timeout: 8000 });
+        await p3.page.waitForFunction(() => Array.from(document.fonts).some((f) => f.family.includes('ZipperS7Late') && f.status === 'loaded'), null, { timeout: 6000 }).catch(() => {});
+        await sleep(900); // the re-measure, and the fade it takes
+        const r3 = await zt(p3.page, () => ({ pausedPx: window.__s7pausedPx ?? null, loaded: window.__fontAtFirstCrawl ?? null, first: window.__zt.frames()[0] || null, start: window.__zt.startOf(), fades: window.__zt.fades(), fading: window.__zt.fading(), segW: window.__zt.segW(), widths: window.__zt.widths() }));
+        check('crawl (ZIP-19, the owner\'s ruling of 2026-11-26): a web font served late, with the first loop paused 120 px in, is re-measured under one fade that keeps the crawl\'s place: the new loop, with the new copy\'s width as its end, starts at 120 px',
+          r3.loaded === false && !!r3.first && !!r3.start && r3.start.id !== r3.first.id && Math.abs(r3.segW - r3.first.w) > 1 && Math.abs(r3.segW - r3.widths[0]) <= 0.5
+            && r3.fades === 1 && r3.fading === false && Math.abs(r3.pausedPx - 120) <= 0.5 && Math.abs(r3.start.px - (r3.pausedPx % r3.start.w)) <= 0.5,
+          JSON.stringify(r3));
+        await closePage(p3);
+
+        // The same late font, with the first loop paused 120 px in, and an announcement the
+        // moment the re-measure's fade starts (a MutationObserver sees .swap-fade go on the
+        // track; no new results anywhere): the announcement cuts the fade short and swaps
+        // the re-measured copies in at once, and with nothing new that loop starts at the
+        // crawl's place, not at offset 0 (the owner's ruling of 2026-11-27).
+        const announceOnFade = () => {
+          document.addEventListener('readystatechange', () => {
+            const t = document.getElementById('track');
+            if (!t || t.__s7cutWatched) return;
+            t.__s7cutWatched = true;
+            new MutationObserver(() => {
+              if (window.__s7cut || !t.classList.contains('swap-fade')) return;
+              window.__s7cut = true;
+              window.dispatchEvent(new CustomEvent('ticker:announce', { detail: { kind: 'custom', text: 'Sprint 7 fade cut', duration: 15 } }));
+            }).observe(t, { attributes: true, attributeFilter: ['class'] });
+          });
+        };
+        const p4 = await openPage('late-font fade-cut overlay page', { width: 1920, height: 72 }, overlayUrl(), { init: [crawlProbe, fontCss, pauseFirstLoop, announceOnFade], setup });
+        await p4.page.waitForSelector('.track .seg .item', { state: 'attached', timeout: 8000 }); // hidden by the announcement once the font is in
+        await p4.page.waitForFunction(() => Array.from(document.fonts).some((f) => f.family.includes('ZipperS7Late') && f.status === 'loaded'), null, { timeout: 6000 }).catch(() => {});
+        await sleep(900); // the re-measure, and a fade's swap if one were left to run (it is not)
+        const r4 = await zt(p4.page, () => ({ pausedPx: window.__s7pausedPx ?? null, loaded: window.__fontAtFirstCrawl ?? null, cut: window.__s7cut === true, announcing: document.querySelector('.zipper').classList.contains('announcing'), first: window.__zt.frames()[0] || null, start: window.__zt.startOf(), fades: window.__zt.fades(), fading: window.__zt.fading(), segW: window.__zt.segW(), widths: window.__zt.widths(), copies: window.__zt.copies() }));
+        check('crawl (ZIP-19, the announcement path): a late web font\'s re-measure fade that an announcement cuts short (no new results, the first loop paused 120 px in) is swapped in at once under the bar: one fade started and is over, the loop ends at the new copy\'s width, every copy holds the same items, and the new loop starts at 120 px, the crawl\'s place, not at offset 0',
+          r4.loaded === false && r4.cut === true && r4.announcing === true && r4.fades === 1 && r4.fading === false
+            && !!r4.first && !!r4.start && r4.start.id !== r4.first.id && Math.abs(r4.segW - r4.first.w) > 1 && Math.abs(r4.segW - r4.widths[0]) <= 0.5
+            && r4.copies.length >= 2 && r4.copies.every((c) => c === r4.copies[0])
+            && Math.abs(r4.pausedPx - 120) <= 0.5 && Math.abs(r4.start.px - (r4.pausedPx % r4.start.w)) <= 0.5,
+          JSON.stringify({ ...r4, copies: r4.copies.map((c) => c.slice(0, 30)) }));
+        await closePage(p4);
+        await fetch(`${HTTP}/mock/push`, { method: 'POST', body: sampleText }); // the store as it was
+      }
+    }
   }
 } catch (err) {
   fail++;

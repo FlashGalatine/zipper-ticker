@@ -69,6 +69,14 @@ Rules:
   `generatedAt` or one that is not a date, such as the empty update Ticker Push
   replays when nothing is stored; none of these changes the newest stamp or
   starts the 5 seconds again.
+- The overlay draws an update it applies without a cut in the crawl. A crawl
+  equal to the one on the strip changes nothing (the caps still apply at once).
+  A new one waits for the crawl's loop to wrap when that is 20 seconds away or
+  less, and comes in under a short fade when it is further off. The fade keeps
+  the crawl's place: the new loop starts where the old one had got to. An
+  update with nothing to crawl (no message lines, matches or standings) puts a
+  static "waiting for results" line on the strip at once, and the first crawl
+  after that line comes in at once too. See [THEMING.md](THEMING.md), Anatomy.
 
 ## Persistent message mode
 
@@ -89,8 +97,10 @@ Rules:
 - Enabled with blank text is the same as off — the payload's `message` key is
   omitted and results show. That's the fallback for any malformed line list too.
 - Results **keep polling underneath**: the same payload still carries `matches`
-  and `standings`, so switching the message off restores live results on the
-  spot with no re-poll. The exception is while the current payload is the
+  and `standings`, so switching the message off brings live results back with
+  no re-poll. The overlay brings them in as it does any new crawl: at the loop's
+  wrap, or under a short fade (see the last rule of `ticker:update` above).
+  The exception is while the current payload is the
   blank, just after a restart or a `setUrl`: see *Nothing kept yet* below.
 - It needs no tournament at all. Message edits push **immediately** rather than
   riding the next poll (which, with polling off, would never come), and with
@@ -316,10 +326,11 @@ The status carries an `auto` block describing the auto-scheduler (see
   pushes the blank payload (no results, the caps kept) with the message. A
   message edit before the first good poll, polling or not, pushes that blank
   payload with the message too. That replaces the results Streamer.bot stored:
-  the message shows at once, and from then on the blank is the current payload,
+  the message is pushed at once (the overlay brings it in as it does any new
+  crawl), and from then on the blank is the current payload,
   as it is after a `setUrl` (below). A cap change then pushes the blank with the
   new caps and fetches nothing, and a message switched off leaves the strip with
-  no results. The results come back with the next good poll or fetch: `start`,
+  no results (its "waiting for results" line, shown at once). The results come back with the next good poll or fetch: `start`,
   `pollNow`, or an option change, which still runs one fetch (see *No blank over
   the stored strip* below). With polling on, nothing is pushed on connect;
   the first good poll pushes the results with the message.
@@ -463,8 +474,12 @@ passed as they are. An unknown name is ignored and reported in the status's
 ## ticker:announce
 
 Interrupts the strip: the overlay pauses the results crawl in place, shows the
-announcement (kind pill + text) for `duration` seconds, then resumes.
-Announcements queue (up to 10) and play back-to-back. Ephemeral — never
+announcement (kind pill + text) for `duration` seconds, then resumes. New results
+that are waiting for the crawl's wrap or its fade, or that arrive while the
+announcement is up, go in while it hides the crawl; the crawl then resumes from
+the start of its loop. With nothing new, it resumes where it paused, also when
+a web font that arrives late has the crawl measured again while the announcement
+is up. Announcements queue (up to 10) and play back-to-back. Ephemeral — never
 persisted, so reconnecting overlays don't replay them.
 
 ```json

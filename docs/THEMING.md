@@ -22,6 +22,7 @@ custom properties in `overlay/ticker.css`. You never need to touch the JS.
   --ticker-edge: #2a3342;   /* top border + cap dividers */
   --ticker-font: 'Segoe UI', system-ui, sans-serif;
   --ticker-font-size: 20px;
+  --ticker-cap-max: 40%;    /* right cap's widest, as a share of the strip */
 }
 ```
 
@@ -58,10 +59,30 @@ custom properties in `overlay/ticker.css`. You never need to touch the JS.
 - In persistent message mode each configured line is an `.item.message` holding
   a single `.msg` span — style it via `--ticker-message-fg`, or reach for
   `.item.message` directly for a fuller treatment (background, size, casing).
-- The marquee duplicates its content (`.seg` twice) and animates
-  `translateX(0 → -50%)`; duration is computed as segment-width ÷
-  `--ticker-speed`, so the apparent speed stays constant regardless of how many
-  results are showing.
+- The marquee repeats the items until one copy of them (a `.seg`) is as wide as
+  the scrolling area, and puts copies side by side on `.track`: two, or more
+  when the scrolling area grows later. The `ticker-scroll` animation moves
+  `.track` left by one copy's width in px (`--seg-w`), over that width ÷
+  `--ticker-speed` seconds (`--dur`), and then starts again. So the speed stays
+  the same however many results are showing.
+- `ticker.js` sets `--seg-w` and `--dur` on `.track`, and starts a new animation
+  each time they change. Leave both to it, and keep the `ticker-scroll`
+  animation on `.track`: new results wait for its loop to wrap.
+- New results never cut into the crawl. When the wrap is 20 seconds away or
+  less, they wait for it. Then the copies off screen take them, so they scroll
+  in from the right, and at the next wrap every copy holds them. When the wrap
+  is further off, `.track` fades out (`.track.swap-fade`, opacity 0 over 0.3 s),
+  takes them and fades back in. The crawl keeps its place under the fade: the
+  new animation starts where the old one had got to (modulo the new copy's
+  width), so results that come often never keep the end of the list out of view.
+  A theme may give `.track` a longer opacity transition: the swap waits for it.
+  Results equal to those on screen change nothing. Custom CSS written for the
+  older crawl, which moved `.track` by `-50%` with exactly two `.seg`, may need
+  changing.
+- The right cap's text sits in `.cap-right .cap-text`. It ends in "…" when the
+  cap reaches `--ticker-cap-max` (default `40%` of the strip). A logo that does
+  not load hides the left cap. An update a minute or more later asks for the
+  same logo again, and the cap comes back once it loads.
 - `body.offline` is set while Streamer.bot is unreachable — the default theme
   dims the strip; style it however you like.
 

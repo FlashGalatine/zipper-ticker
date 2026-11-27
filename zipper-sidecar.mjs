@@ -1321,7 +1321,8 @@ function buildPayload(result, url, platform) {
 
 // The message-mode wire block, or null when it's off or blank — the overlay
 // falls back to results whenever the key is absent. Results keep flowing in the
-// same payload underneath, so toggling the message off restores them instantly.
+// same payload underneath, so toggling the message off needs no re-poll: the
+// overlay brings them back as it does any new crawl (at its wrap, or under a fade).
 function messageBlock() {
   if (!config.message.enabled) return null;
   const lines = config.message.text

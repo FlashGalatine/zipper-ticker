@@ -10,6 +10,64 @@ traceability.
 
 ## [Unreleased]
 
+## [1.0.28] — 2026-11-27
+
+Copy the `overlay` folder, then refresh the OBS overlay source. No sidecar
+restart and nothing to re-paste. If your OBS source has Custom CSS written for
+the old crawl, check it: the loop's keyframes now end at `--seg-w` in px, not at
+`-50%`, the track can hold more than two `.seg` copies, and `--dur` is set by
+the script for each loop. See `docs/THEMING.md`.
+
+### Fixed
+
+- **New results no longer cut into the crawl.** Before, every update rebuilt
+  the strip and the text jumped. Now an update that arrives 20 seconds or less
+  before the loop wraps waits for the wrap and scrolls in from the right. One
+  that arrives earlier comes in under a short fade (about 0.3 seconds out and
+  0.3 back), and the crawl carries on from where it was.
+- **The same results pushed again change nothing.** A dock or a second overlay
+  connecting no longer restarts the crawl.
+- **A font that loads late no longer leaves a gap or a jump** at the wrap: the
+  strip is measured again when a font arrives or the strip changes width.
+- **The logo is not asked for again on every update.** A logo that fails to
+  load hides the left cap; it is tried again after a minute.
+- **A long right cap stops at 40% of the strip** and ends in "…". Change the
+  share with `--ticker-cap-max`.
+- A finished match with no scores and no winner reads "P1 vs P2", not a bare
+  dash.
+- One empty entry among the matches or standings no longer drops the whole
+  update.
+
+### Changed
+
+- **The message switches on and off the way new results come in:** at the wrap,
+  or under the short fade. Before, it cut in at once.
+- **During an announcement,** results that changed go in under the bar and the
+  crawl comes back from its first item. With no change it comes back where it
+  paused.
+- A theme can lengthen the fade with a transition on `#track`; the swap waits
+  for it.
+
+### Development
+
+- `overlay/ticker.js` holds the figures: `FADE_THRESHOLD_MS` 20000, `FADE_MS`
+  300, `LOGO_RETRY_MS` 60000. README, `docs/PROTOCOL.md` and `docs/THEMING.md`
+  name the 20 seconds, and a check fails when they and the constant differ.
+- The render suite sets the animation's time; it does not wait for it. It
+  passes with the threshold set to 5 or to 40 seconds, the docs check apart.
+- `npm run verify` 506 checks, `npm run verify:render` 171 (was 107),
+  `npm run verify:cs` 19.
+
+### Not checked
+
+- Nothing was looked at in OBS. Every check ran in a headless browser with the
+  crawl's time set by the test. The 20 seconds is a starting figure until that
+  look.
+- In real time the place kept by the fade can be off by one frame of crawl.
+- The copy of the ticker in the NFC Broadcast kit is unchanged by this release.
+- The overlay with a refused `?sbport=` still has no check of its own.
+- The suites ran on Node 22, not Node 20.
+
 ## [1.0.26] — 2026-11-26
 
 Copy the `zipper-shared` folder, then reload the control dock and refresh the
@@ -510,7 +568,8 @@ Initial release — scrolling tournament-results ticker for Streamer.bot.
 Live-validated keyless against real start.gg and Challonge brackets across
 pre-start, mid-event and completed states.
 
-[Unreleased]: https://github.com/FlashGalatine/zipper-ticker/compare/v1.0.26...main
+[Unreleased]: https://github.com/FlashGalatine/zipper-ticker/compare/v1.0.28...main
+[1.0.28]: https://github.com/FlashGalatine/zipper-ticker/compare/v1.0.26...v1.0.28
 [1.0.26]: https://github.com/FlashGalatine/zipper-ticker/compare/v1.0.24...v1.0.26
 [1.0.24]: https://github.com/FlashGalatine/zipper-ticker/compare/v1.0.22...v1.0.24
 [1.0.22]: https://github.com/FlashGalatine/zipper-ticker/compare/v1.0.20...v1.0.22
