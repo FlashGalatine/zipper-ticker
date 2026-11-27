@@ -12,7 +12,9 @@ polled straight from the bracket site. Named after the Times Square news
 - **Any width:** 1920px broadcast strip by default, `?w=640` for old-school
   layouts — one overlay file.
 - **End caps:** optional static logo (left) and streamer-set text like a social
-  handle (right); the middle scrolls.
+  handle (right); the middle scrolls. A long text ends in "…" at 40% of the
+  strip's width. A logo that does not load hides the left cap. An update a
+  minute or more later tries the logo again.
 - **Top-N focus:** optionally show only matches involving the top-N placed
   participants (e.g. Top 4) — uses the platform's standings (start.gg always;
   Challonge via `final_rank` on your own keyed tournaments, or derived from the
@@ -20,9 +22,9 @@ polled straight from the bracket site. Named after the Times Square news
 - **Persistent message:** type a message in the control page and flip a
   checkbox to hold it on the strip instead of results ("bracket starts at 8pm",
   a Discord plug) — one line per ticker item. Results keep polling underneath
-  and return the moment you switch it off (one exception, just after a restart
-  with polling off, is under *5. Drive it* below), and it works with no tournament set
-  at all.
+  and come back when you switch it off, the way new results come in (see *5.
+  Drive it* below, which also has the one exception, just after a restart with
+  polling off). It works with no tournament set at all.
 - **Announcements:** subs, raids, milestones, or anything you type interrupt
   the crawl — the strip pauses, shows the alert with a kind pill, and resumes.
   Wire SB's own Twitch triggers to the `Ticker Announce` action for sub/raid
@@ -200,18 +202,32 @@ Paste the tournament URL (e.g. `https://challonge.com/blko42` or
 with a new URL clears the old tournament's results from the strip at once (the
 end caps and the message stay), so an old bracket never crawls under a new
 event's name; the new results appear with the first good poll. Set
-the end-cap text/logo and the persistent message there too; end-cap and option
-changes show on the strip at once, even while the bracket site is failing (just
+the end-cap text/logo and the persistent message there too; end-cap changes show
+on the strip at once, and option changes reach it as new results do (see the next
+paragraph), even while the bracket site is failing (just
 after the sidecar starts, before it has fetched the bracket once, a change waits
 for that fetch). The message is the exception: when the sidecar starts with the
-persistent message on and polling off, it puts the message on the strip at once,
-on a payload with no results, which replaces the results Streamer.bot kept (a
-message edit before the first good fetch does the same). From then on an end-cap
-change shows at once on that payload, and switching the message off leaves the
-strip with no results until the bracket is fetched again: **Start polling**,
-**Poll now**, or an option change. Chat control also works — point a `!ticker`
-command trigger at the `Ticker Command` action and type
+persistent message on and polling off, it pushes the message at once, on a
+payload with no results, which replaces the results Streamer.bot kept (a message
+edit before the first good fetch does the same). The strip brings the message in
+as it does new results (see the next paragraph). From then on an end-cap
+change shows at once on that payload. Switching the message off puts the
+"waiting for results" line on the strip at once, with no results, until the
+bracket is fetched again: **Start polling**, **Poll now**, or an option change.
+Chat control also works — point a `!ticker` command trigger at the `Ticker Command` action and type
 `!ticker setUrl https://…`, `!ticker setTopN 4`, `!ticker stop`, etc.
+
+New results never cut into the crawl. The same goes for an option change and for
+the message going on or off. When the loop is about to wrap (in 20 seconds or
+less), they wait for it and then scroll in from the right. When the wrap is
+further off, the crawl fades out for a moment and comes back with them, at the
+place it had reached (the end caps stay). So updates that come often do not send
+the crawl back to its start, and the end of a long list still scrolls into view.
+An update that holds the same results as the strip changes nothing. A strip
+with nothing to crawl shows its "waiting for results" line at once. That is the
+blank strip after a new URL, or the message switched off on the payload with no
+results (above). The first crawl after that line, results or the message, shows
+at once too.
 
 **Auto start/stop** (the checkbox next to the polling buttons, on by default)
 keeps API calls to a minimum: start polling any time — before the event begins
@@ -232,8 +248,9 @@ that is longer.
 
 Type into the control page's **Persistent message** box — one line per ticker
 item — and tick *Show this instead of results*. It holds the strip until you
-untick it; results keep polling underneath and come straight back (except just after a
-restart with polling off, as described above). No
+untick it; results keep polling underneath and come back the way new results do:
+they wait for the crawl's next wrap, or come in under a short fade (except just
+after a restart with polling off, as described above). No
 tournament needs to be set, so it doubles as a plain message ticker. From chat:
 `!ticker setMessageText Bracket starts at 8pm ET` then
 `!ticker setMessageEnabled on` / `off`.

@@ -17,6 +17,7 @@
   --ticker-edge: #2a3342;       /* top border + cap hairlines */
   --ticker-font: 'Segoe UI', system-ui, sans-serif;
   --ticker-font-size: 20px;
+  --ticker-cap-max: 40%;        /* the right cap's widest, as a share of the strip; longer text ends in … */
 }
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -42,7 +43,10 @@ body.offline .zipper { opacity: .35; }
 .cap.on { display: flex; }
 .cap-left { border-right: 2px solid var(--ticker-edge); }
 .cap-right { border-left: 2px solid var(--ticker-edge); font-weight: 700; letter-spacing: .06em;
-  font-size: calc(var(--ticker-font-size) * .8); text-transform: uppercase; white-space: nowrap; }
+  font-size: calc(var(--ticker-font-size) * .8); text-transform: uppercase; white-space: nowrap;
+  max-width: var(--ticker-cap-max); }
+/* ticker.js puts the right cap's text in this span, so it can end in an ellipsis */
+.cap-right .cap-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .cap-left img { max-height: calc(var(--ticker-height) - 24px); max-width: 220px; display: block; }
 
 /* ── Scrolling middle ── */
@@ -51,11 +55,15 @@ body.offline .zipper { opacity: .35; }
   -webkit-mask-image: linear-gradient(to right, transparent 0, #000 24px, #000 calc(100% - 24px), transparent 100%);
   mask-image: linear-gradient(to right, transparent 0, #000 24px, #000 calc(100% - 24px), transparent 100%);
 }
+/* ticker.js sets --seg-w (one copy's width, in px) and --dur (that width ÷ --ticker-speed),
+   and starts the animation again whenever they change (docs/THEMING.md, Anatomy). */
 .track { display: flex; white-space: nowrap; will-change: transform;
-  animation: ticker-scroll var(--dur, 38s) linear infinite; }
+  animation: ticker-scroll var(--dur, 38s) linear infinite;
+  transition: opacity .3s ease; }   /* the fade under a swap; ticker.js reads its length and swaps once it has run */
+.track.swap-fade { opacity: 0; }
 .track.paused { animation: none; }
 .seg { display: flex; }
-@keyframes ticker-scroll { 0% { transform: translateX(0); } 100% { transform: translateX(-50%); } }
+@keyframes ticker-scroll { 0% { transform: translateX(0); } 100% { transform: translateX(calc(-1 * var(--seg-w, 50%))); } }
 
 /* ── Items ── */
 .item { display: flex; align-items: center; gap: .45em; padding: 0 30px; }
@@ -82,7 +90,9 @@ body.offline .zipper { opacity: .35; }
 .track.static .item { color: var(--ticker-muted); }
 
 /* ── Announcement takeover (ticker:announce) ──
-   The crawl pauses in place and this bar covers it for the announce duration. */
+   The crawl pauses and this bar covers it for the announce duration. It resumes where it
+   paused, unless new results went in while it was hidden (ticker.js): then its loop
+   starts again. */
 .announce-wrap { position: absolute; inset: 0; display: none; align-items: center; justify-content: center;
   gap: .7em; background: var(--ticker-announce-bg, var(--ticker-bg)); white-space: nowrap; overflow: hidden; }
 .zipper.announcing .announce-wrap { display: flex; animation: announce-in .35s ease-out; }
