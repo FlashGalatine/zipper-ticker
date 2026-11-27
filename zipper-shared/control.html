@@ -52,6 +52,7 @@
   .status b { color: var(--acc); }
   .status .err { color: var(--bad); }
   .status .dim { color: var(--muted); }
+  .status .note { color: var(--acc); }
   .preview { background:#10141a; border:1px solid var(--edge); border-radius:6px; padding:8px 10px; margin-top:8px;
     font-size:12.5px; max-height:180px; overflow:auto; }
   .preview .m { padding:2px 0; border-bottom:1px dashed #222a35; }
@@ -384,10 +385,21 @@
     if (!Number.isFinite(n)) return fallback;
     return Math.max(min, Math.min(max, n));
   }
+  // The sidecar's normalizeInput (platforms/index.js), to know the URL it stores: an
+  // address pasted without a scheme is given https:// (decision 11 d), so the box settles
+  // on https://… and shows it. Its body is the one there, in linear time; verify.mjs
+  // checks that the two match.
+  function normalizeInput(input) {
+    const s = String(input || '').trim();
+    if (!s || /^[a-z][a-z0-9+.-]*:/i.test(s)) return s;
+    const head = /^[^\s\/]*/.exec(s)[0];
+    const next = s.charAt(head.length);
+    return (next === '' || next === '/') && head.slice(1, -1).includes('.') ? 'https://' + s : s;
+  }
 
   $('btn-seturl').onclick = () => {
     const url = $('url').value.trim();
-    if (send('setUrl', url)) noteSent('url', url);
+    if (send('setUrl', url)) noteSent('url', normalizeInput(url));
   };
   $('btn-start').onclick = () => send('start');
   $('btn-stop').onclick = () => send('stop');
@@ -517,7 +529,8 @@
   // ticker:status rides the command relay as command "__status" (docs/PROTOCOL.md).
   // Its lastError is a failed poll; its commandNotice an unknown or refused command;
   // its actionNotice an action the sidecar sends to that answered "not found" or with another error;
-  // its configWarning a config.json that did not load, a refused key, a dropped logo, a failed save, or saves stopped after a hand edit.
+  // its configWarning a config.json that did not load, a refused key, a dropped logo, a failed save, or saves stopped after a hand edit;
+  // its pollNotice a fact about the last good poll (start.gg's page limit), shown as a notice, not an error.
   window.addEventListener('ticker:command', (e) => {
     const d = e.detail || {};
     // Ticker Command ran: it is there and it works, and an earlier ticker:error is over.
@@ -561,6 +574,7 @@
       (s.commandNotice ? `<br><span class="err">${esc(s.commandNotice)}</span>` : '') +
       (s.actionNotice ? `<br><span class="err">${esc(s.actionNotice)}</span>` : '') +
       (s.configWarning ? `<br><span class="err">${esc(s.configWarning)}</span>` : '') +
+      (s.pollNotice ? `<br><span class="note">${esc(s.pollNotice)}</span>` : '') +
       (s.se?.lastError ? `<br><span class="err">SE: ${esc(s.se.lastError)}</span>` : '');
   });
 

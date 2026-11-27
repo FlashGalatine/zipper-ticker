@@ -1,0 +1,10 @@
+{
+  "tournament": {
+    "id": 9001,
+    "name": "Zipper Major",
+    "events": [
+      { "id": 9101, "name": "Street Fighter 6", "slug": "tournament/zipper-major/event/sf6", "videogame": { "id": 43868 } },
+      { "id": 9102, "name": "TEKKEN 8", "slug": "tournament/zipper-major/event/tekken-8", "videogame": { "id": 49783 } }
+    ]
+  }
+}

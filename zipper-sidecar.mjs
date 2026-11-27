@@ -27,8 +27,11 @@
 //           Names match without regard to case. An unknown or refused command is
 //           reported in the status's commandNotice (docs/PROTOCOL.md).
 //           A new URL pushes a blank payload at once, caps and message kept
-//           (decision 5). Cap and option changes push at once, polling or not, from
+//           (decision 5). A URL pasted without https:// is given it (decision 11 d).
+//           Cap and option changes push at once, polling or not, from
 //           the last result the sidecar keeps (ZIP-14).
+//           A good poll's non-fatal notice (start.gg's page limit) is the status's
+//           pollNotice until the next good poll or a setUrl that changes the URL.
 //
 // Auto-scheduling (config.autoSchedule, default ON): API calls are only spent
 // while the event is actually running. A poll that comes back `completed`
@@ -100,7 +103,7 @@ import { createServer } from 'node:net';
 import { resolve, relative, isAbsolute, dirname, basename, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import WebSocket from 'ws';
-import { detectPlatform } from './platforms/index.js';
+import { detectPlatform, normalizeInput } from './platforms/index.js';
 import { guardedFetch, statusError, parseRetryAfter, envLimit, seconds, requestTimeoutMs } from './platforms/guarded-fetch.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -171,6 +174,9 @@ const REDACT_MIN_CHARS = 8;
 // longest real name, setMessageEnabled, has 17). The name can come from chat or any
 // local program, so nothing else limits its length.
 const COMMAND_NAME_MAX = 40;
+// A result's pollNotice is kept to this many characters, cut after redaction (row 8.3).
+// An adapter's notice is fixed words well under it; a stub: file can carry anything.
+const POLL_NOTICE_MAX = 200;
 const LOGO_MAX = 500;
 // What a relative logo is resolved against to check it: the overlay's address on
 // Streamer.bot's HTTP server. Only its host matters (a relative logo must stay on it).
@@ -258,6 +264,10 @@ let lastError = ''; // poll failures only
 // An unknown or refused command (docs/PROTOCOL.md). The next accepted command clears
 // it; `status`, which the control page sends every 10 seconds, does not.
 let commandNotice = '';
+// A non-fatal fact about the last good poll, from its adapter's result (row 8.3: start.gg's
+// page limit). Set or cleared by every good poll, left alone by a failed one, cleared by a
+// setUrl that changes the URL. Not an error: it counts for nothing in the backoff.
+let pollNotice = '';
 let lastPollAt = null;
 let lastHash = null;
 let lastPayload = null; // last payload built, so config-only changes (message,
@@ -955,7 +965,8 @@ function armPoll(at, why) {
 // skipping the interval and the error backoff; a poll already armed for sooner stands. A
 // deliberate request that arrives while a poll is in flight is kept for after it. A
 // command's is not: the poll in flight builds its payload with the new settings (and if
-// its result comes back cut short under the old ones, pollOnce asks again). The caller
+// its result, fetched under the old ones, holds less than the new ones ask for, pollOnce
+// asks again: wantsMore). The caller
 // sends the status.
 function requestPoll(deliberate) {
   if (!polling) return;
@@ -1047,9 +1058,9 @@ async function pollOnce({ oneOff = false } = {}) {
   pollAbort = ac;
   const deadline = setTimeout(() => ac.abort(new Error(`the poll took longer than ${seconds(pollDeadlineMs)} and was stopped`)), pollDeadlineMs);
   let stale = false;
-  let needMore = false; // the result kept was cut short, and a command since asks for more
+  let needMore = false; // a command since asks for more than the result kept holds (wantsMore)
   try {
-    const result = await fetchCurrent(url, ac.signal);
+    const result = await fetchCurrent(url, ac.signal, fetchedWith);
     stale = gen !== urlGeneration;
     if (stale) {
       log('a poll of the previous tournament URL came back after setUrl; its result is thrown away');
@@ -1066,6 +1077,10 @@ async function pollOnce({ oneOff = false } = {}) {
       // option change then rebuilds from the last one that could (row 4.3).
       lastRaw = { result, gen, url, platform, ...fetchedWith };
       needMore = wantsMore(lastRaw);
+      // Set or cleared by this good poll ("Status messages"), and only once it has built.
+      const notice = pollNoticeOf(result);
+      if (notice && notice !== pollNotice) log(`poll notice: ${notice}`);
+      pollNotice = notice;
       lastPayload = payload;
       const hash = hashPayload(payload);
       if (hash !== lastHash) {
@@ -1112,23 +1127,40 @@ async function pollOnce({ oneOff = false } = {}) {
     // One more fetch only when the reason for it still holds (row 4.3). A fetch a command
     // asked for while this one ran (polling off): this one, if it came back, was built
     // with that command's settings, so it is needed only while nothing is kept (this one
-    // failed). A result cut short is fetched again when a command during the fetch asked
-    // for more than it was fetched with; while polling, a command's request made during a
-    // poll is not kept, so this is where that re-fetch is asked for.
+    // failed). A result is fetched again when a command during the fetch asked for more
+    // than it holds (wantsMore: more than it was cut short at, or more standings than were
+    // asked for); while polling, a command's request made during a poll is not kept, so
+    // this is where that re-fetch is asked for.
     if (!stale && (needMore || (again && !lastRaw && !polling))) refetch();
     pushStatus();
   }
 }
 
-// Whether the settings now ask for more than a kept result holds: its adapter cut it short
-// (`cutShort`; only start.gg will, from Sprint 8), and maxItems is higher than it was
-// fetched with, or topN has been switched on since.
+// Whether the settings now ask for more than a kept result holds (row 4.3). Either its
+// adapter cut it short (`cutShort`; only start.gg does, when its paging stops early), and
+// maxItems is higher than it was fetched with, or topN has been switched on since. Or topN
+// is higher than the standings its adapter asked for (`standingsAsked`, a number; only
+// start.gg records it, the standings its first page asked for), cut short or not, at the
+// page limit or not (the owner's ruling of 2026-11-27); a lower topN, one within what was
+// asked for, or a result without the field fetches nothing for this. That topN must also
+// be higher than the one the result was fetched with: start.gg always asks for at least
+// that many, so this changes nothing for it, but a result that asked for fewer than its
+// own topN (a stub file) is then not fetched again and again.
 function wantsMore(raw) {
-  return raw.result.cutShort === true && (config.maxItems > raw.maxItems || (config.topN > 0 && raw.topN === 0));
+  const r = raw.result;
+  if (r.cutShort === true && (config.maxItems > raw.maxItems || (config.topN > 0 && raw.topN === 0))) return true;
+  return Number.isFinite(r.standingsAsked) && config.topN > r.standingsAsked && config.topN > raw.topN;
+}
+
+// A result's pollNotice as the status carries it: a string, every key redacted before it
+// is cut to POLL_NOTICE_MAX (row 5.3's order), or '' when there is none.
+function pollNoticeOf(result) {
+  const text = typeof result?.pollNotice === 'string' ? result.pollNotice.trim() : '';
+  return text ? redact(text).slice(0, POLL_NOTICE_MAX) : '';
 }
 
 // One fetch a command asks for (row 4.3): a cap or option change with no result held and a
-// URL set, or one that needs more than the result held (it was cut short). While polling it
+// URL set, or one that needs more than the result held (wantsMore). While polling it
 // is a poll asked for, under polling's rules. Otherwise it is one fetch outside the poll
 // loop: it waits for the minimum gap and any Retry-After hold, it does not go through the
 // poll timer or the next-delay function, so it does not start polling, and its result is
@@ -1152,8 +1184,10 @@ function cancelOneOff() {
   oneOffAgain = false;
 }
 
-// Fetches the normalized result for `url`, with the poll's AbortSignal.
-async function fetchCurrent(url, signal) {
+// Fetches the normalized result for `url`, with the poll's AbortSignal. `fetchedWith` is the
+// maxItems and topN the poll is made with (and keeps beside its result): the adapter is
+// given those, so a start.gg early stop matches what wantsMore compares against.
+async function fetchCurrent(url, signal, fetchedWith) {
   if (!url) throw new Error(NO_URL_MESSAGE); // ZIP-12: a plain message, never a TypeError
   // Test hook / offline styling: stub:<path> loads a normalized result file. The gate
   // runs first, so a URL from config.json that fails it reads nothing.
@@ -1175,7 +1209,7 @@ async function fetchCurrent(url, signal) {
   if (!platform) throw new Error(`Unrecognized tournament URL: ${url}`);
   const id = platform.parseId(url);
   if (!id) throw new Error(`${platform.displayName}: could not parse a tournament id from that URL`);
-  return platform.fetchTicker(id, adapterConfig(), url, signal);
+  return platform.fetchTicker(id, { ...adapterConfig(), ...fetchedWith }, url, signal);
 }
 
 // The other half of the slow source: a stub fixture may make its poll fail as a site
@@ -1405,9 +1439,11 @@ function showCaps() {
 
 // Row 4.3 (ZIP-14): an option change (maxItems, topN) rebuilds the payload from the last
 // result, with the URL and platform it was fetched under, and pushes it at once, polling
-// or not. A result its adapter cut short (`cutShort`, only start.gg will mark one, from
-// Sprint 8) is fetched again when the change asks for more than it held: a higher maxItems
-// than it was fetched with, or topN switched on. With nothing held (after a restart, or
+// or not. The result is fetched again when the change asks for more than it held
+// (wantsMore): when its adapter cut it short (`cutShort`; only start.gg marks one, when its
+// paging stops early), a higher maxItems than it was fetched with, or topN switched on; and,
+// cut short or not, a topN higher than the standings its adapter asked for
+// (`standingsAsked`; only start.gg records it). With nothing held (after a restart, or
 // since setUrl) and a URL set, it fetches once; with no URL it only saves the setting.
 // Apart from setUrl's own blank (decision 5), no blank payload is pushed here. (setUrl
 // drops the result kept, so what is kept is always the URL now set's.)
@@ -1926,6 +1962,8 @@ function statusSnapshot(seq) {
     // after a hand edit, or a failed write (rows 5.1 to 5.4); "" otherwise. A good poll
     // and setUrl never clear it.
     configWarning: configWarning(),
+    // A non-fatal fact about the last good poll (row 8.3), every key redacted; "" otherwise.
+    pollNotice,
     intervalMs: config.pollIntervalMs,
     maxItems: config.maxItems,
     topN: config.topN,
@@ -2000,7 +2038,11 @@ function dispatch(command, value) {
   if (name !== 'status') commandNotice = ''; // an accepted command clears the last notice
   switch (name) {
     case 'setUrl': {
-      const url = strOrNull(value);
+      // An address pasted without https:// is given it before anything else looks at it
+      // (decision 11 d), so it is detected, compared with the URL set, saved and shown as
+      // https://… . A start.gg admin page's address is kept as typed: the adapter reads
+      // past its "/admin" (decision 11 c).
+      const url = strOrNull(normalizeInput(value));
       // A refused URL is no URL change: the old one, its platform and its state stay,
       // nothing is saved, and no poll follows.
       const refusal = url && url.startsWith('stub:') ? stubRefusal(url) : null;
@@ -2025,6 +2067,7 @@ function dispatch(command, value) {
       platformName = platformFor(config.tournamentUrl);
       // A Retry-After hold is left as it is: it belongs to its platform (see holdUntil).
       lastError = '';
+      pollNotice = ''; // it was about the old URL's last good poll
       consecutiveErrors = 0; // the new URL does not inherit the old one's backoff
       eventState = null; // new tournament — forget the old one's state/schedule
       eventStartAt = null;

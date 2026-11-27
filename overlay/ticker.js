@@ -35,8 +35,9 @@
 // view, and a logo or a cap that changes size changes the width of the strip's middle. A
 // ResizeObserver on #track-wrap and on the first copy, the FontFaceSet's loadingdone event
 // and a document.fonts.ready re-armed after each build all call remeasure(). Copies that
-// changed width are swapped in under the fade, which keeps the crawl's place (at once, from
-// offset 0, while hidden). A middle that grew past the copies gets one more copy off screen
+// changed width are swapped in under the fade, which keeps the crawl's place (while the
+// announcement bar hides the track, at once, and at the crawl's place too: the owner's
+// ruling of 2026-11-27). A middle that grew past the copies gets one more copy off screen
 // at once, and the loop is built again at its end. Widths are the strip's own px (layoutW),
 // so a scaled strip loops true.
 

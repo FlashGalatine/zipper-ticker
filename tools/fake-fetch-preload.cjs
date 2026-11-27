@@ -1,4 +1,4 @@
-// Development only (verify.mjs, section 6j); nothing deploys it. Preloaded into a test
+// Development only (verify.mjs, sections 6j and 6k); nothing deploys it. Preloaded into a test
 // sidecar with `node --require`, it replaces fetch for that whole process, so nothing the
 // sidecar asks for leaves the machine: no request is made, no name is looked up. That is
 // how the suite drives the real request paths (a Challonge API URL with its key in the
@@ -20,9 +20,14 @@
 //            key appears as the address encodes it (%2B for +, and so on)
 //   json:<path>  an ok answer whose body is that file (a recorded fixture), so a poll
 //            succeeds and its result is pushed
+//
+// With ZIPPER_TEST_FAKE_FETCH_LOG set, every call is first appended to the file it names,
+// one JSON line: the host asked, and the GraphQL operationName and variables when the
+// body is JSON (section 6k reads the paging variables the sidecar's poll sends). Nothing
+// else of the request is written: no path or query, no header, so no key.
 'use strict';
 
-const { readFileSync } = require('node:fs');
+const { readFileSync, appendFileSync } = require('node:fs');
 
 const modeFile = process.env.ZIPPER_TEST_FAKE_FETCH_FILE;
 function mode() {
@@ -30,8 +35,25 @@ function mode() {
   try { return readFileSync(modeFile, 'utf-8').trim() || 'fail'; } catch { return 'fail'; }
 }
 
+const logFile = process.env.ZIPPER_TEST_FAKE_FETCH_LOG;
+function record(url, init) {
+  if (!logFile) return;
+  let host = '';
+  try { host = new URL(url).host; } catch { /* not an address */ }
+  let operationName = null;
+  let variables = null;
+  try {
+    const body = JSON.parse(String(init.body));
+    const q = Array.isArray(body) ? body[0] : body;
+    operationName = q?.operationName ?? null;
+    variables = q?.variables ?? null;
+  } catch { /* no JSON body */ }
+  try { appendFileSync(logFile, JSON.stringify({ host, operationName, variables }) + '\n'); } catch { /* the test reads what it can */ }
+}
+
 globalThis.fetch = async function fakeFetch(input, init = {}) {
   const url = typeof input === 'string' ? input : input instanceof URL ? input.href : String(input?.url ?? input);
+  record(url, init);
   const how = mode();
   if (how === 'hang') {
     return new Promise((_, reject) => {
