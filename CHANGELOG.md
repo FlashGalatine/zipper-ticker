@@ -10,6 +10,66 @@ traceability.
 
 ## [Unreleased]
 
+## [1.0.30] — 2026-11-27
+
+Copy the folder, restart the sidecar, then reload the control dock (the dock has
+a new status line and must match the sidecar). Nothing to re-paste, and the OBS
+overlay source needs no refresh.
+
+### Fixed
+
+- **A large start.gg event no longer takes ten requests every poll.** The sets
+  are read newest first, 50 at a time, and the reading stops once it holds
+  enough finished sets for the strip (**Max ticker items**). With **Top N** on,
+  every page is still read.
+- **An event with more than 500 sets says so.** When a poll reads all 500 and
+  more remain, the control page's status line carries a notice, and the strip
+  shows the newest. Before, the older sets were dropped with no word.
+- **Top N above 8 on start.gg now has the standings it needs.** The first page
+  asks for as many standings as **Top N** (at least 8, at most 100). Raising
+  **Top N** above what the last poll asked for fetches the event again at once.
+- **A set that finishes between two requests is no longer listed twice.**
+- **A start.gg admin page's address works.** The address is kept as you typed
+  it; the lookup reads past `/admin`.
+- **An address pasted without `https://` gets it**, and the URL box then shows
+  it that way.
+
+### Changed
+
+- **A start.gg tournament URL with several events always stops** with "paste a
+  specific event URL" and names the events. Before, a single Street Fighter 6
+  event among them was picked without asking. A tournament with one event still
+  works.
+- The status has a new field, `pollNotice`: a fact about the last good poll that
+  is not an error. It stays until the next good poll, or until a different URL
+  is set. See `docs/PROTOCOL.md`.
+
+### Development
+
+- A result may carry `cutShort`, `standingsAsked` and `pollNotice`; a `stub:`
+  file may carry them too. `docs/PROTOCOL.md` says how the sidecar reads each.
+- The start.gg query texts are unchanged and pinned by SHA-256 in the suite.
+  Only their variables vary.
+- The address rule runs in linear time. The rule it was copied from took
+  seconds on a very long run of dots.
+- `npm run verify` 568 checks (was 506), `npm run verify:render` 173 (was 171),
+  `npm run verify:cs` 19.
+
+### Not checked
+
+- The paging was checked once against one large public start.gg event with no
+  key: one request with Max items 20, two with 60, ten with Top N 16, every one
+  answered. That run was made before the fetch-again rule for Top N was added;
+  the rule does not change what is asked for. With an API key and Top N at 100
+  it is not checked.
+- The Challonge half of this work (addresses with a language or a sub-page in
+  them, and the embed page's address for those) is not in this release.
+- Challonge's JSON routes and the new bracket API are not in this release: they
+  wait on recordings of the live site.
+- An address without `https://` typed by hand into `config.json` is not given
+  it on load; only a `setUrl` does that.
+- Nothing was looked at in OBS. The suites ran on Node 22, not Node 20.
+
 ## [1.0.28] — 2026-11-27
 
 Copy the `overlay` folder, then refresh the OBS overlay source. No sidecar
@@ -568,7 +628,8 @@ Initial release — scrolling tournament-results ticker for Streamer.bot.
 Live-validated keyless against real start.gg and Challonge brackets across
 pre-start, mid-event and completed states.
 
-[Unreleased]: https://github.com/FlashGalatine/zipper-ticker/compare/v1.0.28...main
+[Unreleased]: https://github.com/FlashGalatine/zipper-ticker/compare/v1.0.30...main
+[1.0.30]: https://github.com/FlashGalatine/zipper-ticker/compare/v1.0.28...v1.0.30
 [1.0.28]: https://github.com/FlashGalatine/zipper-ticker/compare/v1.0.26...v1.0.28
 [1.0.26]: https://github.com/FlashGalatine/zipper-ticker/compare/v1.0.24...v1.0.26
 [1.0.24]: https://github.com/FlashGalatine/zipper-ticker/compare/v1.0.22...v1.0.24
