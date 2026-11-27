@@ -630,6 +630,36 @@ try {
     const errs = await page.locator('#status .err').allTextContents();
     check('control: the status line shows the sidecar\'s configWarning as an error line of its own', errs.includes(warning), text);
   }
+  // …and its pollNotice (row 8.3: a fact about the last good poll, such as start.gg's page
+  // limit), as text, on a line of its own after the configWarning line and before the
+  // StreamElements one ("Status messages" order). It is a notice, not an error.
+  {
+    const notice = 'start.gg: this event has more than 500 sets; only the 500 most recent were read <i>x</i>';
+    const warning = 'config.json was edited while the sidecar was running';
+    const seError = 'SE token rejected';
+    await sendStatus(statusOf({ lastError: 'poll mark 8.3', configWarning: warning, pollNotice: notice, se: { configured: true, lastPollAt: null, lastError: seError } }));
+    await page.waitForFunction((t) => document.getElementById('status').textContent.includes(t), notice, { timeout: 5000 }).catch(() => {});
+    const seen = await page.evaluate(() => {
+      const el = document.getElementById('status');
+      return {
+        // Each line's text, read in an inert document (nothing in it loads or runs).
+        lines: el.innerHTML.split(/<br\s*\/?>/i).map((h) => new DOMParser().parseFromString(h, 'text/html').body.textContent),
+        noteSpans: [...el.querySelectorAll('.note')].map((s) => s.textContent),
+        errSpans: [...el.querySelectorAll('.err')].map((s) => s.textContent),
+        tags: el.querySelectorAll('i').length,
+        // Drawn in the accent (--acc, #ffd166), not the error red (--bad).
+        noteColor: el.querySelector('.note') ? getComputedStyle(el.querySelector('.note')).color : null,
+        errColor: el.querySelector('.err') ? getComputedStyle(el.querySelector('.err')).color : null,
+      };
+    });
+    const iWarn = seen.lines.indexOf(warning);
+    const iNotice = seen.lines.indexOf(notice);
+    const iSe = seen.lines.indexOf(`SE: ${seError}`);
+    check('control (row 8.3): the status line shows the sidecar\'s pollNotice as text, on a line of its own after the configWarning line and before the StreamElements line, marked as a notice (not an error) and drawn in the accent colour, not the error red',
+      iWarn > 0 && iNotice === iWarn + 1 && iSe === iNotice + 1 && seen.noteSpans.includes(notice) && !seen.errSpans.includes(notice) && seen.tags === 0
+        && seen.noteColor === 'rgb(255, 209, 102)' && seen.errColor === 'rgb(255, 77, 94)',
+      JSON.stringify({ ...seen, iWarn, iNotice, iSe }));
+  }
   await closePage(p);
 
   const mockSwitch = async (path) => (await fetch(`${HTTP}${path}`)).json();
@@ -822,6 +852,24 @@ try {
         seenUrl.every(Boolean) && urlSent === 'https://challonge.com/zipaaa' && settledUrl.value === 'https://challonge.com/zipaaa' && settledUrl.dirty === false
           && urlSent2 === 'https://challonge.com/zipbbb' && editedAgain.value === 'https://challonge.com/zipbbbc' && editedAgain.dirty === true,
         JSON.stringify({ seenUrl, urlSent, urlSent2, settledUrl, editedAgain }));
+
+      // Row 8.4 (decision 11 d): the sidecar gives an address pasted without https:// its
+      // https:// (setUrl), so a status carries https://challonge.com/zipccc for a box that
+      // held challonge.com/zipccc. The page applies the same rule: the box settles on that
+      // status, and shows the address as the sidecar stores it. A status that still carries
+      // the old URL leaves it as typed, and marked.
+      await page.locator('#url').fill(' challonge.com/zipccc ');
+      from = bus.seen.length;
+      await page.click('#btn-seturl');
+      const bareSent = await sentValue('setUrl', from);
+      const seenBare = [await status({ url: 'https://challonge.com/zipbbb', caps: { text: 'Typed cap', logo: '' }, message: { enabled: true, text: 'Live message' }, auto: autoOff })];
+      const staleBare = await box('url');
+      seenBare.push(await status({ url: 'https://challonge.com/zipccc', caps: { text: 'Typed cap', logo: '' }, message: { enabled: true, text: 'Live message' }, auto: autoOff }));
+      const settledBare = await box('url');
+      check('control (row 8.4): a URL typed without https:// is sent as typed (trimmed), stays as typed through a status with the old URL, and settles on the status that carries it with https://, as the sidecar stores it',
+        seenBare.every(Boolean) && bareSent === 'challonge.com/zipccc' && staleBare.value === ' challonge.com/zipccc ' && staleBare.dirty === true
+          && settledBare.value === 'https://challonge.com/zipccc' && settledBare.dirty === false,
+        JSON.stringify({ seenBare, bareSent, staleBare, settledBare }));
 
       // The sidecar's other clamps and cuts (row 6.1): top N 150 settles at 100, and a caps
       // text, a logo and a message longer than the sidecar keeps settle at their first 120,

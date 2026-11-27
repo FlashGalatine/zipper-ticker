@@ -15,6 +15,20 @@
 // Both URL shapes are accepted:
 //   /tournament/<t>/event/<e>       (event landing)
 //   /tournament/<t>/events/<e>/...  (any sub-page incl. brackets/standings)
+// and either one behind the "/admin" prefix of the tournament's admin pages.
+// A tournament URL (no event in it) is polled only when the tournament has one event;
+// with several it stops with "paste a specific event URL" (decision 12).
+//
+// Paging (ZIP-20): sets come newest first, 50 a page, de-duplicated by id (a set that
+// completes between two requests moves the list down by one). With topN off, paging
+// stops once the sets read hold maxItems completed ones, which is all the strip can show
+// (completed sets come first, cut to maxItems), and the result is marked `cutShort`, so
+// the sidecar fetches again when a command asks for more. With topN on, every page is
+// read. The standings ride the first page only: max(topN, 8) of them, at most 100, and
+// the result records that number as `standingsAsked`, so the sidecar fetches again when
+// topN is raised above it, cut short or not (the owner's ruling of 2026-11-27). At most
+// 10 pages are read; an event cut there says so in the result's `pollNotice`.
+// Only the queries' variables vary: their text is the one that passed the public proxy.
 
 import { guardedFetch, statusError, USER_AGENT } from './guarded-fetch.js';
 
@@ -23,8 +37,22 @@ const API_ENDPOINT = 'https://api.start.gg/gql/alpha';
 const DEFAULT_CLIENT_VERSION = '20';
 const PAGE_SIZE = 50;
 const MAX_PAGES = 10; // safety cap (500 sets — plenty for a ticker)
-const SF6_VIDEOGAME_ID = 43868; // disambiguates multi-event tournaments toward SF6
+// The standings asked for on the first page: at least the 8 the query asks for by
+// default, more when topN needs them, and at most STANDINGS_MAX (a choice left open in
+// row 8.3; max(topN, maxItems) would give a fuller standings crawl). Later pages ask for 1.
+const STANDINGS_MIN = 8;
+const STANDINGS_MAX = 100;
+// The result's pollNotice when an event has more pages than MAX_PAGES. Fixed words only:
+// nothing from the site or the request is in it.
+const PAGE_LIMIT_NOTICE = `start.gg: this event has more than ${MAX_PAGES * PAGE_SIZE} sets; only the ${MAX_PAGES * PAGE_SIZE} most recent were read`;
 
+// The path of a start.gg URL without the "/admin" prefix organisers copy from the
+// tournament's admin pages (decision 11 c), as Tally's sgPath does.
+function sgPath(url) { return url.pathname.replace(/^\/admin(?=\/)/, ''); }
+
+// `videogame { id }` is no longer read (decision 12 removed the Street Fighter 6 pick);
+// the text is kept as it is, because start.gg's public proxy may refuse a query that is
+// not on its allow-list, and this one passed it.
 const TOURNAMENT_EVENTS_QUERY = `
 query ZipperTournamentEvents($slug: String!) {
   tournament(slug: $slug) {
@@ -83,9 +111,9 @@ export const startgg = {
     try {
       const url = new URL(raw);
       if (!/(^|\.)start\.gg$/i.test(url.hostname)) return null;
-      const ev = url.pathname.match(/^\/tournament\/([^\/]+)\/(?:event|events)\/([^\/]+)/);
+      const ev = sgPath(url).match(/^\/tournament\/([^\/]+)\/(?:event|events)\/([^\/]+)/);
       if (ev) return `${ev[1]}/${ev[2]}`;
-      const t = url.pathname.match(/^\/tournament\/([^\/]+)/);
+      const t = sgPath(url).match(/^\/tournament\/([^\/]+)/);
       if (t) return t[1];
       return null;
     } catch {
@@ -95,6 +123,8 @@ export const startgg = {
 
   // `signal` is the poll's deadline: it reaches every request below, so a poll that
   // pages through sets stops as a whole rather than paging on in the background.
+  // `config.maxItems` and `config.topN` are what the sidecar polls with: they decide
+  // when paging may stop, and how many standings the first page asks for.
   async fetchTicker(displayId, config, originalUrl, signal) {
     const apiKey = config?.startggApiKey ?? null;
     let eventSlug = deriveEventSlug(originalUrl, displayId);
@@ -105,8 +135,13 @@ export const startgg = {
       }
       eventSlug = await resolveEventSlug(tournamentSlug, apiKey, signal);
     }
-    const event = await fetchAllSets(eventSlug, apiKey, signal);
-    return normalizeStartggEvent(event);
+    const { event, cutShort, pollNotice, standingsAsked } = await fetchAllSets(eventSlug, apiKey, signal, { maxItems: config?.maxItems, topN: config?.topN });
+    const result = normalizeStartggEvent(event);
+    if (cutShort) result.cutShort = true; // the sidecar fetches again when a command asks for more
+    if (pollNotice) result.pollNotice = pollNotice;
+    // The standings the first page asked for: a topN above it fetches again (row 4.3).
+    result.standingsAsked = standingsAsked;
+    return result;
   },
 };
 
@@ -181,7 +216,7 @@ function deriveEventSlug(originalUrl, displayId) {
     try {
       const url = new URL(originalUrl);
       if (/(^|\.)start\.gg$/i.test(url.hostname)) {
-        const m = url.pathname.match(/^\/tournament\/([^\/]+)\/(?:event|events)\/([^\/]+)/);
+        const m = sgPath(url).match(/^\/tournament\/([^\/]+)\/(?:event|events)\/([^\/]+)/);
         if (m) return `tournament/${m[1]}/event/${m[2]}`;
       }
     } catch { /* fall through */ }
@@ -200,7 +235,7 @@ function deriveTournamentSlug(originalUrl, displayId) {
     try {
       const url = new URL(originalUrl);
       if (/(^|\.)start\.gg$/i.test(url.hostname)) {
-        const m = url.pathname.match(/^\/tournament\/([^\/]+)/);
+        const m = sgPath(url).match(/^\/tournament\/([^\/]+)/);
         if (m) return `tournament/${m[1]}`;
       }
     } catch { /* fall through */ }
@@ -212,9 +247,22 @@ function deriveTournamentSlug(originalUrl, displayId) {
   return null;
 }
 
-// Pick the event from a tournament-level URL. One event → use it; many → prefer
-// the single SF6 event; otherwise throw, naming the events so the operator can
-// paste a specific event URL.
+// The event to poll from a tournament's events (decision 12, as Tally rules it): one
+// event → that one, whatever its game; several → always stop, naming them, so the
+// operator pastes the event's own URL (a guess could crawl another game's bracket);
+// none → stop. Pure, and exported for verify.mjs.
+export function chooseStartggEvent(events) {
+  const list = Array.isArray(events) ? events : [];
+  if (list.length === 0) throw new Error('start.gg: this tournament has no events yet');
+  const chosen = list.length === 1 ? list[0] : null;
+  if (!chosen || !chosen.slug) {
+    const names = list.map((e) => `${e?.name} → ${e?.slug}`).join('; ');
+    throw new Error(`start.gg: tournament has multiple events — paste a specific event URL. Events: ${names}`);
+  }
+  return chosen.slug; // already "tournament/<t>/event/<e>"
+}
+
+// Looks up a tournament-level URL's events and picks one (chooseStartggEvent).
 async function resolveEventSlug(tournamentSlug, apiKey, signal) {
   const data = await gql({
     operationName: 'ZipperTournamentEvents',
@@ -227,34 +275,34 @@ async function resolveEventSlug(tournamentSlug, apiKey, signal) {
   if (!tournament) {
     throw new Error('start.gg: tournament not found (private or draft events need an API token with admin access)');
   }
-  const events = Array.isArray(tournament.events) ? tournament.events : [];
-  if (events.length === 0) throw new Error('start.gg: this tournament has no events yet');
-
-  let chosen = null;
-  if (events.length === 1) {
-    chosen = events[0];
-  } else {
-    const sf6 = events.filter((e) => Number(e?.videogame?.id) === SF6_VIDEOGAME_ID);
-    if (sf6.length === 1) chosen = sf6[0];
-  }
-  if (!chosen || !chosen.slug) {
-    const list = events.map((e) => `${e.name} → ${e.slug}`).join('; ');
-    throw new Error(`start.gg: tournament has multiple events — paste a specific event URL. Events: ${list}`);
-  }
-  return chosen.slug; // already "tournament/<t>/event/<e>"
+  return chooseStartggEvent(tournament.events);
 }
 
-async function fetchAllSets(slug, apiKey, signal) {
+// Reads the event's sets, page by page (see "Paging" at the top). Gives the event of the
+// first page (its standings) with the sets read, de-duplicated by id, whether paging
+// stopped early for having enough (cutShort) or at the page limit (pollNotice), and how
+// many standings the first page asked for (standingsAsked). A read to the last page is
+// neither cut short nor at the limit.
+async function fetchAllSets(slug, apiKey, signal, { maxItems = null, topN = 0 } = {}) {
+  const top = Math.round(Number(topN)) || 0;
+  const max = Math.round(Number(maxItems));
+  // With topN on, every page is read (the filter needs every match of the top players).
+  // Without a usable maxItems, every page is read too, as before.
+  const enough = top > 0 || !(max > 0) ? Infinity : max;
+  const standingsFirst = Math.min(STANDINGS_MAX, Math.max(STANDINGS_MIN, top));
   let event = null;
   let page = 1;
-  let totalPages = 1;
   const nodes = [];
+  const seen = new Set();
+  let completed = 0;
+  let cutShort = false;
+  let pollNotice = '';
 
-  while (page <= totalPages && page <= MAX_PAGES) {
+  for (;;) {
     const data = await gql({
       operationName: 'ZipperEventSets',
       query: SETS_QUERY,
-      variables: { slug, page, perPage: PAGE_SIZE },
+      variables: { slug, page, perPage: PAGE_SIZE, standingsPerPage: page === 1 ? standingsFirst : 1 },
       apiKey,
       signal,
     });
@@ -263,13 +311,24 @@ async function fetchAllSets(slug, apiKey, signal) {
     event = event || ev;
     const conn = ev.sets;
     if (!conn || !Array.isArray(conn.nodes)) break;
-    nodes.push(...conn.nodes);
-    totalPages = Number(conn.pageInfo?.totalPages) || 1;
+    for (const s of conn.nodes) {
+      const id = s?.id == null ? null : String(s.id);
+      if (id !== null) {
+        if (seen.has(id)) continue; // already read on the page before
+        seen.add(id);
+      }
+      nodes.push(s);
+      if (Number(s?.state) === 3) completed++;
+    }
+    const totalPages = Number(conn.pageInfo?.totalPages) || 1;
+    if (page >= totalPages) break; // the last page: nothing left unread
+    if (completed >= enough) { cutShort = true; break; }
+    if (page >= MAX_PAGES) { pollNotice = PAGE_LIMIT_NOTICE; break; }
     page++;
   }
 
   if (!event) throw new Error('start.gg: event not found');
-  return { ...event, sets: { nodes } };
+  return { event: { ...event, sets: { nodes } }, cutShort, pollNotice, standingsAsked: standingsFirst };
 }
 
 async function gql({ operationName, query, variables, apiKey, signal }) {

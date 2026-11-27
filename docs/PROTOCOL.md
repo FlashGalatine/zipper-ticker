@@ -123,7 +123,7 @@ reserved command `__status` with the status JSON as `value`:
 
 ```json
 { "type": "ticker:command", "command": "__status",
-  "value": "{\"type\":\"ticker:status\",\"seq\":42,\"polling\":true,\"url\":\"…\",\"platform\":\"challonge\",\"lastPollAt\":\"…\",\"nextPollAt\":\"…\",\"lastError\":\"\",\"commandNotice\":\"\",\"actionNotice\":\"\",\"configWarning\":\"\",\"intervalMs\":30000,\"maxItems\":20,\"caps\":{…}}" }
+  "value": "{\"type\":\"ticker:status\",\"seq\":42,\"polling\":true,\"url\":\"…\",\"platform\":\"challonge\",\"lastPollAt\":\"…\",\"nextPollAt\":\"…\",\"lastError\":\"\",\"commandNotice\":\"\",\"actionNotice\":\"\",\"configWarning\":\"\",\"pollNotice\":\"\",\"intervalMs\":30000,\"maxItems\":20,\"caps\":{…}}" }
 ```
 
 The sidecar ignores its own `__status` echo, in any casing; the control page
@@ -216,9 +216,20 @@ of each one, and the control page ignores it.
 
   Only a restart clears the others. A good poll and a `setUrl` never clear it.
   The control page shows it in its status line.
+- `pollNotice` — a fact about the last good poll that is not an error, in fixed
+  words; `""` when there is none. Today only start.gg gives one: `start.gg: this
+  event has more than 500 sets; only the 500 most recent were read`, when a poll
+  reads all 10 pages of 50 and more remain: with `topN` on (every page is read), or
+  when those 500 sets hold fewer completed ones than `maxItems`. A poll that stops
+  early because it holds `maxItems` completed sets gives none, however big the
+  event. Every good poll sets or
+  clears it; a failed poll leaves it as it was, and so does a command; a `setUrl`
+  that changes the URL clears it. It never counts as a failure, so it plays no
+  part in the error back-off. The control page shows it in its status line, after
+  `configWarning`, as a notice rather than an error.
 
 A key value in `lastError`, the StreamElements
-error, `commandNotice` or `url` (and in the sidecar's log, and in the
+error, `commandNotice`, `pollNotice` or `url` (and in the sidecar's log, and in the
 `tournament.url` of every `ticker:update` it pushes) is replaced by a label such
 as `[Challonge key]`, `[start.gg key]` or `[StreamElements token]`. The sidecar
 keeps the URL as it was set, key and all, and so does `config.json`. Only the
@@ -297,11 +308,15 @@ The status carries an `auto` block describing the auto-scheduler (see
   standings, and each match's id, state, round, winner, scores and names. So a
   corrected winner with the same scores is pushed, and so is an event that
   completes with no set changing (the stored payload then says `completed`).
-- **A new URL** (`setUrl` with a value other than the one set) pushes a blank
+- **A new URL** (a `setUrl` whose value, once trimmed and given `https://` when
+  it is a site's address sent without a scheme, such as `challonge.com/blko42`
+  (a bare `blko42` is left as it is), differs from the URL set) pushes a blank
   payload at once: no matches and no standings, under the new URL, with the
   caps and the message kept. The old bracket leaves the strip, and stays gone if
   the new URL keeps failing. The new URL's first good poll is pushed. A refused
-  `setUrl` pushes nothing, and the URL already set pushes nothing either.
+  `setUrl` pushes nothing, and neither does one whose value comes to the URL
+  already set that way (`challonge.com/blko42` sent again, or with spaces around
+  it, while `https://challonge.com/blko42` is set).
 - **Cap changes** (`setCaps`, `setCapsText`, `setCapsLogo`) push the current
   payload with the new caps at once, polling or not, so they show while a site
   is failing (just after a restart there is no current payload yet: see
@@ -309,9 +324,14 @@ The status carries an `auto` block describing the auto-scheduler (see
 - **Option changes** (`setMaxItems`, `setTopN`, and `setOptions` when one of
   them changes) rebuild the payload from the last good result the sidecar keeps,
   with the URL and platform it was fetched under, and push it at once, polling
-  or not. When that result was cut short by its platform (`cutShort`) and the
-  change asks for more than it held (a higher `maxItems`, or `topN` switched
-  on), the sidecar also fetches again.
+  or not. The sidecar also fetches again when the change asks for more than
+  that result holds: when its platform cut it short (`cutShort`) and the change
+  asks for a higher `maxItems` than it was fetched with, or switches `topN` on;
+  and, cut short or not, at the page limit or not, when `topN` is raised above
+  the standings its platform asked for (`standingsAsked`; start.gg asks for 8,
+  or `topN` when that is more, at most 100). A lower `topN`, one within the
+  standings asked for, or a result with no `standingsAsked` (every platform but
+  start.gg) is only rebuilt.
 - **Nothing kept yet.** After a restart, until its first good poll, the
   sidecar holds no result and, until a message is pushed (below), no payload. A cap or option change with a URL set
   then runs one fetch, which pushes what it brings with the change; with polling
@@ -426,7 +446,7 @@ passed as they are. An unknown name is ignored and reported in the status's
 
 | command       | value                          | effect |
 |---------------|--------------------------------|--------|
-| `setUrl`      | tournament URL (empty = none)  | switch tournaments: a blank payload (no results; caps and message kept) is pushed at once, and the new URL's first good poll is pushed (see [What the sidecar pushes](#what-the-sidecar-pushes)). A poll of the old URL still running is stopped and its result thrown away; while polling, the new URL is polled once the gap allows (see [When the sidecar polls](#when-the-sidecar-polls)). An empty value clears the URL, pushes the blank and **stops polling**. The URL already set (after trimming) changes nothing on the strip; while polling it asks for a poll, as `pollNow` does. A refused `stub:` URL (see [Test hook](#test-hook)) keeps the old URL, saves nothing, pushes nothing and says why in `commandNotice` |
+| `setUrl`      | tournament URL (empty = none)  | an address with no scheme is given `https://` first (`challonge.com/blko42` is set, saved and shown as `https://challonge.com/blko42`; a bare word such as `blko42` and a `stub:` URL are left as they are), and the rest of this row applies to that. Switch tournaments: a blank payload (no results; caps and message kept) is pushed at once, and the new URL's first good poll is pushed (see [What the sidecar pushes](#what-the-sidecar-pushes)). A poll of the old URL still running is stopped and its result thrown away; while polling, the new URL is polled once the gap allows (see [When the sidecar polls](#when-the-sidecar-polls)). An empty value clears the URL, pushes the blank and **stops polling**. The URL already set (after trimming) changes nothing on the strip; while polling it asks for a poll, as `pollNow` does. A refused `stub:` URL (see [Test hook](#test-hook)) keeps the old URL, saves nothing, pushes nothing and says why in `commandNotice` |
 | `start`       | —                              | start polling |
 | `stop`        | —                              | stop polling |
 | `pollNow`     | —                              | a fresh poll as soon as the 15 s gap after the last poll and any Retry-After allow (starts polling if stopped); the status answers at once, with `nextPollAt` |
@@ -440,7 +460,7 @@ passed as they are. An unknown name is ignored and reported in the status's
 | `setCapsLogo` | an http(s) URL, or a path on the overlay's server (≤500 chars; empty = no logo) | left-cap logo image (single-field). Anything else — `data:`, `file:`, `javascript:`, `//host`, `\\host` — is refused: the old logo stays and `commandNotice` says why. A saved logo that breaks this rule is dropped when `config.json` loads, and `configWarning` says so |
 | `setInterval` above, `setMaxItems`, `setTopN` | see below | single-field variants |
 | `setMaxItems` | 1–100                          | ticker item cap; a change is rebuilt from the last result and pushed at once (after a fetch, when nothing is kept yet or the URL changed since) |
-| `setTopN`     | 0–100 (0 = off)                | only show matches involving the top-N placed participants (needs platform standings — start.gg always; Challonge via `final_rank` on the keyed API for your own tournaments, or derived from elimination order on finished brackets when scraping; also trims the standings crawl to N); a change is rebuilt from the last result and pushed at once (after a fetch, when nothing is kept yet or the URL changed since) |
+| `setTopN`     | 0–100 (0 = off)                | only show matches involving the top-N placed participants (needs platform standings — start.gg always; Challonge via `final_rank` on the keyed API for your own tournaments, or derived from elimination order on finished brackets when scraping; also trims the standings crawl to N); a change is rebuilt from the last result and pushed at once (after a fetch, when nothing is kept yet or the URL changed since), and fetched again too when it is raised above the standings that result asked for (start.gg's `standingsAsked`, see [What the sidecar pushes](#what-the-sidecar-pushes)) |
 | `setAutoSchedule` | `on`/`off` (default on)    | auto start/stop: a poll that returns `completed` pushes the final payload then **stops polling**; one that returns `upcoming` **waits for the platform's start time**, checking again at least every 15 min (or every poll interval, if that is longer) so a bracket that starts early is picked up (every 5 min without a start time, or every poll interval if that is longer), and resumes normal polling when the event goes live. `start`/`pollNow` get a poll even during that sleep or after that stop, but it still waits for the 15 s gap after the last poll and for a site's Retry-After (see [When the sidecar polls](#when-the-sidecar-polls)). |
 | `status`      | —                              | request a status re-broadcast; a push still owed is pushed first (see [What the sidecar pushes](#what-the-sidecar-pushes)) |
 
@@ -580,8 +600,14 @@ HTTP <status>`.
 A stub file is a normalized result, so it may also carry what a platform
 adapter's result carries: `"cutShort": true` marks a result its adapter stopped
 reading early, which an option change asking for more then fetches again (see
-[What the sidecar pushes](#what-the-sidecar-pushes)). That is not a test-only key:
-no adapter sets it yet (start.gg will, from its paging change).
+[What the sidecar pushes](#what-the-sidecar-pushes)), `"standingsAsked"` the
+standings its adapter asked for, which a higher `topN` then fetches again (a
+number, such as `"standingsAsked": 8`; a `topN` it was fetched with counts as
+asked for, so a file that says fewer is not fetched again and again), and
+`"pollNotice"` is a
+notice the status then carries (see `pollNotice` above). None is a test-only
+key: start.gg sets `cutShort` when its paging stops early, `standingsAsked` on
+every result, and `pollNotice` when an event is cut at its page limit.
 
 The tests shorten the poll loop's limits with `ZIPPER_REQUEST_TIMEOUT_MS` (10 s
 per request), `ZIPPER_POLL_DEADLINE_MS` (45 s per poll) and

@@ -1,6 +1,15 @@
 // Zipper verify suite — no network, no Streamer.bot install, no browser.
 //   1. Platform normalizer tests against recorded fixtures (pure functions).
-//   2. Platform detection/parseId routing.
+//   2. Platform detection/parseId routing (Tally's rows: start.gg admin pages, hosts
+//      that only look right), and normalizeInput (https:// for an address pasted
+//      without it; Tally's answers in linear time), with the control page's copy.
+//   2e. start.gg paging and the event choice, in-process: the real adapter fed fixture
+//      pages through a stand-in for fetch (the early stop at maxItems completed sets,
+//      counted after de-duplication, and its cutShort, every page with topN, the first
+//      page's standings and the standingsAsked that records them, sets de-duplicated by
+//      id, the page limit's pollNotice and what the docs say of it and of the re-fetch
+//      rule, admin-page addresses, several events refused, the query texts pinned by
+//      SHA-256).
 //   2b. The fetch wrapper (platforms/guarded-fetch.js), in-process against a local
 //      server on an OS-assigned port: its timeout (shortened only with ZIPPER_ALLOW_STUB),
 //      size cap, Retry-After and error wording; each adapter's wiring to it (signal,
@@ -63,6 +72,19 @@
 //      newest push's outcome counts, and only its reply for the notice), and a push owed:
 //      paid across a reconnect (/mock/kick), on a status command, and by itself after the
 //      retry wait; a push in flight when the socket closes is settled at once.
+//   6k. The adapters' results through the sidecar (ZIP-20; rows 8.3 and 8.4), with
+//      tools/fake-fetch-preload.cjs in place of fetch: pollNotice (set and cleared by a
+//      good poll, kept by a failed one, by a result that does not build, by a command and
+//      by a setUrl to the URL already set, cleared by a setUrl that changes it), section
+//      2e's start.gg results as stub fixtures (the page limit's notice and no re-fetch, the
+//      early stop's re-fetch on setMaxItems and setTopN, topN 16 with 16 standings, and
+//      topN raised above the standingsAsked of a result, cut short or not, fetched again
+//      at once, through setTopN and setOptions, but not when lowered, within it, equal
+//      to it, or when the field is not a number),
+//      setUrl with an address pasted without https:// (sent again bare, the URL already
+//      set) or from a start.gg admin page, and the real start.gg adapter given the poll's
+//      maxItems and topN, and its standingsAsked read by the sidecar (the fake fetch's json
+//      mode and its request log).
 //   6j. Config safety, keys and the log file (ZIP-05, ZIP-21): a config.json that does
 //      not parse, cannot be read, holds no object, is saved as UTF-16, is empty or is not
 //      valid UTF-8 (an ANSI file with an accented letter; one of plain ASCII still loads) is
@@ -76,7 +98,7 @@
 //      names); keys from the environment
 //      used but never saved; keys that are not printable ASCII (a lone surrogate
 //      included) refused, and not replaced by the environment's; every key, from
-//      config.json or the environment, redacted from lastError, the status, the pushed
+//      config.json or the environment, redacted from lastError, pollNotice, the status, the pushed
 //      payload's URL, the caps text, logo and message text in the status and in every
 //      pushed payload (config.json keeping what was typed, and the change check working on
 //      it), and the log, a command's value before its cut (the Challonge key
@@ -282,8 +304,10 @@ async function testNormalizers() {
 
 // ── 2. Detection ──────────────────────────────────────────────────────────────
 
-function testDetection() {
+async function testDetection() {
   console.log('\n[2] platform detection');
+  // [input, platform name or null, parsed id or null]. A row that expects no platform
+  // passes when no platform claims the input.
   const cases = [
     ['https://challonge.com/blko42', 'challonge', 'blko42'],
     ['https://blko.challonge.com/weekly42', 'challonge', 'blko-weekly42'],
@@ -293,13 +317,92 @@ function testDetection() {
     ['https://round.one/tournament/my-cup', 'roundone', 'my-cup'],
     ['https://tourneybot.gg/tourneys/1234', 'tourneybot', '1234'],
     ['blko42', 'challonge', 'blko42'],
+    // Row 8.4 (decision 11 c): start.gg admin pages, from Tally's verify-parse.test.mjs:21-22.
+    ['https://www.start.gg/admin/tournament/cup/event/singles/seeding', 'startgg', 'cup/singles'],
+    ['https://www.start.gg/admin/tournament/cup/dashboard', 'startgg', 'cup'],
+    // Hosts that only look right, from Tally's :46-51.
+    ['https://start.gg.evil.example/tournament/cup/event/singles', null, null],
+    ['https://evil.example/start.gg/tournament/cup', null, null],
+    ['https://start.gg@evil.example/tournament/cup', null, null],
+    ['https://example.com/not-a-bracket', null, null],
   ];
   for (const [input, name, id] of cases) {
     const p = detectPlatform(input);
-    check(`detect ${input}`, p?.name === name && p.parseId(input) === id,
+    check(`detect ${input}`, (p ? p.name : null) === name && (!p || p.parseId(input) === id),
       p ? `${p.name}/${p.parseId(input)}` : 'no match');
   }
   check('all platforms expose fetchTicker', PLATFORMS.every((p) => typeof p.fetchTicker === 'function'));
+
+  // Row 8.4 (decision 11 d): input pasted without https:// is given it before platform
+  // detection (Tally's normalizeInput, roster-lib.mjs:97-103, and its test rows).
+  {
+    const idx = await import('./platforms/index.js');
+    const n = idx.normalizeInput;
+    const rows = [
+      ['start.gg/tournament/cup/event/singles', 'https://start.gg/tournament/cup/event/singles'],
+      ['  www.challonge.com/abc ', 'https://www.challonge.com/abc'],
+      ['challonge.com', 'https://challonge.com'],
+      ['challonge.com/blko42', 'https://challonge.com/blko42'],
+      ['mytourney', 'mytourney'],
+      ['https://challonge.com/abc', 'https://challonge.com/abc'],
+      ['http://challonge.com/abc', 'http://challonge.com/abc'],
+      ['stub:platforms/fixtures/stub-result.json', 'stub:platforms/fixtures/stub-result.json'],
+      ['', ''],
+    ];
+    const wrong = typeof n !== 'function' ? ['normalizeInput is not exported by platforms/index.js']
+      : rows.map(([v, want]) => [v, want, n(v)]).filter(([, want, got]) => got !== want).map(([v, want, got]) => `${JSON.stringify(v)} → ${JSON.stringify(got)}, wanted ${JSON.stringify(want)}`);
+    check('row 8.4 (decision 11 d): normalizeInput gives https:// to an address pasted without a scheme, and leaves a bare word, an address with a scheme and a stub: URL alone',
+      wrong.length === 0, wrong.join('; '));
+    const p = typeof n === 'function' ? detectPlatform(n('challonge.com/blko42')) : null;
+    check('row 8.4: challonge.com/blko42 with no scheme, normalized, is detected as Challonge, tournament blko42',
+      p?.name === 'challonge' && p.parseId(n('challonge.com/blko42')) === 'blko42', p ? `${p.name}/${p.parseId(n('challonge.com/blko42'))}` : 'no match');
+    // The control page applies the same rule to know what the sidecar stores (its URL box
+    // settles on that): its copy has the same body as platforms/index.js (compared with
+    // each run of white space made one space), and that body, run here, gives the table's
+    // answers.
+    const bodyOf = (src) => ((/function normalizeInput\s*\([^)]*\)\s*\{([\s\S]*?)\n\s*\}/.exec(src) || [])[1] || '').replace(/\s+/g, ' ').trim();
+    const fromIndex = bodyOf(readFileSync(resolve(__dirname, 'platforms', 'index.js'), 'utf-8'));
+    const fromPage = bodyOf(readFileSync(resolve(__dirname, 'zipper-shared', 'control.html'), 'utf-8'));
+    let pageFn = null;
+    let pageWrong = ['the control page has no normalizeInput'];
+    if (fromPage) {
+      try {
+        pageFn = new Function('input', fromPage);
+        pageWrong = rows.map(([v, want]) => [v, want, pageFn(v)]).filter(([, want, got]) => got !== want).map(([v, want, got]) => `${JSON.stringify(v)} → ${JSON.stringify(got)}, wanted ${JSON.stringify(want)}`);
+      } catch (e) { pageFn = null; pageWrong = [`the page's copy does not run: ${e.message}`]; }
+    }
+    check('row 8.4: the control page\'s normalizeInput has the same body as platforms/index.js, and that copy gives the table\'s answers, so the URL box settles on the address the sidecar stores',
+      fromIndex.length > 0 && fromPage === fromIndex && pageWrong.length === 0, JSON.stringify({ fromIndex, fromPage, pageWrong }));
+    // The test is Tally's regex in linear time (review of Sprint 8): the same answer as
+    // Tally's form on every string of up to 6 characters from "a", ".", "/", ":" and a
+    // space (the scheme test, the dot's place, a slash or a space after it), and a long run
+    // of dots before a space, which Tally's form takes seconds over (quadratic
+    // backtracking), done in well under 250 ms by both copies.
+    const tallyForm = (input) => {
+      const s = String(input || '').trim();
+      if (!s || /^[a-z][a-z0-9+.-]*:/i.test(s)) return s;
+      return /^[^\s\/]+\.[^\s\/]+(\/|$)/.test(s) ? 'https://' + s : s;
+    };
+    const differ = [];
+    let tried = 0;
+    if (typeof n === 'function') {
+      let level = [''];
+      for (let len = 1; len <= 6; len++) {
+        const nextLevel = [];
+        for (const pre of level) for (const c of ['a', '.', '/', ':', ' ']) nextLevel.push(pre + c);
+        for (const v of nextLevel) { tried++; if (n(v) !== tallyForm(v) && differ.length < 5) differ.push(`${JSON.stringify(v)} → ${JSON.stringify(n(v))}, Tally's form ${JSON.stringify(tallyForm(v))}`); }
+        level = nextLevel;
+      }
+    }
+    check('review (row 8.4): normalizeInput gives Tally\'s answer on every string of up to 6 characters from "a", ".", "/", ":" and a space',
+      typeof n === 'function' && tried === 19530 && differ.length === 0, JSON.stringify({ tried, differ }));
+    const longDots = '.'.repeat(50000) + ' x';
+    const timeOf = (fn) => { if (typeof fn !== 'function') return null; const t0 = performance.now(); fn(longDots); return Math.round(performance.now() - t0); };
+    const msIndex = timeOf(n);
+    const msPage = timeOf(pageFn);
+    check('review (row 8.4): normalizeInput takes linear time: 50,000 dots and " x" (no address) take under 250 ms in platforms/index.js and in the control page\'s copy (Tally\'s regex takes seconds)',
+      msIndex !== null && msPage !== null && msIndex < 250 && msPage < 250 && n(longDots) === longDots, JSON.stringify({ msIndex, msPage }));
+  }
 }
 
 // ── 2b. The fetch wrapper, in-process (ZIP-06), and no bare fetch( left ───────
@@ -643,6 +746,334 @@ async function testFetchWrapper() {
     check('adapters, in-process with a stand-in for fetch (no network): start.gg and Challonge (both paths each) and Matcherino pass the poll\'s signal to their request (an abort ends it at once, with the host and the reason), throw a 429 with its status and Retry-After, and send their User-Agent',
       wrong.length === 0, wrong.join('; '));
   }
+}
+
+// ── 2e. start.gg paging and the event choice, in-process (ZIP-20, rows 8.3 to 8.5) ──
+// The real start.gg adapter is fed fixture pages through a stand-in for fetch in this
+// process (decision 9: no base-URL override, no network). The stand-in answers the two
+// queries as start.gg's GraphQL does, honours page, perPage and standingsPerPage (8, the
+// query's own default, when none is sent), and records every request. What the adapter
+// gives back is kept for section 6k, which runs it through the sidecar as stub fixtures.
+
+// The two start.gg query texts as they passed start.gg's public proxy at 1.0.11 (its
+// CHANGELOG entry): the proxy may reject a query that is not on its allow-list, so row 8.3
+// varies only the variables. A change to either text fails here, and would need the
+// owner's live keyless check again.
+const STARTGG_QUERY_SHA256 = {
+  ZipperTournamentEvents: '2454d65bcb3f1fa4c614e236110880805e0d7fa03b6ca60a516dab0398b057c5',
+  ZipperEventSets: '3b74c15395b6de98dce50b55bbb7ad0e687f92e408827f52acfca8eec0c028d5',
+};
+// The notice the adapter gives for an event cut at its page limit (10 pages of 50 sets).
+const STARTGG_PAGE_LIMIT_NOTICE = 'start.gg: this event has more than 500 sets; only the 500 most recent were read';
+let adapterResults = null; // { early, pageLimit, topN16, onePage0, onePage16 }: start.gg results for section 6k
+
+// A start.gg set as the sets query gives it. state: 3 completed, 2 in progress, 1 not started.
+const sgSet = (i, state, a = `A${i}`, b = `B${i}`) => ({
+  id: 5000 + i, state, round: 1, fullRoundText: 'Round 1', displayScore: '', winnerId: state === 3 ? 100000 + i : null,
+  slots: [
+    { entrant: { id: 100000 + i, name: a }, standing: { stats: { score: { value: state === 1 ? null : 2 } } } },
+    { entrant: { id: 200000 + i, name: b }, standing: { stats: { score: { value: state === 1 ? null : 0 } } } },
+  ],
+});
+
+// The stand-in for fetch. `sets` is the event's whole newest-first list; with
+// shiftAfterFirstPage a set completes between the first request and the next, so it moves
+// to the top and every later page starts one set further back (its first set is the first
+// page's last one again).
+function startggStandIn({ sets = [], standings = [], events = null, shiftAfterFirstPage = false } = {}) {
+  const requests = [];
+  const fetch = async (url, init = {}) => {
+    let body = null;
+    try { body = JSON.parse(String(init.body || 'null')); } catch {}
+    const proxy = Array.isArray(body);
+    const req = (proxy ? body[0] : body) || {};
+    const v = req.variables || {};
+    requests.push({ host: new URL(String(url)).host, operationName: req.operationName, variables: { ...v }, query: req.query });
+    let data;
+    if (req.operationName === 'ZipperTournamentEvents') {
+      data = { tournament: events ? { id: 9001, name: 'Zipper Major', events } : null };
+    } else {
+      const page = Number(v.page ?? 1);
+      const perPage = Number(v.perPage ?? 50);
+      const standingsPerPage = Number(v.standingsPerPage ?? 8);
+      const list = shiftAfterFirstPage && page > 1 ? [sgSet(999, 3, 'Late', 'Comer'), ...sets] : sets;
+      data = { event: {
+        id: 77, name: 'Paging Singles', state: 'ACTIVE', startAt: null, tournament: { name: 'Paging Cup' },
+        standings: { nodes: standings.slice(0, standingsPerPage) },
+        sets: { nodes: list.slice((page - 1) * perPage, page * perPage), pageInfo: { page, total: list.length, perPage, totalPages: Math.ceil(list.length / perPage) } },
+      } };
+    }
+    return new Response(JSON.stringify(proxy ? [{ data }] : { data }), { status: 200, headers: { 'content-type': 'application/json' } });
+  };
+  return { fetch, requests, sets: () => requests.filter((r) => r.operationName === 'ZipperEventSets') };
+}
+
+// Runs the start.gg adapter as the sidecar does (parseId, then fetchTicker with the URL)
+// with fetch replaced by the stand-in for this call only.
+async function runStartgg(standIn, url, cfg) {
+  const { startgg } = await import('./platforms/startgg.js');
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = standIn.fetch;
+  try {
+    const id = startgg.parseId(url);
+    if (!id) return { error: new Error(`parseId gave ${JSON.stringify(id)}`) };
+    return { result: await startgg.fetchTicker(id, { startggApiKey: null, ...cfg }, url, new AbortController().signal) };
+  } catch (error) {
+    return { error };
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+}
+
+async function testStartggPaging() {
+  console.log('\n[2e] start.gg paging and the event choice, in-process (ZIP-20, rows 8.3 to 8.5)');
+  const { createHash } = await import('node:crypto');
+  const EV = 'https://www.start.gg/tournament/paging-cup/event/singles';
+  const all = [];
+  const run = async (standIn, url, cfg) => { const r = await runStartgg(standIn, url, cfg); all.push(...standIn.requests); return r; };
+  const brief = (r, s) => JSON.stringify({ error: r.error?.message, requests: s.sets().length, cutShort: r.result?.cutShort, pollNotice: r.result?.pollNotice, matches: r.result?.matches?.length, perPage: s.sets().map((q) => q.variables.standingsPerPage) });
+
+  // 150 sets, newest first: page 1 holds 30 completed and 20 not, page 2 25 and 25, page 3
+  // 50 completed (105 completed in all).
+  const paged = [
+    ...Array.from({ length: 30 }, (_, i) => sgSet(i, 3)),
+    ...Array.from({ length: 20 }, (_, i) => sgSet(30 + i, i < 5 ? 2 : 1)),
+    ...Array.from({ length: 25 }, (_, i) => sgSet(50 + i, 3)),
+    ...Array.from({ length: 25 }, (_, i) => sgSet(75 + i, 1)),
+    ...Array.from({ length: 50 }, (_, i) => sgSet(100 + i, 3)),
+  ];
+  const standings8 = Array.from({ length: 20 }, (_, i) => ({ placement: i + 1, entrant: { id: 300 + i, name: `S${i + 1}` } }));
+
+  // The early stop.
+  let early = null;
+  {
+    const s = startggStandIn({ sets: paged, standings: standings8 });
+    const r = await run(s, EV, { maxItems: 20, topN: 0 });
+    early = r.result || null;
+    check('row 8.3 (ZIP-20): with maxItems 20 and topN off, paging stops once the sets read hold 20 completed ones: one request (the first page holds 30), and the result carries cutShort, so a command asking for more fetches again (row 4.3)',
+      !r.error && s.sets().length === 1 && r.result.cutShort === true && r.result.matches.length === 50 && !r.result.pollNotice, brief(r, s));
+  }
+  {
+    const s = startggStandIn({ sets: paged, standings: standings8 });
+    const r = await run(s, EV, { maxItems: 40, topN: 0 });
+    const per = s.sets().map((q) => q.variables.standingsPerPage);
+    check('row 8.3: with maxItems 40 it reads two pages (30 + 25 completed), marks the result cutShort, and asks for the standings on the first page only (8 there, 1 on the next)',
+      !r.error && s.sets().length === 2 && r.result.cutShort === true && per[0] === 8 && per[1] === 1, brief(r, s));
+  }
+  {
+    const s = startggStandIn({ sets: paged, standings: standings8 });
+    const r = await run(s, EV, { maxItems: 100, topN: 0 });
+    check('row 8.3: with maxItems 100 it reads to the last page (105 completed are reached only there), and a result read to the last page is not cutShort',
+      !r.error && s.sets().length === 3 && r.result.cutShort !== true && r.result.matches.length === 150, brief(r, s));
+  }
+  {
+    const s = startggStandIn({ sets: paged.slice(0, 30), standings: standings8 });
+    const r = await run(s, EV, { maxItems: 20, topN: 0 });
+    check('row 8.3: an event of one page that holds enough completed sets is read whole, and is not cutShort (nothing was left unread)',
+      !r.error && s.sets().length === 1 && r.result.cutShort !== true, brief(r, s));
+  }
+
+  // topN in use: every page is read, and the first asks for max(topN, 8) standings, at most 100.
+  let topN16 = null;
+  {
+    const named = [
+      sgSet(0, 3, 'P1', 'P2'), sgSet(1, 3, 'P9', 'P10'), sgSet(2, 3, 'P11', 'P12'), sgSet(3, 2, 'P13', 'P14'), sgSet(4, 3, 'P15', 'P16'),
+      ...Array.from({ length: 115 }, (_, i) => sgSet(10 + i, 3, `X${i}`, `Y${i}`)),
+    ];
+    const standings16 = Array.from({ length: 20 }, (_, i) => ({ placement: i + 1, entrant: { id: 400 + i, name: `P${i + 1}` } }));
+    const s = startggStandIn({ sets: named, standings: standings16 });
+    const r = await run(s, EV, { maxItems: 2, topN: 16 });
+    topN16 = r.result || null;
+    const per = s.sets().map((q) => q.variables.standingsPerPage);
+    check('row 8.3: with topN 16 every page is read whatever maxItems is (3 here, with maxItems 2), the first page asks for 16 standings and the later ones for 1, the result holds the 16 placed, and it is not cutShort',
+      !r.error && s.sets().length === 3 && per.join(',') === '16,1,1' && r.result.standings.length === 16 && r.result.standings[15].name === 'P16' && r.result.cutShort !== true,
+      JSON.stringify({ error: r.error?.message, requests: s.sets().length, perPage: per, standings: r.result?.standings?.length, cutShort: r.result?.cutShort }));
+  }
+  {
+    const got = [];
+    for (const topN of [0, 3, 16, 100, 150]) {
+      const s = startggStandIn({ sets: paged.slice(0, 10), standings: standings8 });
+      await run(s, EV, { maxItems: 20, topN });
+      got.push(s.sets()[0]?.variables.standingsPerPage);
+    }
+    check('row 8.3: the first page asks for max(topN, 8) standings, at most 100: topN 0, 3, 16, 100 and 150 ask for 8, 8, 16, 100 and 100',
+      got.join(',') === '8,8,16,100,100', JSON.stringify(got));
+  }
+
+  // De-duplicated by id: a set that completes between two requests shifts the list by one.
+  {
+    const s = startggStandIn({ sets: Array.from({ length: 100 }, (_, i) => sgSet(i, 3)), standings: standings8, shiftAfterFirstPage: true });
+    const r = await run(s, EV, { maxItems: 20, topN: 16 });
+    const ids = (r.result?.matches || []).map((m) => m.id);
+    const twice = ids.filter((id, i) => ids.indexOf(id) !== i);
+    check('row 8.3 (ZIP-20): a set that appears on two pages (one completed between the requests and the list moved down by one) is kept once: 100 sets, each id once',
+      !r.error && s.sets().length === 3 && ids.length === 100 && twice.length === 0, JSON.stringify({ error: r.error?.message, requests: s.sets().length, matches: ids.length, twice }));
+  }
+  // The early stop counts the completed sets after de-duplication (review of Sprint 8): page
+  // 1 holds 19 completed, its last set among them; after the shift page 2 starts with that
+  // set again and holds no other completed one; page 3 is all completed. So 20 completed are
+  // held only after page 3 (3 requests, cutShort). Counting the repeat would stop after
+  // page 2 with 19 real completed sets.
+  {
+    const shifted = [
+      ...Array.from({ length: 50 }, (_, i) => sgSet(i, i < 18 || i === 49 ? 3 : 1)),
+      ...Array.from({ length: 50 }, (_, i) => sgSet(50 + i, 1)),
+      ...Array.from({ length: 100 }, (_, i) => sgSet(100 + i, 3)),
+    ];
+    const s = startggStandIn({ sets: shifted, standings: standings8, shiftAfterFirstPage: true });
+    const r = await run(s, EV, { maxItems: 20, topN: 0 });
+    const ids = (r.result?.matches || []).map((m) => m.id);
+    const completed = (r.result?.matches || []).filter((m) => m.state === 'completed').length;
+    check('row 8.3 (review): the early stop counts completed sets once each: a completed set repeated on the next page (the list moved down by one) does not count again, so with maxItems 20 paging reads 3 pages (19, 19, 68 completed), not 2, and the result is cutShort',
+      !r.error && s.sets().length === 3 && r.result.cutShort === true && new Set(ids).size === ids.length && completed === 68,
+      JSON.stringify({ error: r.error?.message, requests: s.sets().length, cutShort: r.result?.cutShort, completed, matches: ids.length }));
+  }
+
+  // The page limit: 12 pages, none completed. Ten are read, pollNotice says so, and the
+  // result is not cutShort (a fetch again would stop at the same limit).
+  let pageLimit = null;
+  {
+    const s = startggStandIn({ sets: Array.from({ length: 600 }, (_, i) => sgSet(i, 1)), standings: standings8 });
+    const r = await run(s, EV, { maxItems: 20, topN: 0 });
+    pageLimit = r.result || null;
+    check(`row 8.3 (ZIP-20): an event past the page limit (12 pages of 50) is read to the 10th page, its result carries pollNotice "${STARTGG_PAGE_LIMIT_NOTICE}", and it is not cutShort`,
+      !r.error && s.sets().length === 10 && r.result.pollNotice === STARTGG_PAGE_LIMIT_NOTICE && r.result.cutShort !== true, brief(r, s));
+    const s2 = startggStandIn({ sets: Array.from({ length: 600 }, (_, i) => sgSet(i, 3)), standings: standings8 });
+    const r2 = await run(s2, EV, { maxItems: 20, topN: 16 });
+    check('row 8.3: with topN in use the same limit holds, with the same pollNotice and no cutShort',
+      !r2.error && s2.sets().length === 10 && r2.result.pollNotice === STARTGG_PAGE_LIMIT_NOTICE && r2.result.cutShort !== true, brief(r2, s2));
+  }
+
+  // The owner's ruling of 2026-11-27: the result records how many standings its first page
+  // asked for (standingsAsked), so the sidecar fetches again when topN is raised above that
+  // (row 4.3). A one-page event of 30 sets, 20 placed: read under topN 0 and under topN 16, it
+  // gives section 6k its two results (8 standings, then 16).
+  let onePage0 = null;
+  let onePage16 = null;
+  {
+    const named = [
+      sgSet(0, 3, 'P1', 'P2'), sgSet(1, 3, 'P9', 'P10'), sgSet(2, 3, 'P11', 'P12'), sgSet(3, 2, 'P13', 'P14'), sgSet(4, 3, 'P15', 'P16'),
+      ...Array.from({ length: 25 }, (_, i) => sgSet(10 + i, 3, `X${i}`, `Y${i}`)),
+    ];
+    const placed = Array.from({ length: 20 }, (_, i) => ({ placement: i + 1, entrant: { id: 700 + i, name: `P${i + 1}` } }));
+    const got = [];
+    let oneRequestEach = true;
+    for (const topN of [0, 3, 16, 100, 150]) {
+      const s = startggStandIn({ sets: named, standings: placed });
+      const r = await run(s, EV, { maxItems: 20, topN });
+      if (s.sets().length !== 1 || r.error || r.result.cutShort === true) oneRequestEach = false;
+      got.push(`${s.sets()[0]?.variables.standingsPerPage}/${r.result?.standingsAsked}/${r.result?.standings?.length}`);
+      if (topN === 0) onePage0 = r.result || null;
+      if (topN === 16) onePage16 = r.result || null;
+    }
+    const others = { early: early?.standingsAsked, topN16: topN16?.standingsAsked, pageLimit: pageLimit?.standingsAsked };
+    check('owner\'s ruling 2026-11-27: the start.gg result records in standingsAsked the standings its first page asked for: topN 0, 3, 16, 100 and 150 on a one-page event (one request each, not cutShort) give 8, 8, 16, 100 and 100 (8, 8, 16, 20 and 20 held); and the field is there on a cutShort result (8), on one read under topN 16 (16) and on one cut at the page limit (8)',
+      oneRequestEach && got.join(',') === '8/8/8,8/8/8,16/16/16,100/100/20,100/100/20'
+        && others.early === 8 && others.topN16 === 16 && others.pageLimit === 8,
+      JSON.stringify({ oneRequestEach, got, others }));
+  }
+
+  // Row 8.4 (decision 11 c): an admin page's address resolves to its event, or its tournament.
+  {
+    const s = startggStandIn({ sets: paged.slice(0, 10), standings: standings8 });
+    const r = await run(s, 'https://www.start.gg/admin/tournament/paging-cup/event/singles/seeding', { maxItems: 20, topN: 0 });
+    check('row 8.4: a start.gg admin page\'s address (…/admin/tournament/<t>/event/<e>/seeding) resolves to its event: the sets are asked for tournament/<t>/event/<e> at once, with no lookup of the tournament\'s events',
+      !r.error && s.requests[0]?.operationName === 'ZipperEventSets' && s.requests[0].variables.slug === 'tournament/paging-cup/event/singles'
+        && !s.requests.some((q) => q.operationName === 'ZipperTournamentEvents') && r.result.tournamentName === 'Paging Cup — Paging Singles',
+      JSON.stringify({ error: r.error?.message, requests: s.requests.map((q) => `${q.operationName} ${q.variables.slug}`) }));
+    const s2 = startggStandIn({ sets: paged.slice(0, 10), standings: standings8, events: [{ id: 77, name: 'Paging Singles', slug: 'tournament/paging-cup/event/singles' }] });
+    const r2 = await run(s2, 'https://www.start.gg/admin/tournament/paging-cup/dashboard', { maxItems: 20, topN: 0 });
+    check('row 8.4: a start.gg admin page of a tournament (…/admin/tournament/<t>/dashboard) resolves to the tournament: its events are looked up (one here), then that event\'s sets',
+      !r2.error && s2.requests[0]?.operationName === 'ZipperTournamentEvents' && s2.requests[0].variables.slug === 'tournament/paging-cup'
+        && s2.requests[1]?.operationName === 'ZipperEventSets' && s2.requests[1].variables.slug === 'tournament/paging-cup/event/singles',
+      JSON.stringify({ error: r2.error?.message, requests: s2.requests.map((q) => `${q.operationName} ${q.variables.slug}`) }));
+  }
+
+  // Row 8.5 (decision 12): several events always stop with "paste a specific event URL".
+  {
+    const fixture = (await loadFixture('startgg-tournament-events.json')).tournament.events;
+    const s = startggStandIn({ sets: paged.slice(0, 10), standings: standings8, events: fixture });
+    const r = await run(s, 'https://www.start.gg/tournament/zipper-major/details', { maxItems: 20, topN: 0 });
+    const msg = r.error?.message || '';
+    check('row 8.5 (decision 12): a tournament URL with two events, one of them Street Fighter 6, stops with "paste a specific event URL", naming both events, and asks for no sets',
+      fixture.length === 2 && fixture.some((e) => Number(e?.videogame?.id) === 43868)
+        && /paste a specific event URL/.test(msg) && msg.includes('Street Fighter 6') && msg.includes('TEKKEN 8') && s.sets().length === 0,
+      JSON.stringify({ error: msg || null, picked: r.result?.tournamentName ?? null, setRequests: s.sets().length }));
+    const sg = await import('./platforms/startgg.js');
+    const choose = sg.chooseStartggEvent;
+    let two = null, none = null, one = null;
+    if (typeof choose === 'function') {
+      try { choose(fixture); } catch (e) { two = e.message; }
+      try { choose([]); } catch (e) { none = e.message; }
+      try { one = choose([fixture[1]]); } catch (e) { one = `threw: ${e.message}`; }
+    }
+    check('row 8.5: the choice of event is a pure exported function (chooseStartggEvent): two events throw "paste a specific event URL", none throws "no events yet", one gives its slug',
+      typeof choose === 'function' && /paste a specific event URL/.test(two || '') && /no events yet/.test(none || '') && one === fixture[1].slug,
+      JSON.stringify({ exported: typeof choose, two, none, one }));
+    const src = readFileSync(resolve(__dirname, 'platforms', 'startgg.js'), 'utf-8');
+    check('row 8.5: the Street Fighter 6 id (SF6_VIDEOGAME_ID, 43868) is gone from platforms/startgg.js: nothing picks an event by its game',
+      !/SF6_VIDEOGAME_ID|43868/.test(src), (/.*(SF6_VIDEOGAME_ID|43868).*/.exec(src) || [''])[0].trim());
+  }
+
+  // Row 8.3: only the variables vary. Every request above sent one of the two query texts
+  // as they were, and no variable beyond the ones each query declares.
+  {
+    const wrong = [];
+    const declared = { ZipperTournamentEvents: ['slug'], ZipperEventSets: ['slug', 'page', 'perPage', 'standingsPerPage'] };
+    for (const q of all) {
+      const want = STARTGG_QUERY_SHA256[q.operationName];
+      const got = createHash('sha256').update(String(q.query ?? '')).digest('hex');
+      if (!want) { wrong.push(`unknown operation ${q.operationName}`); continue; }
+      if (got !== want) wrong.push(`${q.operationName}: its query text changed`);
+      const extra = Object.keys(q.variables).filter((k) => !declared[q.operationName].includes(k));
+      if (extra.length) wrong.push(`${q.operationName}: variables ${extra.join(', ')} not declared by the query`);
+    }
+    check(`row 8.3: the start.gg query texts are the ones that passed the public proxy at 1.0.11 (SHA-256 pinned), and only their declared variables vary (${all.length} requests)`,
+      all.length > 20 && wrong.length === 0, [...new Set(wrong)].join('; '));
+  }
+
+  // The docs say when the page limit's notice appears as the code above gives it (review of
+  // Sprint 8): only when a poll reads all ten pages and more remain, never when paging
+  // stops early with enough completed sets, however big the event.
+  {
+    const flat = (p) => readFileSync(resolve(__dirname, p), 'utf-8').replace(/\s+/g, ' ');
+    const readme = flat('README.md');
+    const protocol = flat(join('docs', 'PROTOCOL.md'));
+    const readmeOk = readme.includes('When a poll reads all 500 and more remain (with **Top N** on, or when those 500 hold fewer finished sets than **Max ticker items**), the control page\'s status line says so')
+      && readme.includes('A poll that stops early because it has enough says nothing') && !readme.includes('for a bigger event the control page\'s status line says so');
+    const protocolOk = protocol.includes('when a poll reads all 10 pages of 50 and more remain: with `topN` on (every page is read), or when those 500 sets hold fewer completed ones than `maxItems`')
+      && protocol.includes('A poll that stops early because it holds `maxItems` completed sets gives none') && !protocol.includes('when an event has more sets than the 10 pages of 50 a poll reads');
+    check('docs (row 8.3, review): the README and PROTOCOL say the page limit\'s notice comes only when a poll reads all 10 pages and more remain (Top N on, or too few finished sets in them), and that a poll that stops early with enough says nothing',
+      readmeOk && protocolOk, JSON.stringify({ readmeOk, protocolOk }));
+    // The owner's ruling of 2026-11-27 in the docs: topN raised above the standings asked for
+    // fetches again, cut short or not, and a stub file may carry standingsAsked.
+    const ruling = {
+      readme: readme.includes('and so does raising **Top N** above the standings asked for, after any poll') && !readme.includes('above the standings read'),
+      pushes: protocol.includes('when `topN` is raised above the standings its platform asked for (`standingsAsked`'),
+      stub: protocol.includes('`"standingsAsked"` the standings its adapter asked for'),
+      oldRule: !protocol.includes('When that result was cut short by its platform (`cutShort`) and the change asks for more than it held (a higher `maxItems`, or `topN` switched on), the sidecar also fetches again.'),
+    };
+    check('docs (owner\'s ruling 2026-11-27): the README and PROTOCOL say a Top N raised above the standings a result asked for fetches again (cut short or not), and that a stub file may carry standingsAsked',
+      Object.values(ruling).every(Boolean), JSON.stringify(ruling));
+    // Two sentences a gate found untrue, and one comment: a setUrl to the URL already set (once
+    // normalised) leaves pollNotice and pushes nothing, and a re-measure under the
+    // announcement bar keeps the crawl's place.
+    const flatSrc = (p) => flat(p).replace(/ ?\/\/ ?/g, ' ');
+    const index = flatSrc(join('platforms', 'index.js'));
+    const sidecarSrc = flatSrc('zipper-sidecar.mjs');
+    const overlaySrc = flatSrc(join('overlay', 'ticker.js'));
+    const words = {
+      index: index.includes('until the next good poll or a setUrl that changes the URL') && !/until the next good poll or setUrl/.test(index),
+      sidecar: sidecarSrc.includes('pollNotice until the next good poll or a setUrl that changes the URL'),
+      protocol: !protocol.includes('(`setUrl` with a value other than the one set)') && protocol.includes('a `setUrl` whose value, once trimmed and given `https://` when it is a site\'s address sent without a scheme')
+        && protocol.includes('(a bare `blko42` is left as it is)') && !protocol.includes('given `https://` when it has no scheme'),
+      overlay: !overlaySrc.includes('(at once, from offset 0, while hidden)'),
+    };
+    check('docs (review): platforms/index.js and the sidecar\'s header say pollNotice lasts until the next good poll or a setUrl that changes the URL; PROTOCOL\'s "A new URL" is a setUrl whose value, normalised, differs from the URL set; overlay/ticker.js no longer says a re-measure while hidden starts from offset 0',
+      Object.values(words).every(Boolean), JSON.stringify(words));
+  }
+
+  adapterResults = { early, pageLimit, topN16, onePage0, onePage16 };
 }
 
 // ── 2c. The sidecar's send queue and milestone rule, in-process (ZIP-11, ZIP-16) ─
@@ -2255,7 +2686,7 @@ const sidecars = [];
 // too, so no test sidecar ever holds a real key; a check that needs one passes a fake.
 // With expectExit, the sidecar is meant to end by itself (a crash, a second launch).
 const SHELL_ENV_DROPPED = ['ZIPPER_ALLOW_STUB', 'ZIPPER_REQUEST_TIMEOUT_MS', 'ZIPPER_POLL_DEADLINE_MS', 'ZIPPER_MIN_POLL_GAP_MS', 'ZIPPER_PUSH_RETRY_MS', 'ZIPPER_TEST_CLOCK_STEP_FILE',
-  'ZIPPER_SE_BASE', 'ZIPPER_TEST_FAKE_FETCH_FILE', 'ZIPPER_TEST_CRASH_FILE', 'ZIPPER_TEST_CRASH_AT', 'CHALLONGE_API_KEY', 'STARTGG_API_KEY'];
+  'ZIPPER_SE_BASE', 'ZIPPER_TEST_FAKE_FETCH_FILE', 'ZIPPER_TEST_FAKE_FETCH_LOG', 'ZIPPER_TEST_CRASH_FILE', 'ZIPPER_TEST_CRASH_AT', 'CHALLONGE_API_KEY', 'STARTGG_API_KEY'];
 function startSidecar(label, env, { allowStub = true, nodeArgs = [], expectExit = false } = {}) {
   const sc = { label, out: '', err: '', stopping: false, exited: false, code: null };
   const base = { ...process.env };
@@ -2591,6 +3022,7 @@ async function testSidecar() {
   await testStubAtTheRead(client);
   await testPollLoop(client);
   await testPushes();
+  await testAdapterResults();
   await testConfigSafety();
 
   client.ws.close();
@@ -5128,6 +5560,405 @@ async function testPushes() {
   }
 }
 
+// ── 6k. The adapters' results through the sidecar (ZIP-20; rows 8.3 and 8.4) ────
+// Its own sidecar, with tools/fake-fetch-preload.cjs in place of fetch in "fail" mode
+// (every request fails at once, naming its host), so a real platform's URL set here
+// reaches no site. The start.gg results section 2e had the real adapter give are written
+// as stub fixtures, so this sidecar takes what the adapter gives (decision 9: no base-URL
+// override for the tournament adapters).
+
+async function testAdapterResults() {
+  console.log('\n[6k] the adapters\' results through the sidecar: pollNotice, the cut-short flag, topN with 16 standings, and addresses pasted without https:// or from an admin page');
+  const statusOf = (d) => (isStatus(d) ? parseStatus(d) : null);
+  const T = (name) => `stub:${TMP_REL}/${name}`;
+  const fixture = (name, body) => writeFile(join(TMP_DIR, name), JSON.stringify(body), 'utf-8');
+  const cfgPath = join(TMP_DIR, 'config-adapters.json');
+  const modeFile = join(TMP_DIR, 'fetch-mode-6k');
+  writeFileSync(modeFile, 'fail');
+  // Each request the fake fetch answers, one JSON line (host, operationName, variables).
+  const fetchLog = join(TMP_DIR, 'fetch-log-6k.jsonl');
+  writeFileSync(fetchLog, '');
+  const fetched = () => { try { return readFileSync(fetchLog, 'utf-8').split('\n').filter(Boolean).map((l) => JSON.parse(l)); } catch { return []; } };
+  await writeFile(cfgPath, JSON.stringify({ tournamentUrl: null, autoStart: false, autoSchedule: false, pollIntervalMs: 15000, maxItems: 20, topN: 0, caps: { text: '', logo: '' } }), 'utf-8');
+  const client = await busClient();
+  const at0 = client.events.length;
+  const sc = startSidecar('adapters sidecar [6k]', { ZIPPER_CONFIG: cfgPath, ZIPPER_GUARD_PORT: String(GUARD_PORT), ZIPPER_MIN_POLL_GAP_MS: '200', ZIPPER_TEST_FAKE_FETCH_FILE: modeFile, ZIPPER_TEST_FAKE_FETCH_LOG: fetchLog },
+    { nodeArgs: ['--require', PRELOAD_FAKE_FETCH] });
+  const since = sinceOn(client, sc);
+  const mark = () => client.events.length;
+  const cmd = (command, value) => client.ws.send(JSON.stringify({ request: 'DoAction', id: 'k', action: { name: 'Ticker Command' }, args: { command, value: value ?? '' } }));
+  const statusAfter = async (command, value, pred = () => true, timeoutMs = 4000) => {
+    const at = mark();
+    cmd(command, value);
+    return statusOf(await since(at, (d) => !!statusOf(d) && pred(statusOf(d)), timeoutMs));
+  };
+  // The status that closes the next poll or fetch: one with a lastPollAt other than `before`.
+  const closed = (at, before, pred = () => true, timeoutMs = 6000) =>
+    since(at, (d) => !!statusOf(d)?.lastPollAt && statusOf(d).lastPollAt !== before && pred(statusOf(d)), timeoutMs).then(statusOf);
+  const updatesSince = (at) => client.events.slice(at).filter(isUpdate);
+  const settle = () => statusAfter('status');
+  // Sets the URL and polls it once (start, then stop once the poll has closed). Gives the
+  // update that poll pushed (by its URL and name) and the status that closed it.
+  const pollOnceFor = async (url, name) => {
+    const s = await statusAfter('setUrl', url, (x) => x.url === url);
+    const at = mark();
+    cmd('start');
+    const update = await since(at, (d) => isUpdate(d) && d.tournament?.url === url && d.tournament?.name === name);
+    const status = await closed(at, s?.lastPollAt);
+    await statusAfter('stop', '', (x) => x.polling === false);
+    return { update, status };
+  };
+  const SG_NAME = 'Paging Cup — Paging Singles';
+
+  try {
+    const first = statusOf(await since(at0, isStatus, 8000));
+    check('6k: the adapters sidecar starts (fetch replaced by the fake, in "fail" mode) and its first status has pollNotice ""',
+      first?.pollNotice === '', JSON.stringify({ started: !!first, pollNotice: first?.pollNotice }));
+
+    // "Status messages": pollNotice, set or cleared by every good poll; setUrl clears it; a
+    // failed poll and a command leave it.
+    {
+      const NOTICE = 'start.gg: this event has more than 500 sets; only the 500 most recent were read';
+      await fixture('notice.json', { ...threeMatches('Notice Cup'), pollNotice: NOTICE });
+      const n1 = await pollOnceFor(T('notice.json'), 'Notice Cup');
+      check('row 8.3 (Status messages): a good poll whose result carries pollNotice puts it in the status as it came, with lastError ""',
+        n1.status?.pollNotice === NOTICE && n1.status.lastError === '', JSON.stringify({ pollNotice: n1.status?.pollNotice, lastError: n1.status?.lastError }));
+      const afterCmd = await statusAfter('setCapsText', '@Notice', (x) => x.caps?.text === '@Notice');
+      await fixture('notice.json', { ...threeMatches('Notice Cup'), pollNotice: NOTICE, stubFail: { status: 500 } });
+      const s0 = await settle();
+      const failed = await statusAfter('pollNow', '', (x) => !!x.lastError && x.lastPollAt !== s0?.lastPollAt, 6000);
+      await statusAfter('stop', '', (x) => x.polling === false);
+      check('row 8.3 (Status messages): a command and a failed poll leave pollNotice as it was (only a good poll or setUrl changes it); the failure goes to lastError',
+        afterCmd?.pollNotice === NOTICE && failed?.pollNotice === NOTICE && failed.lastError === 'stub: the test file answered as HTTP 500',
+        JSON.stringify({ afterCmd: afterCmd?.pollNotice, failed: failed?.pollNotice, lastError: failed?.lastError }));
+      await fixture('notice.json', threeMatches('Notice Cup'));
+      const s1 = await settle();
+      const good = await statusAfter('pollNow', '', (x) => !!x.lastPollAt && x.lastPollAt !== s1?.lastPollAt && x.lastError === '', 6000);
+      await statusAfter('stop', '', (x) => x.polling === false);
+      check('row 8.3 (Status messages): the next good poll whose result has no pollNotice clears it (""); it never counted as an error',
+        good?.pollNotice === '' && good.lastError === '', JSON.stringify({ pollNotice: good?.pollNotice, lastError: good?.lastError }));
+      await fixture('notice.json', { ...threeMatches('Notice Cup'), pollNotice: NOTICE });
+      const s2 = await settle();
+      const again = await statusAfter('pollNow', '', (x) => !!x.lastPollAt && x.lastPollAt !== s2?.lastPollAt, 6000);
+      await statusAfter('stop', '', (x) => x.polling === false);
+      // A setUrl that does not change the URL leaves pollNotice (review of Sprint 8): it is
+      // still about the URL's last good poll. Nothing is pushed (polling is off).
+      let at = mark();
+      const unchanged = await statusAfter('setUrl', T('notice.json'), (x) => x.url === T('notice.json'));
+      await sleep(300);
+      await settle();
+      check('row 8.3 (review): a setUrl that does not change the URL leaves pollNotice as it was, and pushes nothing',
+        again?.pollNotice === NOTICE && unchanged?.pollNotice === NOTICE && updatesSince(at).length === 0,
+        JSON.stringify({ before: again?.pollNotice, after: unchanged?.pollNotice, pushed: updatesSince(at).length }));
+      // A good fetch whose result cannot be built (a standing that is not an object) fails
+      // its poll, and leaves pollNotice as the last good poll set it: the notice is taken
+      // only once the payload has built (review of Sprint 8).
+      await fixture('notice.json', { ...threeMatches('Notice Cup Bad'), standings: [null, { placement: 1, name: 'Ann' }], pollNotice: 'a notice from a result that does not build' });
+      const s3 = await settle();
+      const unbuilt = await statusAfter('pollNow', '', (x) => !!x.lastError && !!x.lastPollAt && x.lastPollAt !== s3?.lastPollAt, 6000);
+      await statusAfter('stop', '', (x) => x.polling === false);
+      check('row 8.3 (review): a poll whose result cannot be built fails (lastError) and leaves pollNotice as the last good poll set it, not the failed result\'s',
+        !!unbuilt?.lastError && unbuilt.lastError !== 'stub: the test file answered as HTTP 500' && unbuilt.pollNotice === NOTICE,
+        JSON.stringify({ lastError: unbuilt?.lastError ?? null, pollNotice: unbuilt?.pollNotice ?? null }));
+      await fixture('quiet.json', threeMatches('Quiet Cup'));
+      const cleared = await statusAfter('setUrl', T('quiet.json'), (x) => x.url === T('quiet.json'));
+      check('row 8.3 (Status messages): setUrl clears pollNotice', again?.pollNotice === NOTICE && cleared?.pollNotice === '',
+        JSON.stringify({ before: again?.pollNotice, afterSetUrl: cleared?.pollNotice }));
+      await statusAfter('setCapsText', '', (x) => x.caps?.text === '');
+    }
+
+    // The page limit, through the real adapter's result: pollNotice, and no cutShort, so a
+    // rise in maxItems is rebuilt from what is kept and not fetched again.
+    if (!adapterResults?.pageLimit || !adapterResults?.early || !adapterResults?.topN16 || !adapterResults?.onePage0 || !adapterResults?.onePage16) {
+      check('6k: section 2e left the start.gg adapter\'s five results (early stop, page limit, topN 16, one page under topN 0 and 16)', false, JSON.stringify(Object.keys(adapterResults || {})));
+    } else {
+      await fixture('sg-limit.json', adapterResults.pageLimit);
+      await statusAfter('setMaxItems', '20', (x) => x.maxItems === 20);
+      const pl = await pollOnceFor(T('sg-limit.json'), SG_NAME);
+      check(`row 8.3 (ZIP-20): the adapter's result for an event past the page limit reaches the status as pollNotice ("${STARTGG_PAGE_LIMIT_NOTICE}"), with lastError ""`,
+        pl.status?.pollNotice === STARTGG_PAGE_LIMIT_NOTICE && pl.status.lastError === '' && pl.update?.matches?.length === 20,
+        JSON.stringify({ pollNotice: pl.status?.pollNotice, lastError: pl.status?.lastError, pushed: pl.update?.matches?.length ?? null }));
+      let at = mark();
+      cmd('setMaxItems', '30');
+      const rebuilt = await since(at, (d) => isUpdate(d) && d.tournament?.url === T('sg-limit.json') && d.matches?.length === 30, 2000);
+      await sleep(600);
+      const after = await settle();
+      check('row 8.3: a result cut at the page limit carries no cutShort, so a setMaxItems rise is rebuilt from what is kept (30 pushed) and not fetched again (lastPollAt unchanged)',
+        !!pl.status?.lastPollAt && !!rebuilt && after?.lastPollAt === pl.status.lastPollAt,
+        JSON.stringify({ rebuilt: !!rebuilt, lastPollAt: [pl.status?.lastPollAt, after?.lastPollAt] }));
+      // The owner's ruling of 2026-11-27: the same result asked for 8 standings, so topN 16
+      // fetches it again (more standings can be had), page limit or not. The stub answers
+      // as before (standingsAsked 8): the result now kept was fetched under topN 16, so it is
+      // not fetched again and again (no second fetch while the gap, 200 ms here, passes 4 times).
+      at = mark();
+      cmd('setTopN', '16');
+      const plAgain = await closed(at, after?.lastPollAt, () => true, 3000);
+      await sleep(800);
+      const plAfter = await settle();
+      check('owner\'s ruling 2026-11-27: a result cut at the page limit (pollNotice, no cutShort) that asked for 8 standings is fetched again when setTopN 16 asks for more, polling off (polling stays off); a result that comes back still holding 8, fetched under topN 16, is not fetched again after that',
+        !!after?.lastPollAt && !!plAgain && plAgain.polling === false && plAgain.lastError === '' && plAfter?.lastPollAt === plAgain.lastPollAt,
+        JSON.stringify({ refetched: !!plAgain, polling: plAgain?.polling ?? null, lastPollAt: [after?.lastPollAt, plAgain?.lastPollAt, plAfter?.lastPollAt] }));
+
+      // The early stop, through the real adapter's result (cutShort, read under maxItems 20).
+      await fixture('sg-early.json', adapterResults.early);
+      await statusAfter('setOptions', JSON.stringify({ intervalMs: 15000, maxItems: 20, topN: 0 }), (x) => x.maxItems === 20 && x.topN === 0);
+      const e = await pollOnceFor(T('sg-early.json'), SG_NAME);
+      at = mark();
+      cmd('setMaxItems', '30');
+      const refetched = await closed(at, e.status?.lastPollAt, () => true, 3000);
+      check('row 8.3 → row 4.3: the adapter\'s early-stop result (cutShort, read under maxItems 20) is fetched again when setMaxItems rises to 30, polling off (polling stays off)',
+        e.update?.matches?.length === 20 && !!refetched && refetched.polling === false,
+        JSON.stringify({ pushed: e.update?.matches?.length ?? null, refetched: !!refetched }));
+      await statusAfter('setMaxItems', '20', (x) => x.maxItems === 20);
+      const before = (await settle())?.lastPollAt;
+      at = mark();
+      cmd('setTopN', '1');
+      const refetched2 = await closed(at, before, () => true, 3000);
+      check('row 8.3 → row 4.3: and when topN is switched on after it', !!before && !!refetched2 && refetched2.polling === false,
+        JSON.stringify({ refetched: !!refetched2 }));
+
+      // topN 16, through the real adapter's result (it asked for 16 standings).
+      await fixture('sg-top16.json', adapterResults.topN16);
+      await statusAfter('setOptions', JSON.stringify({ intervalMs: 15000, maxItems: 20, topN: 16 }), (x) => x.maxItems === 20 && x.topN === 16);
+      const t = await pollOnceFor(T('sg-top16.json'), SG_NAME);
+      const pairs = (t.update?.matches || []).map((m) => `${m.p1?.name}-${m.p2?.name}`);
+      const want = ['P1-P2', 'P9-P10', 'P11-P12', 'P13-P14', 'P15-P16'];
+      check('row 8.3: topN 16, with the 16 standings the adapter now asks for, keeps the matches of the players placed 9 to 16 (and 1 to 2), and no one else\'s',
+        want.every((p) => pairs.includes(p)) && pairs.length === want.length && t.update?.standings?.length === 16,
+        JSON.stringify({ pairs, standings: t.update?.standings?.length ?? null }));
+      await statusAfter('setOptions', JSON.stringify({ intervalMs: 15000, maxItems: 20, topN: 0 }), (x) => x.maxItems === 20 && x.topN === 0);
+
+      // The owner's ruling of 2026-11-27: topN raised above the standings a kept start.gg
+      // result asked for (standingsAsked) fetches again at once, polling or not, cut short or
+      // not; lowered, or within what it asked for, it does not. The stub file is the real
+      // adapter's result for a one-page event (section 2e): under topN 0 it holds 8 of the 20
+      // placed; before a fetch that should come, it is replaced by the adapter's result under
+      // topN 16 (16 placed), as the site would answer that fetch.
+      const pairsOf = (u) => (u?.matches || []).map((m) => `${m.p1?.name}-${m.p2?.name}`);
+      const placedOf = (u) => (u?.standings || []).map((s) => s.name);
+      {
+        await fixture('sg-one.json', adapterResults.onePage0);
+        const o = await pollOnceFor(T('sg-one.json'), SG_NAME);
+        await fixture('sg-one.json', adapterResults.onePage16);
+        at = mark();
+        cmd('setTopN', '16');
+        const refetched3 = await closed(at, o.status?.lastPollAt, () => true, 3000);
+        await sleep(300);
+        const ups = updatesSince(at).filter((d) => d.tournament?.url === T('sg-one.json'));
+        const rebuiltPairs = pairsOf(ups[0]);
+        const lastPairs = pairsOf(ups[ups.length - 1]);
+        const lastPlaced = placedOf(ups[ups.length - 1]);
+        check('owner\'s ruling 2026-11-27: a start.gg result of one page (not cutShort) read under topN 0 (8 standings asked for) is fetched again when setTopN 16 asks for more, polling off (polling stays off): the rebuild from what is kept shows only P1-P2 (the 8 it holds), and the fetch brings the matches of the players placed 9 to 16, with 16 standings',
+          o.update?.standings?.length === 8 && adapterResults.onePage0.cutShort !== true && !!refetched3 && refetched3.polling === false && refetched3.lastError === ''
+            && rebuiltPairs.join(',') === 'P1-P2' && want.every((p) => lastPairs.includes(p)) && lastPairs.length === want.length
+            && lastPlaced.length === 16 && lastPlaced[15] === 'P16',
+          JSON.stringify({ firstStandings: o.update?.standings?.length ?? null, refetched: !!refetched3, polling: refetched3?.polling ?? null, rebuiltPairs, lastPairs, lastPlaced: lastPlaced.length }));
+      }
+      // 8 to 16: a result read under topN 8 (8 standings asked for) is fetched again.
+      {
+        await statusAfter('setOptions', JSON.stringify({ intervalMs: 15000, maxItems: 20, topN: 8 }), (x) => x.maxItems === 20 && x.topN === 8);
+        await fixture('sg-one8.json', adapterResults.onePage0);
+        const o = await pollOnceFor(T('sg-one8.json'), SG_NAME);
+        await fixture('sg-one8.json', adapterResults.onePage16);
+        at = mark();
+        cmd('setTopN', '16');
+        const refetched4 = await closed(at, o.status?.lastPollAt, () => true, 3000);
+        await sleep(300);
+        const ups = updatesSince(at).filter((d) => d.tournament?.url === T('sg-one8.json'));
+        check('owner\'s ruling 2026-11-27: topN raised from 8 to 16 over a result that asked for 8 standings fetches again (polling off, and it stays off), and the strip then shows the matches of the players placed 9 to 16',
+          !!o.status?.lastPollAt && !!refetched4 && refetched4.polling === false && pairsOf(ups[ups.length - 1]).includes('P15-P16'),
+          JSON.stringify({ refetched: !!refetched4, polling: refetched4?.polling ?? null, lastPairs: pairsOf(ups[ups.length - 1]) }));
+        // 16 to 8: lowered, nothing to fetch; the strip is rebuilt from what is kept.
+        const before16 = (await settle())?.lastPollAt;
+        at = mark();
+        cmd('setTopN', '8');
+        const rebuilt8 = await since(at, (d) => isUpdate(d) && d.tournament?.url === T('sg-one8.json') && pairsOf(d).join(',') === 'P1-P2', 2000);
+        await sleep(800);
+        const after8 = await settle();
+        check('owner\'s ruling 2026-11-27: topN lowered from 16 to 8 over a result that asked for 16 standings is rebuilt from what is kept (only P1-P2) and not fetched again (lastPollAt unchanged)',
+          !!before16 && !!rebuilt8 && after8?.lastPollAt === before16 && after8.topN === 8,
+          JSON.stringify({ rebuilt: !!rebuilt8, lastPollAt: [before16 ?? null, after8?.lastPollAt ?? null] }));
+      }
+      // Within what it asked for: a result that asked for 16 standings, read under topN 0
+      // (a stub file that says so), is not fetched again when setTopN 12 switches topN on.
+      {
+        await statusAfter('setOptions', JSON.stringify({ intervalMs: 15000, maxItems: 20, topN: 0 }), (x) => x.maxItems === 20 && x.topN === 0);
+        await fixture('sg-asked16.json', adapterResults.onePage16);
+        const o = await pollOnceFor(T('sg-asked16.json'), SG_NAME);
+        at = mark();
+        cmd('setTopN', '12');
+        const rebuilt12 = await since(at, (d) => isUpdate(d) && d.tournament?.url === T('sg-asked16.json') && pairsOf(d).includes('P11-P12') && !pairsOf(d).includes('P13-P14'), 2000);
+        await sleep(800);
+        const after12 = await settle();
+        check('owner\'s ruling 2026-11-27: a result that asked for 16 standings (standingsAsked 16, not cutShort), read under topN 0, is rebuilt when setTopN 12 switches topN on (the matches of the 12 placed first) and not fetched again (lastPollAt unchanged)',
+          adapterResults.onePage16.standingsAsked === 16 && !!o.status?.lastPollAt && !!rebuilt12 && after12?.lastPollAt === o.status.lastPollAt && after12.topN === 12,
+          JSON.stringify({ rebuilt: !!rebuilt12, lastPollAt: [o.status?.lastPollAt ?? null, after12?.lastPollAt ?? null] }));
+      }
+      // The edge (a gate's finding): topN raised to exactly the standings asked for (0 to 8
+      // over a result that asked for 8) is within them, so nothing is fetched.
+      {
+        await statusAfter('setOptions', JSON.stringify({ intervalMs: 15000, maxItems: 20, topN: 0 }), (x) => x.maxItems === 20 && x.topN === 0);
+        await fixture('sg-edge8.json', adapterResults.onePage0);
+        const o = await pollOnceFor(T('sg-edge8.json'), SG_NAME);
+        const set8 = await statusAfter('setTopN', '8', (x) => x.topN === 8);
+        await sleep(800);
+        const after8 = await settle();
+        check('owner\'s ruling 2026-11-27 (gate): topN raised to exactly the standings a result asked for (0 to 8, standingsAsked 8) is not fetched again (lastPollAt unchanged)',
+          adapterResults.onePage0.standingsAsked === 8 && typeof o.status?.lastPollAt === 'string' && set8?.topN === 8 && after8?.topN === 8 && after8.lastPollAt === o.status.lastPollAt,
+          JSON.stringify({ asked: adapterResults.onePage0.standingsAsked ?? null, lastPollAt: [o.status?.lastPollAt ?? null, after8?.lastPollAt ?? null] }));
+      }
+      // A stub file whose standingsAsked is not a number (null here) has no such figure:
+      // topN switched on over it fetches nothing (a gate's finding).
+      {
+        await statusAfter('setOptions', JSON.stringify({ intervalMs: 15000, maxItems: 20, topN: 0 }), (x) => x.maxItems === 20 && x.topN === 0);
+        await fixture('sg-asknull.json', { ...adapterResults.onePage0, standingsAsked: null });
+        const o = await pollOnceFor(T('sg-asknull.json'), SG_NAME);
+        const set12 = await statusAfter('setTopN', '12', (x) => x.topN === 12);
+        await sleep(800);
+        const after12 = await settle();
+        check('owner\'s ruling 2026-11-27 (gate): a stub result whose standingsAsked is null (not a number) is not fetched again when setTopN 12 switches topN on (lastPollAt unchanged)',
+          adapterResults.onePage0.cutShort !== true && typeof o.status?.lastPollAt === 'string' && set12?.topN === 12 && after12?.topN === 12 && after12.lastPollAt === o.status.lastPollAt,
+          JSON.stringify({ lastPollAt: [o.status?.lastPollAt ?? null, after12?.lastPollAt ?? null] }));
+      }
+      // The control page's Apply sends setOptions: topN raised there over a result that
+      // asked for 8 standings fetches again too.
+      {
+        await statusAfter('setOptions', JSON.stringify({ intervalMs: 15000, maxItems: 20, topN: 0 }), (x) => x.maxItems === 20 && x.topN === 0);
+        await fixture('sg-opts.json', adapterResults.onePage0);
+        const o = await pollOnceFor(T('sg-opts.json'), SG_NAME);
+        await fixture('sg-opts.json', adapterResults.onePage16);
+        at = mark();
+        cmd('setOptions', JSON.stringify({ intervalMs: 15000, maxItems: 20, topN: 16 }));
+        const refetched5 = await closed(at, o.status?.lastPollAt, () => true, 3000);
+        check('owner\'s ruling 2026-11-27: setOptions (the control page\'s Apply) raising topN from 0 to 16 over a result that asked for 8 standings fetches again too, polling off (polling stays off)',
+          !!o.status?.lastPollAt && !!refetched5 && refetched5.polling === false && refetched5.topN === 16,
+          JSON.stringify({ refetched: !!refetched5, polling: refetched5?.polling ?? null }));
+      }
+      await statusAfter('setOptions', JSON.stringify({ intervalMs: 15000, maxItems: 20, topN: 0 }), (x) => x.maxItems === 20 && x.topN === 0);
+    }
+
+    // Row 8.4 (decision 11 d): an address pasted without https:// is given it in setUrl,
+    // before the platform is detected. Polled here, the fake fetch names the host asked.
+    {
+      const bare = 'challonge.com/zk8cup';
+      const full = 'https://challonge.com/zk8cup';
+      const set = await statusAfter('setUrl', bare, (x) => x.url === full || x.url === bare);
+      check('row 8.4 (decision 11 d): setUrl with an address pasted without https:// stores it with https:// (the status\'s url), and the platform is Challonge',
+        set?.url === full && set.platform === 'challonge', JSON.stringify({ url: set?.url, platform: set?.platform }));
+      const polled = await statusAfter('pollNow', '', (x) => !!x.lastError, 6000);
+      await statusAfter('stop', '', (x) => x.polling === false);
+      check('row 8.4: a poll of it goes to Challonge\'s embed page (the fake fetch fails it, naming challonge.com), not "Unrecognized tournament URL"',
+        polled?.lastError === 'challonge.com: the request failed (ZIPPER_FAKE_FETCH)', JSON.stringify({ lastError: polled?.lastError }));
+      const at = mark();
+      const same = await statusAfter('setUrl', full, (x) => x.url === full);
+      await sleep(300);
+      await settle();
+      check('row 8.4: the same address typed with https:// afterwards is the URL already set: no blank payload is pushed',
+        !!same && updatesSince(at).length === 0, JSON.stringify({ pushed: updatesSince(at).length }));
+      // ...and so is the address sent again as it was first typed, bare or with spaces
+      // around it (a second Set click before the box settles, or a Stream Deck button): it
+      // is given https:// before the comparison, so nothing is blanked and the last poll's
+      // lastError stays (review of Sprint 8).
+      const atBare = mark();
+      const sameBare = await statusAfter('setUrl', bare, (x) => x.url === full);
+      const sameSpaced = await statusAfter('setUrl', ` ${bare} `, (x) => x.url === full);
+      await sleep(300);
+      const afterBare = await settle();
+      check('row 8.4 (review): the same address sent again without https://, bare or with spaces around it, is the URL already set: no blank payload is pushed, the status url stays https://challonge.com/zk8cup, and lastError is kept',
+        sameBare?.url === full && sameSpaced?.url === full && afterBare?.url === full && updatesSince(atBare).length === 0
+          && !!polled?.lastError && afterBare.lastError === polled.lastError,
+        JSON.stringify({ pushed: updatesSince(atBare).length, url: afterBare?.url ?? null, lastError: afterBare?.lastError ?? null }));
+
+      // Row 8.4 (decision 11 c): a start.gg admin page's address is kept as set, and polled
+      // as its event.
+      const admin = 'https://www.start.gg/admin/tournament/zk8cup/event/singles/seeding';
+      await statusAfter('setUrl', admin, (x) => x.url === admin);
+      const sg = await statusAfter('pollNow', '', (x) => !!x.lastError, 6000);
+      await statusAfter('stop', '', (x) => x.polling === false);
+      check('row 8.4 (decision 11 c): a start.gg admin page\'s address is kept as set and polled: the request goes to start.gg (the fake fetch names www.start.gg), not "could not parse a tournament id"',
+        sg?.lastError === 'www.start.gg: the request failed (ZIPPER_FAKE_FETCH)' && sg.platform === 'startgg' && sg.url === admin,
+        JSON.stringify({ lastError: sg?.lastError, platform: sg?.platform, url: sg?.url }));
+      await statusAfter('setUrl', '', (x) => x.url === null);
+    }
+
+    // The seam (review of Sprint 8): the sidecar hands the real start.gg adapter the
+    // maxItems and topN its poll is made with. The fake fetch answers every request with
+    // one page as the public proxy gives it ([{ data }]): 50 sets, 30 of them completed,
+    // and totalPages 3 (later pages repeat the same sets, which the adapter drops). Its
+    // log gives the variables of each request.
+    {
+      const pageFile = join(TMP_DIR, 'sg-seam-page.json');
+      const sets = [...Array.from({ length: 30 }, (_, i) => sgSet(i, 3)), ...Array.from({ length: 20 }, (_, i) => sgSet(30 + i, 1))];
+      const standings = Array.from({ length: 20 }, (_, i) => ({ placement: i + 1, entrant: { id: 600 + i, name: `Q${i + 1}` } }));
+      writeFileSync(pageFile, JSON.stringify([{ data: { event: {
+        id: 78, name: 'Seam Singles', state: 'ACTIVE', startAt: null, tournament: { name: 'Seam Cup' },
+        standings: { nodes: standings }, sets: { nodes: sets, pageInfo: { page: 1, total: 150, perPage: 50, totalPages: 3 } },
+      } } }]));
+      writeFileSync(modeFile, `json:${pageFile}`);
+      const seamUrl = 'https://www.start.gg/tournament/zk8seam/event/singles';
+      const asked = (from) => fetched().slice(from).filter((q) => q.operationName === 'ZipperEventSets').map((q) => `${q.variables?.page}:${q.variables?.standingsPerPage}`).join(',');
+      await statusAfter('setOptions', JSON.stringify({ intervalMs: 15000, maxItems: 20, topN: 0 }), (x) => x.maxItems === 20 && x.topN === 0);
+      let from = fetched().length;
+      const p = await pollOnceFor(seamUrl, 'Seam Cup — Seam Singles');
+      const first = asked(from);
+      // maxItems: the poll under maxItems 20 stops after page 1 (cutShort), so a rise to 40
+      // fetches again; that re-fetch reads the three pages.
+      from = fetched().length;
+      let at = mark();
+      cmd('setMaxItems', '40');
+      const refetched = await closed(at, p.status?.lastPollAt, () => true, 3000);
+      const second = asked(from);
+      check('review (row 8.3, seam): the sidecar gives the start.gg adapter its poll\'s maxItems: under maxItems 20 one page is asked for (page 1, 8 standings) and the result is cut short, so setMaxItems 40 fetches again (pages 1 to 3, standings on the first only), polling off',
+        p.status?.lastError === '' && first === '1:8' && !!refetched && refetched.lastError === '' && refetched.polling === false && second === '1:8,2:1,3:1',
+        JSON.stringify({ lastError: p.status?.lastError ?? null, first, refetched: !!refetched, second }));
+      // topN: a poll under maxItems 20 and topN 0 (cut short again), then setTopN 16, which
+      // fetches again with 16 standings asked for on the first page, and every page read.
+      await statusAfter('setMaxItems', '20', (x) => x.maxItems === 20);
+      const s3 = await settle();
+      from = fetched().length;
+      const again = await statusAfter('pollNow', '', (x) => !!x.lastPollAt && x.lastPollAt !== s3?.lastPollAt, 6000);
+      await statusAfter('stop', '', (x) => x.polling === false);
+      const third = asked(from);
+      from = fetched().length;
+      at = mark();
+      cmd('setTopN', '16');
+      const refetched2 = await closed(at, again?.lastPollAt, () => true, 3000);
+      const fourth = asked(from);
+      check('review (row 8.3, seam): the sidecar gives the start.gg adapter its poll\'s topN: after a poll under topN 0 (page 1, 8 standings), setTopN 16 fetches again asking for 16 standings on the first page, and reads every page',
+        third === '1:8' && !!refetched2 && refetched2.lastError === '' && fourth === '1:16,2:1,3:1',
+        JSON.stringify({ third, refetched: !!refetched2, fourth }));
+      // The owner's ruling of 2026-11-27, through the real adapter: an event of one page
+      // (totalPages 1), so its result is never cut short. Read under topN 0 it asked for 8
+      // standings; setTopN 16 fetches again, asking for 16.
+      const onePageFile = join(TMP_DIR, 'sg-seam-one.json');
+      writeFileSync(onePageFile, JSON.stringify([{ data: { event: {
+        id: 79, name: 'Seam Doubles', state: 'ACTIVE', startAt: null, tournament: { name: 'Seam Cup' },
+        standings: { nodes: standings }, sets: { nodes: sets, pageInfo: { page: 1, total: 50, perPage: 50, totalPages: 1 } },
+      } } }]));
+      writeFileSync(modeFile, `json:${onePageFile}`);
+      await statusAfter('setOptions', JSON.stringify({ intervalMs: 15000, maxItems: 20, topN: 0 }), (x) => x.maxItems === 20 && x.topN === 0);
+      from = fetched().length;
+      const one = await pollOnceFor('https://www.start.gg/tournament/zk8seam/event/doubles', 'Seam Cup — Seam Doubles');
+      const fifth = asked(from);
+      from = fetched().length;
+      at = mark();
+      cmd('setTopN', '16');
+      const refetched6 = await closed(at, one.status?.lastPollAt, () => true, 3000);
+      const sixth = asked(from);
+      check('owner\'s ruling 2026-11-27 (seam): through the real start.gg adapter, a one-page event read under topN 0 (one request, 8 standings asked for, so not cut short) is fetched again when setTopN 16 asks for more: one request asking for 16, polling off',
+        one.status?.lastError === '' && fifth === '1:8' && !!refetched6 && refetched6.lastError === '' && refetched6.polling === false && sixth === '1:16',
+        JSON.stringify({ lastError: one.status?.lastError ?? null, fifth, refetched: !!refetched6, sixth }));
+      writeFileSync(modeFile, 'fail');
+      await statusAfter('setOptions', JSON.stringify({ intervalMs: 15000, maxItems: 20, topN: 0 }), (x) => x.maxItems === 20 && x.topN === 0);
+      await statusAfter('setUrl', '', (x) => x.url === null);
+    }
+  } finally {
+    await sc.stop();
+    try { client.ws.close(); } catch {}
+    await rm(cfgPath, { force: true });
+  }
+}
+
 // ── 6j. Config safety, keys and the log file (ZIP-05, ZIP-21; rows 5.1 to 5.4) ──
 // Each sidecar here has a folder of its own, made with mkdtemp in the system temp folder
 // and removed afterwards, which holds only its config.json and its log file (config.log
@@ -5615,6 +6446,42 @@ async function testConfigSafety() {
       ['fail', 'hang', 'big'].every((m) => got[m] === 'as wanted'), JSON.stringify(got));
     check('row 5.3: a site\'s answer that quotes the key reaches lastError with the key redacted ("[Challonge key]"), whole, or cut in two by the adapter\'s 200 characters',
       got.echo401 === 'as wanted' && got.cut401 === 'as wanted', JSON.stringify({ echo401: got.echo401, cut401: got.cut401 }));
+
+    // Row 8.3, and Sprint 5's note (b) for Sprint 8: pollNotice is redacted like the other
+    // fields. An adapter's notice is fixed words; a stub result can carry anything, so one
+    // carries both keys here, and the key grep below reads every status that held it.
+    {
+      const nk = `stub:${TMP_REL}/notice-keys.json`;
+      writeFileSync(join(TMP_DIR, 'notice-keys.json'), JSON.stringify({ ...threeMatches('Notice Keys Cup'), pollNotice: `notice ${FAKE.startgg} and ${FAKE.challonge}` }));
+      await s.after('setUrl', nk, (st) => st.url === nk);
+      const noticed = await s.after('start', '', (st) => typeof st.pollNotice === 'string' && st.pollNotice !== '', 6000);
+      await s.after('stop', '', (st) => st.polling === false);
+      check('row 8.3 (Sprint 5, b): a key in a result\'s pollNotice is replaced by its label in the status ("notice [start.gg key] and [Challonge key]"); the key grep below covers every status that carried it',
+        noticed?.pollNotice === 'notice [start.gg key] and [Challonge key]', JSON.stringify({ pollNotice: noticed?.pollNotice ?? null }));
+      // A second good poll with the same notice, so "once" means the sidecar does not log a
+      // notice it has already logged (review of Sprint 8).
+      const repeat = await s.after('pollNow', '', (st) => !!st.lastPollAt && st.lastPollAt !== noticed?.lastPollAt, 6000);
+      await s.after('stop', '', (st) => st.polling === false);
+      const noticeLine = await waitFor(() => logOf(b).includes('poll notice: notice [start.gg key] and [Challonge key]'), 2000, 50);
+      check('row 8.3: a new pollNotice is logged once, with the keys redacted ("poll notice: notice [start.gg key] and [Challonge key]"), and a second good poll with the same notice does not log it again',
+        !!noticeLine && repeat?.pollNotice === noticed?.pollNotice && !!repeat?.lastPollAt && logOf(b).split('poll notice: ').length === 2,
+        JSON.stringify({ repeated: repeat?.pollNotice ?? null, lines: logOf(b).split('poll notice: ').length - 1 }));
+      // A pollNotice is redacted before it is cut to 200 characters (Sprint 5's note b):
+      // 195 characters and then the Challonge key give the 195 and the label cut to five
+      // characters ("[Chal"). Cut first, the five would be the key's own, too few for the
+      // redaction to know (8 or more); not cut, the notice would run on (review of Sprint 8).
+      const longNk = `stub:${TMP_REL}/notice-long-key.json`;
+      writeFileSync(join(TMP_DIR, 'notice-long-key.json'), JSON.stringify({ ...threeMatches('Notice Long Cup'), pollNotice: 'p'.repeat(195) + FAKE.challonge }));
+      await s.after('setUrl', longNk, (st) => st.url === longNk);
+      const cut = await s.after('start', '', (st) => typeof st.pollNotice === 'string' && st.pollNotice.startsWith('ppp'), 6000);
+      await s.after('stop', '', (st) => st.polling === false);
+      await waitFor(() => logOf(b).includes(`poll notice: ${'p'.repeat(195)}`), 2000, 50);
+      const noticeTexts = s.statuses().map((v) => { try { return JSON.parse(v).pollNotice || ''; } catch { return ''; } }).join('\n')
+        + (logOf(b) + s.sc.out).split(/\r?\n/).filter((l) => l.includes('poll notice: ')).join('\n');
+      check('row 8.3 (review): a pollNotice is redacted before its cut to 200 characters: 195 characters and the Challonge key give the 195 and "[Chal" (200 in all), and no piece of the key (4 characters or more) is in any status\'s pollNotice or any poll-notice line in the log file or on the console',
+        cut?.pollNotice === 'p'.repeat(195) + '[Chal' && cut.pollNotice.length === 200 && !anyPiece(noticeTexts, FAKE.challonge, 4),
+        JSON.stringify({ end: cut?.pollNotice?.slice(190) ?? null, length: cut?.pollNotice?.length ?? null, piece: pieceAt(noticeTexts, FAKE.challonge, 4) }));
+    }
 
     // Row 5.2: the log file. Row 5.3: keys redacted in it.
     for (let i = 0; i < 3; i++) await s.after('status');
@@ -6720,8 +7587,9 @@ try {
   await rm(TMP_DIR, { recursive: true, force: true });
   await mkdir(TMP_DIR, { recursive: true });
   await testNormalizers();
-  testDetection();
+  await testDetection();
   await testFetchWrapper();
+  await testStartggPaging();
   await testSidecarBlocks();
   testPanelCoreVm();
   await startMock();

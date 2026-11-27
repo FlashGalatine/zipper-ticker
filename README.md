@@ -198,7 +198,11 @@ A box you type in keeps what you typed, and is marked, until the sidecar
 reports the value you applied; press Esc in it to put back the current value.
 
 Paste the tournament URL (e.g. `https://challonge.com/blko42` or
-`https://www.start.gg/tournament/…/event/…`), **Set**, **Start polling**. **Set**
+`https://www.start.gg/tournament/…/event/…`), **Set**, **Start polling**. An
+address pasted without `https://` gets it (the box then shows it that way), and
+a start.gg admin page's address works too. A start.gg tournament URL works when
+the tournament has one event; when it has several, the status line says "paste
+a specific event URL" and names them: paste that event's own URL. **Set**
 with a new URL clears the old tournament's results from the strip at once (the
 end caps and the message stay), so an old bracket never crawls under a new
 event's name; the new results appear with the first good poll. Set
@@ -284,6 +288,19 @@ tournament needs to be set, so it doubles as a plain message ticker. From chat:
 
 ¹ The keyless start.gg proxy may reject the sets query; if it 400s, add an API
 key (start.gg → developer settings).
+
+start.gg's sets are read newest first, 50 at a time, and the reading stops once
+it holds enough finished sets for the strip (**Max ticker items**); with **Top N**
+on, every page is read. At most 500 sets are read in one poll. When a poll reads
+all 500 and more remain (with **Top N** on, or when those 500 hold fewer finished
+sets than **Max ticker items**), the control page's status line says so, and the
+strip shows the newest. A poll that stops early because it has enough says
+nothing, however big the event. The standings come with the first 50: 8 of
+them, or as many as **Top N** when that is more. After a poll that stopped
+early, raising **Max ticker items** above what it was read with, or switching
+**Top N** on, fetches the event again at once, polling or not, and so does
+raising **Top N** above the standings asked for, after any poll. Once the event has
+been read, any other option change only redraws the strip from what was read.
 
 ## Dev & tests
 
