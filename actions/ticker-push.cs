@@ -17,10 +17,22 @@
 //      click COMPILE — it must report success. A compile error means the action
 //      runs but broadcasts nothing, which shows up as a blank/stale ticker.
 //
+// QUEUE: put this action, "Ticker Command" and "Ticker Announce" in ONE BLOCKING queue
+// (README, setup step 1). In the Default queue, runs that overlap mix their arguments.
+//
 // NOTE: uses ONLY types in Streamer.bot's default C# reference set — JSON is
 // hand-written (no Newtonsoft). Verified pattern from Tally on Streamer.bot 1.0.4.
-// Any exception is logged AND broadcast as { type:"ticker:error", message } so
-// failures are visible, not silent.
+//
+// ERRORS, so failures are visible, not silent. A tickerPayload that does not start
+// with { and end with } is refused: nothing is stored, one warning is logged, and
+// { type:"ticker:error", code:"bad-payload", message:"tickerPayload is not a JSON object", action:"Ticker Push" }
+// is broadcast. An exception is logged in full and broadcast as
+// { type:"ticker:error", code:"exception", message:"<fixed text>", action:"Ticker Push" }: the exception's
+// own message goes to Streamer.bot's log only, never to the pages. action names the
+// sender (ACTION_NAME); the control page and the sidecar do not read it.
+//
+// mock-sb-server.mjs (runTickerPush) copies Execute() line for line, and
+// tools/cs/ticker-cases.json is the table both are run against. Change them together.
 
 using System;
 using System.Text;
@@ -28,6 +40,11 @@ using System.Text;
 public class CPHInline
 {
     const string EMPTY_UPDATE = "{\"type\":\"ticker:update\",\"tournament\":null,\"matches\":[],\"standings\":[],\"caps\":{\"text\":\"\",\"logo\":\"\"}}";
+    const string BAD_PAYLOAD_CODE = "bad-payload";
+    const string BAD_PAYLOAD_MESSAGE = "tickerPayload is not a JSON object";
+    const string EXCEPTION_MESSAGE = "Ticker Push threw an exception";
+    // This action's exact name, which every ticker:error it sends carries as action.
+    const string ACTION_NAME = "Ticker Push";
 
     public bool Execute()
     {
@@ -39,7 +56,14 @@ public class CPHInline
                 // Sidecar push: cheap sanity check only — the sidecar owns the shape.
                 payload = payload.Trim();
                 if (!payload.StartsWith("{") || !payload.EndsWith("}"))
-                    throw new Exception("tickerPayload is not a JSON object");
+                {
+                    // Refused: the stored payload stays as it was. The log gives the length,
+                    // not the text, which is not ours to quote.
+                    CPH.LogWarn("[Ticker Push] refused (" + BAD_PAYLOAD_CODE + "): " + BAD_PAYLOAD_MESSAGE
+                        + " (" + payload.Length + " chars); nothing was stored");
+                    CPH.WebsocketBroadcastJson(ErrorJson(BAD_PAYLOAD_CODE, BAD_PAYLOAD_MESSAGE));
+                    return false;
+                }
                 CPH.SetGlobalVar("ticker.payload", payload, true);
             }
             else
@@ -55,10 +79,19 @@ public class CPHInline
         }
         catch (Exception ex)
         {
+            // The exception goes to the log. The pages get a code and a fixed text.
             CPH.LogWarn("[Ticker Push] ERROR: " + ex);
-            CPH.WebsocketBroadcastJson("{\"type\":\"ticker:error\",\"message\":" + JsonStr(ex.Message) + "}");
+            try { CPH.WebsocketBroadcastJson(ErrorJson("exception", EXCEPTION_MESSAGE)); }
+            catch (Exception) { }
             return false;
         }
+    }
+
+    // { type, code, message, action }, in that order; action is this action's name.
+    static string ErrorJson(string code, string message)
+    {
+        return "{\"type\":\"ticker:error\",\"code\":" + JsonStr(code) + ",\"message\":" + JsonStr(message)
+            + ",\"action\":" + JsonStr(ACTION_NAME) + "}";
     }
 
     // Minimal, correct JSON string encoder (escapes quotes, backslashes, controls).

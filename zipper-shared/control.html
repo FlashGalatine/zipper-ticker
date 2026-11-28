@@ -186,7 +186,7 @@
   //   offline        the socket is closed: "Streamer.bot offline"
   //   missing        an answer "The action '…' was not found": "Action missing", naming it
   //   refused        any other error answer, in Streamer.bot's own words
-  //   runError       a ticker:error (an action threw), until the next echo, status or
+  //   runError       a ticker:error (an action threw, or refused what it was sent), until the next echo, status or
   //                  reconnect
   //   noAnswer       a click's action answered ok (or not at all) and the click's echo
   //                  did not come within ECHO_WAIT_MS: "<action> did not answer"

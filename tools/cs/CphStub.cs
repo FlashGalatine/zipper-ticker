@@ -1,15 +1,24 @@
 // A stand-in for the `CPH` object Streamer.bot gives an Execute C# Code sub-action.
 // It lets verify-cs.mjs compile the REAL actions/*.cs with the Windows C# compiler and
 // run their logic outside Streamer.bot. It implements only the calls Zipper's actions
-// make (TryGetArg, GetGlobalVar, SetGlobalVar, LogInfo, LogWarn, WebsocketBroadcastJson),
-// and only what mscorlib offers, because that is all Streamer.bot references by default.
+// make (TryGetArg, GetGlobalVar, SetGlobalVar, LogInfo, LogWarn, WebsocketBroadcastJson,
+// and Wait, which only Ticker Sidecar Start calls), and only what mscorlib offers,
+// because that is all Streamer.bot references by default.
 //
 // This is not Streamer.bot: it proves the C# compiles as C# 5 and that its logic does
 // what the checks expect. It does not prove Streamer.bot's own compiler accepts it.
+// TryGetArg converts a value as Convert.ChangeType does (a Boolean read as a string is
+// "True"); that Streamer.bot converts a trigger's Boolean and Int32 arguments the same
+// way was not checked. So nothing run against this stub can tell Ticker Announce's Arg(),
+// which reads an argument as an object and turns it into text itself, from a plain
+// TryGetArg<string> read: both give "True" for a Boolean here, and putting the string read
+// back leaves every check green. No check pretends otherwise. Only the gift-sub and
+// gift-bomb pass in Streamer.bot itself shows that the action reads those arguments.
 //
-// Built from Timbre's tools/cs/CphStub.cs, with one more hook: reading one named
-// argument can be made to throw. Ticker Command and Ticker Announce never write a
-// global, so the SetGlobalVar hook alone could not reach their catch blocks.
+// Built from Timbre's tools/cs/CphStub.cs, with two more hooks: reading one named
+// argument can be made to throw (Ticker Command and Ticker Announce never write a
+// global, so the SetGlobalVar hook alone could not reach their catch blocks), and every
+// broadcast can be made to throw (to reach the try round the broadcast inside a catch).
 
 using System;
 using System.Collections.Generic;
@@ -26,6 +35,7 @@ public class CphStub
     public List<string> Broadcasts = new List<string>();
     public string ThrowOnSetKey = null;  // a global whose write throws
     public string ThrowOnArg = null;     // an argument whose read throws
+    public bool ThrowOnBroadcast = false; // every broadcast throws
     public string ThrowText = DefaultThrowText;
 
     public T GetGlobalVar<T>(string name, bool persisted = true)
@@ -56,5 +66,13 @@ public class CphStub
 
     public void LogInfo(string message) { Infos.Add(message); }
     public void LogWarn(string message) { Warnings.Add(message); }
-    public void WebsocketBroadcastJson(string json) { Broadcasts.Add(json); }
+    public void WebsocketBroadcastJson(string json)
+    {
+        if (ThrowOnBroadcast) throw new InvalidOperationException(ThrowText);
+        Broadcasts.Add(json);
+    }
+
+    // Ticker Sidecar Start waits between its port probes. verify-cs.mjs runs a copy of it
+    // (on ports and a folder of its own, never the sidecar's), so this really waits.
+    public void Wait(int milliseconds) { System.Threading.Thread.Sleep(milliseconds); }
 }

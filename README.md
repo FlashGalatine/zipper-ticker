@@ -67,7 +67,13 @@ Create these actions — names must match exactly:
 Click **Compile** on each — all must report success. `Ticker Sidecar Start`
 also needs `System.dll` added on its References tab (see the file's header);
 edit its `BUNDLE` path and add SB's application-started trigger to auto-launch
-the sidecar with Streamer.bot.
+the sidecar with Streamer.bot. It writes to Streamer.bot's log what it found:
+a sidecar already running (nothing started), a `BUNDLE` without
+`zipper-sidecar.mjs` in it, or, after the launch, whether the sidecar took its
+port within about 3 seconds (if not, run `npm install` there, or run
+`start-zipper.bat` once to see the error). An older paste keeps working;
+re-pasting it is optional, and means entering `BUNDLE` again (`System.dll`
+stays on the References tab).
 
 **Put the three bus actions in one blocking queue.** In Streamer.bot's
 **Action Queues** tab, add a queue with **Blocking** ticked, then set
@@ -80,14 +86,21 @@ default queue, 0 of 25 in a blocking queue. The queue covers every sender: the
 control page, chat, a Stream Deck, Twitch triggers and the sidecar.
 
 **Restrict who can use the chat command.** If you add a `!ticker` chat command
-(see [step 5](#5-drive-it) below), `Ticker Command` does whatever the command passes it
-and does not check who typed it. In the command's own settings (Commands tab),
-set its permissions so only **moderators** and the **broadcaster** can use it.
-Anyone the command allows can change the tournament URL (so someone else's
-bracket crawls on your stream), replace the results with any message, change
-the end-cap text or show an image from any web address there, and stop
-polling. The same applies to every other chat command you point at
-`Ticker Command`.
+(see [step 5](#5-drive-it) below), `Ticker Command` relays only five commands
+from chat: `start`, `stop`, `pollNow`, `status` and `setTopN` (in any letter
+case). Anything else typed in chat is refused, and Streamer.bot's log says so;
+the tournament URL, the end caps and the message are set on the control page
+or from a Stream Deck (a Stream Deck button sets the `command` and `value`
+arguments; one that sets only `rawInput` is held to the five, as chat is, and
+the log says to set `command` and `value` instead). `Ticker Command` does not
+check who typed the command,
+so in the command's own settings (Commands tab), set its permissions so only
+**moderators** and the **broadcaster** can use it. Anyone the command allows
+can stop and start polling, ask for a poll, and change the Top N filter. The
+same applies to every other chat command you point at `Ticker Command`: a
+dedicated `!pollnow` is relayed as `pollNow`, and one that is not on the list
+is refused. A `Ticker Command` pasted before this version relays every
+command from chat, so re-paste it.
 
 ### 2. HTTP maps
 
@@ -219,7 +232,9 @@ change shows at once on that payload. Switching the message off puts the
 "waiting for results" line on the strip at once, with no results, until the
 bracket is fetched again: **Start polling**, **Poll now**, or an option change.
 Chat control also works — point a `!ticker` command trigger at the `Ticker Command` action and type
-`!ticker setUrl https://…`, `!ticker setTopN 4`, `!ticker stop`, etc.
+`!ticker pollNow`, `!ticker setTopN 4`, `!ticker stop`, etc. Chat may send
+only `start`, `stop`, `pollNow`, `status` and `setTopN` (see step 1); the rest
+stays on the control page and a Stream Deck.
 
 New results never cut into the crawl. The same goes for an option change and for
 the message going on or off. When the loop is about to wrap (in 20 seconds or
@@ -240,7 +255,7 @@ the sidecar waits for the platform's advertised start time, checking again every
 early is picked up (every 5 minutes if there is no start time, or at your poll interval if that is longer), and once the
 event completes it pushes the final results and stops polling by itself. The
 results stay on the strip. To
-turn it off from chat: `!ticker setAutoSchedule off`. **Start polling** /
+turn it off, untick the checkbox on the control page. **Start polling** /
 **Poll now** get a fresh poll even before the start time or after that stop,
 but no poll comes sooner than 15 seconds after the last one (a click inside
 that gap is polled when it ends). When a site answers "too many requests" (or
@@ -255,16 +270,42 @@ item — and tick *Show this instead of results*. It holds the strip until you
 untick it; results keep polling underneath and come back the way new results do:
 they wait for the crawl's next wrap, or come in under a short fade (except just
 after a restart with polling off, as described above). No
-tournament needs to be set, so it doubles as a plain message ticker. From chat:
-`!ticker setMessageText Bracket starts at 8pm ET` then
-`!ticker setMessageEnabled on` / `off`.
+tournament needs to be set, so it doubles as a plain message ticker. The
+message is set on the control page, or from a Stream Deck with the
+`setMessageText` and `setMessageEnabled` commands (see
+[the wire protocol](docs/PROTOCOL.md)); chat cannot set it.
 
 ### 7. Announcements (optional)
 
 - **Sub/raid alerts:** in Streamer.bot, add the `Ticker Announce` action to
-  your Subscription / Gift Sub / Raid triggers — it auto-composes the text from
-  the trigger arguments ("UserName is raiding with 25 viewers!"), or pass an
-  explicit `text` argument to customize.
+  your Subscription, Resubscription, Gift Subscription, Gift Bomb and Raid
+  triggers — it composes the text from the trigger arguments ("UserName is
+  raiding with 25 viewers!", "UserName just subscribed!", "Gifter gifted a sub
+  to Recipient!"), or pass an explicit `text` argument to customize. A gift
+  bomb is announced once, by the Gift Bomb trigger ("Gifter gifted 5 subs!");
+  the Gift Subscription runs that belong to it announce nothing, so add both
+  triggers. Add the two gift triggers only after the `Ticker Announce` from
+  this version compiles: one pasted before it sends "Gifter just subscribed!"
+  once per gift of a bomb. (The overlay shows that repeated line once, since it
+  drops an announcement identical to the one just before it; a custom `text`
+  that names each recipient would still show once per gift.) Add them only
+  once the three bus actions are in the blocking queue of step 1, too: a
+  bomb's runs come together, and in the default queue they can mix their
+  arguments, so the Gift Bomb run can read a gift sub's `fromGiftBomb` and be
+  skipped as well, and the bomb is not announced at all. An anonymous gift
+  reads "Someone" (as a missing name does), whatever name Streamer.bot gives
+  with it. The arguments were checked with Streamer.bot's Test Trigger on
+  1.0.7, not against a live gift bomb: how a live bomb's runs arrive, and
+  what name Streamer.bot gives an anonymous gift, were not seen. If a live
+  bomb's Gift Subscription runs did not carry `fromGiftBomb`, the strip would
+  show several "Gifter gifted a sub to Recipient!" lines, one per recipient,
+  beside the bomb's own line (the strip keeps at most ten announcements
+  waiting and drops any more, so a large bomb would show fewer of them and
+  could lose the bomb's own line); whether they carry it was not seen on a
+  live bomb. Test Trigger
+  on Gift Subscription gave `fromGiftBomb` as true when it was tried, so that
+  test is skipped and shows nothing; Test Trigger on Gift Bomb shows the
+  bomb's line.
 - **Milestones:** put your StreamElements JWT in `config.json`
   (streamelements.com → account → Channel settings → Show secrets) and set step
   sizes, e.g. `"milestones": { "followers": 100, "subs": 25 }` — the ticker
@@ -275,6 +316,9 @@ tournament needs to be set, so it doubles as a plain message ticker. From chat:
   The text stays in the box until the announcement comes back from
   Streamer.bot, then the box clears. A second click on Send while the same
   text is still on its way sends nothing, so it is not shown twice.
+- **Repeats:** an announcement identical to the one before it (the same kind
+  pill, text and duration), sent while that one is still on the strip or waiting
+  for its turn, is shown once. Sent again after it has gone, it shows again.
 
 ## Platform notes
 

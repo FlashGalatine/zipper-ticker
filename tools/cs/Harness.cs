@@ -10,11 +10,15 @@
 //   #global64 <key>=<b64>         set a global, the value given as base64 of its UTF-8
 //   #throwset=<key>               make writing that global throw (empty = off)
 //   #throwarg=<name>              make reading that argument throw (empty = off)
-//   #throwtext64=<b64>            the message the two throw hooks use
+//   #throwbc=<1|empty>            make every broadcast throw (empty = off)
+//   #throwtext64=<b64>            the message the throw hooks use
 //   (no args)                     one Execute() with no arguments
-//   #run64 <k>=<b64>[TAB<k>=<b64>…]   one Execute() with those arguments (all strings)
+//   #run64 <k>=<b64>[TAB<k>=<b64>…]   one Execute() with those arguments: strings, or, with
+//                                 <k>:bool= or <k>:int=, a Boolean or an Int32 parsed from
+//                                 the text (as a Twitch trigger gives fromGiftBomb or gifts)
 // Output, one line per Execute(), TAB separated:
 //   ret=<true|false>  warn=<new warnings>  info=<new info lines>
+//   threw=<the exception's type>, only when one escaped Execute() (ret is then false)
 //   log=<the new log lines, warnings first, joined by U+001E; line breaks and tabs as spaces>
 //   bc=<broadcast JSON, joined by U+001E>  then every global as <key>=<value>, sorted.
 // In bc and in the globals a backslash is written \\, a tab \t, a line feed \n, a carriage
@@ -22,6 +26,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Text;
 
@@ -46,6 +51,7 @@ public static class Harness
             if (line.StartsWith("#global64 ")) { string kv = line.Substring(10); int e = kv.IndexOf('='); cph.Globals[kv.Substring(0, e)] = From64(kv.Substring(e + 1)); continue; }
             if (line.StartsWith("#throwset=")) { string k = line.Substring(10); cph.ThrowOnSetKey = k.Length == 0 ? null : k; continue; }
             if (line.StartsWith("#throwarg=")) { string k = line.Substring(10); cph.ThrowOnArg = k.Length == 0 ? null : k; continue; }
+            if (line.StartsWith("#throwbc=")) { cph.ThrowOnBroadcast = line.Substring(9).Length > 0; continue; }
             if (line.StartsWith("#throwtext64=")) { cph.ThrowText = From64(line.Substring(13)); continue; }
             bool run64 = line.StartsWith("#run64 ");
             if (line.StartsWith("#") && !run64) continue;
@@ -57,14 +63,31 @@ public static class Harness
                 {
                     int e = part.IndexOf('=');
                     if (e < 0) continue;
-                    cph.Args[part.Substring(0, e)] = From64(part.Substring(e + 1));
+                    string key = part.Substring(0, e);
+                    string text = From64(part.Substring(e + 1));
+                    object val = text;
+                    int colon = key.IndexOf(':');
+                    if (colon >= 0)
+                    {
+                        string type = key.Substring(colon + 1);
+                        key = key.Substring(0, colon);
+                        if (type == "bool") val = bool.Parse(text);
+                        else if (type == "int") val = int.Parse(text, NumberStyles.Integer, CultureInfo.InvariantCulture);
+                        else throw new ArgumentException("unknown argument type " + type);
+                    }
+                    cph.Args[key] = val;
                 }
             }
             int warnBefore = cph.Warnings.Count, infoBefore = cph.Infos.Count, bcBefore = cph.Broadcasts.Count;
 
             var action = new CPHInline();
             action.CPH = cph;
-            bool ret = action.Execute();
+            bool ret = false;
+            string threw = null;
+            // Streamer.bot catches what escapes Execute(); here it is recorded, so a check can
+            // say that nothing did.
+            try { ret = action.Execute(); }
+            catch (Exception ex) { threw = ex.GetType().FullName; }
 
             var log = new List<string>();
             foreach (string w in cph.Warnings.GetRange(warnBefore, cph.Warnings.Count - warnBefore)) log.Add(OneLine(w));
@@ -75,6 +98,7 @@ public static class Harness
             outp.Append("ret=").Append(ret ? "true" : "false");
             outp.Append("\twarn=").Append(cph.Warnings.Count - warnBefore);
             outp.Append("\tinfo=").Append(cph.Infos.Count - infoBefore);
+            if (threw != null) outp.Append("\tthrew=").Append(threw);
             outp.Append("\tlog=").Append(string.Join("\u001e", log.ToArray()));
             outp.Append("\tbc=").Append(string.Join("\u001e", bcs.ToArray()));
             var keys = new List<string>(cph.Globals.Keys);

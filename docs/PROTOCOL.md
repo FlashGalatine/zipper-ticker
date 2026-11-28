@@ -83,7 +83,7 @@ Rules:
 A configured message that holds the strip until you switch it off — for
 "bracket starts at 8pm", a Discord plug, a rules line. Set it from the control
 page's **Persistent message** box (textarea + a *Show this instead of results*
-checkbox), or from chat / a Stream Deck via the single-field commands.
+checkbox), or from a Stream Deck via the single-field commands.
 
 ```json
 "message": { "enabled": true, "text": "Bracket starts at 8pm ET\n!discord for the lobby code" }
@@ -404,9 +404,9 @@ had one of those two is settled when the next goes.
   happened).
 - **refused** — an error answer, such as "was not found".
 - **failed** — a `ticker:error` arrived while it was the send in flight, before
-  or after an ok answer, or with no answer at all (it names no sender, so a
-  page's failed run at that moment, or the late run of an earlier send, counts
-  against it).
+  or after an ok answer, or with no answer at all (the sidecar does not read
+  which action sent it, so a page's failed run at that moment, or the late run
+  of an earlier send, counts against it).
 - **timed out** — no answer within 5 s of the send, and no broadcast of its own
   while it was the send in flight. Its own broadcast that comes after the next
   send has gone is not looked at, so it does not save the send from timing out.
@@ -432,17 +432,27 @@ in Streamer.bot's Default queue (from any ok answer, late or not).
 
 ## ticker:command
 
-Control surfaces (control page, chat trigger, Stream Deck) call the **Ticker
-Command** action with `command`/`value` arguments; the C# side re-broadcasts
+Control surfaces (the control page, a Stream Deck, and a chat trigger, which
+may send only five of the commands below) call the **Ticker Command** action
+with `command`/`value` arguments; the C# side re-broadcasts
 
 ```json
 { "type": "ticker:command", "command": "setUrl", "value": "https://challonge.com/blko42" }
 ```
 
 which the sidecar consumes. Command names match without regard to case
-(`pollnow` is `pollNow`, as a dedicated chat command relays it); values are
-passed as they are. An unknown name is ignored and reported in the status's
-`commandNotice`. Commands:
+(`pollnow` is `pollNow`, as a `Ticker Command` pasted before the chat list
+relays a dedicated chat command); values are passed as they are. An unknown
+name is ignored and reported in the status's `commandNotice`.
+
+**From chat** (a chat command trigger, which sets `commandId`, or a bare
+`rawInput` with no `command` argument), `Ticker Command` relays only `start`,
+`stop`, `pollNow`, `status` and `setTopN`, matched without regard to case and
+relayed as written here (`!ticker settopn 4` is relayed as `setTopN`). Any
+other command, `__status` included, is refused: one warning in Streamer.bot's
+log, and nothing is relayed or broadcast. An explicit `command` and `value`
+(the control page, a Stream Deck, the sidecar's own `__status`) is relayed
+whatever it is. Commands:
 
 | command       | value                          | effect |
 |---------------|--------------------------------|--------|
@@ -454,9 +464,9 @@ passed as they are. An unknown name is ignored and reported in the status's
 | `setCaps`     | JSON `{text,logo}`             | **batched** — sets both end caps in one command (the control page uses this), pushed at once, polling or not (just after a restart with a URL set, after one fetch). A logo `setCapsLogo` would refuse is refused here too: the old logo stays, the text still applies, and `commandNotice` says why |
 | `setOptions`  | JSON `{intervalMs,maxItems,topN}` | **batched** — sets all three options in one command. A changed `maxItems` or `topN` rebuilds the payload from the last result and pushes it at once, as `setMaxItems` and `setTopN` do (see [What the sidecar pushes](#what-the-sidecar-pushes)); a new interval only re-times the next poll, so it never cuts an error backoff or a Retry-After short |
 | `setMessage`  | JSON `{text,enabled}`          | **batched** — persistent message text + on/off in one command (the control page uses this) |
-| `setMessageText` | string (≤1000 chars, `\n`-separated lines) | message text (single-field; for chat / Stream Deck) |
+| `setMessageText` | string (≤1000 chars, `\n`-separated lines) | message text (single-field; for Stream Deck) |
 | `setMessageEnabled` | `on`/`off` (also `true`/`false`, `1`/`0`, `yes`) | show the message instead of results |
-| `setCapsText` | string (≤120 chars)            | right-cap static text (single-field; for chat / Stream Deck) |
+| `setCapsText` | string (≤120 chars)            | right-cap static text (single-field; for Stream Deck) |
 | `setCapsLogo` | an http(s) URL, or a path on the overlay's server (≤500 chars; empty = no logo) | left-cap logo image (single-field). Anything else — `data:`, `file:`, `javascript:`, `//host`, `\\host` — is refused: the old logo stays and `commandNotice` says why. A saved logo that breaks this rule is dropped when `config.json` loads, and `configWarning` says so |
 | `setInterval` above, `setMaxItems`, `setTopN` | see below | single-field variants |
 | `setMaxItems` | 1–100                          | ticker item cap; a change is rebuilt from the last result and pushed at once (after a fetch, when nothing is kept yet or the URL changed since) |
@@ -489,7 +499,7 @@ passed as they are. An unknown name is ignored and reported in the status's
 > 800 ms belongs to that request, not to the next one alike, for up to 5 s.
 > The sidecar's own sends follow the same rule, and also take a `ticker:error`
 > as the end of a run; a page does not. The single-field commands remain for
-> chat / Stream Deck.
+> Stream Deck.
 
 ## ticker:announce
 
@@ -499,8 +509,12 @@ that are waiting for the crawl's wrap or its fade, or that arrive while the
 announcement is up, go in while it hides the crawl; the crawl then resumes from
 the start of its loop. With nothing new, it resumes where it paused, also when
 a web font that arrives late has the crawl measured again while the announcement
-is up. Announcements queue (up to 10) and play back-to-back. Ephemeral — never
-persisted, so reconnecting overlays don't replay them.
+is up. Announcements queue (up to 10) and play back-to-back. One identical to
+the one before it (the same kind pill, text and duration as shown: the last one
+waiting, or, with none waiting, the one on screen) is dropped, so a run of the
+same line shows once (an older `Ticker Announce` sends the same line for every
+gift of a gift bomb); sent again after the one before it has gone, it shows
+again. Ephemeral — never persisted, so reconnecting overlays don't replay them.
 
 ```json
 { "type": "ticker:announce", "kind": "raid", "text": "Flash is raiding with 42 viewers!", "duration": 8 }
@@ -509,9 +523,32 @@ persisted, so reconnecting overlays don't replay them.
 - `kind` ∈ `sub | raid | milestone | custom` (styles the pill; anything else
   renders as custom). `duration` is clamped 2–30 s (default 8).
 - Broadcast by the **Ticker Announce** action. Sources:
-  - **SB Twitch triggers** (subs, gift subs, raids): add the action to the
-    trigger; with no `text` arg it auto-composes from the trigger's `user` /
-    `viewers` arguments. Pass explicit `text` (Set Argument) to customize.
+  - **SB Twitch triggers** (Subscription, Resubscription, Gift Subscription,
+    Gift Bomb, Raid): add the action to the trigger; with no `text` arg it
+    composes the text from the trigger's own arguments: a raid from `user` and
+    `viewers` ("X is raiding with N viewers!", kind `raid`), a gift bomb from
+    `user` and `gifts` ("X gifted N subs!", or "X gifted a sub!" for one), a
+    gift sub from `user` and `recipientUser` ("X gifted a sub to Y!"), a sub or
+    resub from `user` ("X just subscribed!"); the last three are kind `sub`,
+    and a missing name reads "Someone", as does a gift whose `anonymous` is
+    true, whatever `user` holds. A Gift Subscription run whose
+    `fromGiftBomb` is true (one recipient of a gift bomb) announces nothing,
+    whatever its other arguments, so a bomb is announced once, by its Gift
+    Bomb run. That needs the blocking queue: in the Default queue a bomb's
+    runs can mix their arguments, and a Gift Bomb run that reads a gift
+    sub's `fromGiftBomb` is skipped too. The arguments are those Streamer.bot
+    1.0.7's Test Trigger gives (`fromGiftBomb` and `anonymous` Booleans;
+    `gifts`, `totalGifts` and `subBombCount` Int32; the action reads each as
+    text). Not checked against a live gift bomb: whether Gift Subscription
+    fires once per recipient during one and in what order (the skip does not
+    depend on the order), and what `user` holds for an anonymous gift. Not
+    checked anywhere: what Streamer.bot's own `TryGetArg` gives for a Boolean
+    or an Int32 asked for as a string. The action reads each as an object and
+    turns it into text itself so as not to depend on that, but no suite can
+    show the difference: verify:cs's stand-in for `CPH` gives `True` for a
+    Boolean either way, so a plain string read would pass every check too.
+    Only the gift-sub and gift-bomb pass in Streamer.bot shows that the
+    action reads them. Pass explicit `text` (Set Argument) to customize.
   - **Control page**: the Announcement box DoActions it directly.
   - **Sidecar milestones**: when a StreamElements session counter crosses a
     configured step (see below), the sidecar fires it with kind `milestone`.
@@ -558,12 +595,32 @@ only `se: { configured, lastPollAt, lastError }`.
 
 ## ticker:error
 
-Broadcast by either C# action when it throws, so failures are visible instead
-of silent: `{ "type": "ticker:error", "message": "…" }`. The control page shows
-the message in its banner until the next `ticker:command` or `ticker:announce`
-broadcast, a status, or a reconnect. It reads a `code` only when one is there.
-A `ticker:error` carries no sender, so the page also stops waiting for the
-echo of the clicks it has sent: it does not then say they "did not answer".
+Broadcast by the three bus actions, so failures are visible instead of silent:
+`{ "type": "ticker:error", "code": "…", "message": "…", "action": "…" }`. The
+message is one fixed text per code; it never carries an exception's own
+message, which goes to Streamer.bot's log only (with the rest of the
+exception). `action` names the action that sent it (`Ticker Push`,
+`Ticker Command` or `Ticker Announce`), whatever the code. Today's control
+page, overlay and sidecar do not read it. The codes:
+
+| code | sent by | message |
+|------|---------|---------|
+| `exception` | any of the three, when it throws | `Ticker Push threw an exception` (or `Ticker Command` or `Ticker Announce` in its place) |
+| `bad-payload` | `Ticker Push`, for a `tickerPayload` that does not start with `{` and end with `}` (nothing is stored) | `tickerPayload is not a JSON object` |
+
+A `Ticker Command` refusing a chat command, or a `Ticker Announce` skipping a
+run, broadcasts nothing; each logs it. An action pasted before 1.0.32 sends
+neither `code` nor `action`: `{ "type": "ticker:error", "message": "…" }`,
+with the exception's own message, and keeps working. The control page shows the message in its banner, with the
+code after it in brackets when the message does not already name it, and adds
+that Streamer.bot's log has the details: "A Zipper action failed in
+Streamer.bot: Ticker Push threw an exception. See Streamer.bot's log." or
+"…: tickerPayload is not a JSON object (bad-payload). See Streamer.bot's log."
+The line stays until the next `ticker:command` or `ticker:announce`
+broadcast, a status, or a reconnect; a code it does not know is shown the
+same way. The page does not read which action sent it, so it also
+stops waiting for the echo of every click Streamer.bot has answered: it does not then say
+they "did not answer".
 
 ## Test hook
 
