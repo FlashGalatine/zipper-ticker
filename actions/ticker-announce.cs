@@ -16,8 +16,10 @@
 //       gift sub  → "Gifter gifted a sub to Recipient!"       (user, recipientUser)
 //       gift bomb → "Gifter gifted 5 subs!", or "Gifter gifted a sub!" for one
 //                                                             (user, gifts)
-//     A missing name reads "Someone", and so does an anonymous gift (its anonymous
-//     argument is true), whatever `user` holds. A Gift Subscription run that is part of a
+//     A missing name reads "Someone" in a raid, a gift sub or a gift bomb (a sub with no
+//     name has nothing to compose from, so it is skipped with a warning and nothing is
+//     broadcast), and so does an anonymous gift (its anonymous argument is true), whatever
+//     `user` holds. A Gift Subscription run that is part of a
 //     gift bomb (its fromGiftBomb argument is true) announces nothing, whatever its other
 //     arguments: the Gift Bomb run announces the whole bomb once. So add the Gift Bomb
 //     trigger with the Gift Subscription one, or a bomb is not announced at all, and add
@@ -30,8 +32,13 @@
 //     during one, and in what order (the skip does not depend on the order); what
 //     `user` holds for an anonymous gift; and whether a live Gift Bomb run names its
 //     recipients (not used here).
-//     Pass an explicit `text` argument (Core → Arguments → Set Argument before
-//     this sub-action) to override, e.g. "%user% gifted %gifts% subs!".
+//     To change the text for one trigger, give that trigger an action of its own that
+//     sets `text` with Set Argument, and `kind` too (once `text` is set nothing is
+//     composed, so `kind` stays custom unless it is set; its values are at the top),
+//     then runs "Ticker Announce" (Core → Actions → Run Action; how it carries the
+//     arguments was not checked here). Put that action in a blocking queue too (QUEUE
+//     below). A Set Argument inside Ticker Announce itself runs on every run of it, so
+//     its text would replace every trigger's, the control page's and the milestones'.
 //   • Control page / Stream Deck — DoAction with args { kind, text, duration }.
 //   • Sidecar milestones — the Zipper sidecar calls this with kind "milestone"
 //     when a StreamElements counter crosses a configured step (README.md).

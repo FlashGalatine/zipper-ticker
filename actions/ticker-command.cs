@@ -6,7 +6,11 @@
 //
 // Call styles:
 //   • control.html — DoAction args { command:"setUrl", value:"https://..." }
-//   • Stream Deck  — Set Argument sub-actions before this one, same two args
+//   • Stream Deck  — a button that sets the same two args (command, value) and runs
+//     Ticker Command, or an action of its own that does (Set Argument sub-actions,
+//     then Core → Actions → Run Action; how it carries the arguments was not checked
+//     here). Never add Set Argument sub-actions to Ticker Command itself:
+//     they would run on every run and replace the command and value of every caller.
 //     These two (an explicit `command` argument, no `commandId`) are relayed as
 //     they are, whatever the command.
 //   • Chat Command triggers — attach them directly, NO Set Argument needed.
@@ -46,7 +50,11 @@
 // Core -> C# -> Execute C# Code sub-action holding everything below (COMPILE must
 // report success). Default reference set only — JSON is hand-written.
 //
-// mock-sb-server.mjs (runTickerCommand) copies Execute() line for line, and
+// mock-sb-server.mjs (runTickerCommand) copies Execute()'s relay, its chat parsing and
+// the chat list (what is refused), but not its log lines (which relays are logged at
+// info, and the text a refused command's warning quotes) or its catch block (the mock's
+// /mock/throw switch stands in for a throw). verify-cs.mjs (npm run verify:cs, not part
+// of npm run verify) checks those against the compiled action.
 // tools/cs/ticker-cases.json is the table both are run against. Change them together.
 
 using System;

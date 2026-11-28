@@ -30,6 +30,12 @@
 //      reconnect pacing (decision 11), the events it raises (sb:connection,
 //      sb:action-queued, sb:action-error, sb:action-timeout; ZIP-17), the id
 //      __ZIPPER_DO_ACTION returns, and its send queue's release (decision 13).
+//   2f. The docs against the code (row 11.1): PROTOCOL's payload types, ticker:update
+//      rules, every ticker:status field (the example's keys read from statusSnapshot),
+//      the command table (its ranges, cuts and on/off words read from dispatch), the
+//      announcement, error and test-hook sections; the README; THEMING (every --ticker-*
+//      variable in ticker.css, the URL params' limits in ticker.js); and the action
+//      headers. Files only: nothing is started.
 //   3. Mock-SB E2E: the REAL panel-core.js runs in a browser shim against the
 //      mock server — Subscribe (lowercase), sync-on-connect replay, live push, and
 //      the stamp rule (an update older than the newest is dropped, compared as dates,
@@ -2792,7 +2798,7 @@ async function testCaseTable() {
     const sender = {
       shape: section.includes('`{ "type": "ticker:error", "code": "…", "message": "…", "action": "…" }`'),
       names: section.includes('`action` names the action that sent it (`Ticker Push`, `Ticker Command` or `Ticker Announce`), whatever the code.'),
-      notRead: section.includes('Today\'s control page, overlay and sidecar do not read it.'),
+      notRead: section.includes('Today\'s control page, overlay and sidecar do not read `action`.'),
       older: section.includes('An action pasted before 1.0.32 sends neither `code` nor `action`'),
       queue: protocol.includes('(the sidecar does not read which action sent it, so'),
       headers: ['ticker-push.cs', 'ticker-command.cs', 'ticker-announce.cs'].every((f) => {
@@ -7792,6 +7798,567 @@ async function testLauncher() {
   rmSync(oddDir, { recursive: true, force: true });
 }
 
+// ── 2f. The docs against the code (row 11.1, ZIP-24) ─────────────────────────
+// The final docs sweep: what PROTOCOL, THEMING, the README and the action headers say,
+// read flattened. Where a fact can be read from the code (a count, a name, a figure, a
+// list of keys) the doc is compared with the code; otherwise the sentence that was put
+// right is required, and the one it replaced must be gone. Seven checks, each with its
+// fields named in its detail. Where a doc gives examples of how a value reads, they are
+// run through the code's own function, taken from its text (the sidecar's clampInt and
+// milestone rule, and detectPlatform); a figure or a name is read from the constant or
+// the code that holds it (the gate of 2026-11-28).
+
+function testDocsSweep() {
+  console.log('\n[2f] the docs against the code: the final docs sweep (row 11.1, ZIP-24)');
+  const read = (p) => readFileSync(resolve(__dirname, p), 'utf-8').replace(/\r\n/g, '\n');
+  const flat = (s) => String(s).replace(/\s+/g, ' ');
+  const protocolRaw = read(join('docs', 'PROTOCOL.md'));
+  const protocol = flat(protocolRaw);
+  const readme = flat(read('README.md'));
+  const theming = flat(read(join('docs', 'THEMING.md')));
+  const sidecar = read('zipper-sidecar.mjs');
+  const tickerJs = read(join('overlay', 'ticker.js'));
+  const tickerCss = read(join('overlay', 'ticker.css'));
+  const controlHtml = read(join('zipper-shared', 'control.html'));
+  const mockSrc = read('mock-sb-server.mjs');
+  const cs = (f) => read(join('actions', f));
+  const csCode = (f) => cs(f).split('\n').filter((l) => !/^\s*\/\//.test(l)).join('\n');
+  const csHeader = (f) => flat(cs(f).split('\n').filter((l) => /^\s*\/\//.test(l)).map((l) => l.replace(/^\s*\/\/\s?/, '')).join(' '));
+  const between = (s, a, b) => { const i = s.indexOf(a); if (i < 0) return ''; const j = b ? s.indexOf(b, i + a.length) : -1; return s.slice(i, j < 0 ? undefined : j); };
+  const first = (re, s) => (re.exec(s) || [])[1];
+  const ticks = (s) => [...String(s || '').matchAll(/`([^`]+)`/g)].map((m) => m[1]);
+  const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+  const caseBody = (name) => between(sidecar, `case '${name}':`, '\n    case ');
+  // Backticked names are read with the code blocks taken out: a ```json block's backticks
+  // would pair with the prose's.
+  const noFence = (s) => String(s).replace(/```[\s\S]*?```/g, ' ');
+  const readmeRaw = read('README.md');
+  const themingRaw = read(join('docs', 'THEMING.md'));
+  const panelCore = read(join('zipper-shared', 'panel-core.js'));
+  const num = (re, s) => { const v = first(re, s); return v === undefined ? NaN : Number(v); };
+  const NUM_WORDS = ['zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten', 'eleven', 'twelve'];
+  // The sidecar's own clampInt, taken from its text: where a doc says how a value that is
+  // not a number reads, its examples (JSON values, as the doc backticks them) are run
+  // through it.
+  const fnOf = (src, name) => { const i = src.indexOf(`function ${name}(`); const j = i < 0 ? -1 : src.indexOf('\n}\n', i); return j < 0 ? '' : src.slice(i, j + 2); };
+  let sidecarClamp = null;
+  try { sidecarClamp = new Function(`${fnOf(sidecar, 'clampInt')}\nreturn clampInt;`)(); } catch { sidecarClamp = null; }
+  const jsonOf = (t) => { try { return { ok: true, v: JSON.parse(t) }; } catch { return { ok: false }; } };
+  // What config.json holds, as adoptConfig reads it ("caps.logo", "streamElements.jwtToken",
+  // "milestones.followers", …), and the command names dispatch knows.
+  const adoptBody = between(sidecar, 'function adoptConfig(parsed) {', '\n}\n');
+  const configNames = new Set([...adoptBody.matchAll(/parsed\.([\w?.]+)/g)].map((m) => m[1].replace(/\?/g, '')));
+  const configTop = new Set([...configNames].map((n) => n.split('.')[0]));
+  const configInit = between(sidecar, 'let config = {', '\n};\n');
+  const commandNames = [...between(sidecar, 'const COMMANDS = new Map([', '].map(').matchAll(/'(\w+)'/g)].map((m) => m[1]);
+  const mockHttpPort = num(/const HTTP_PORT = Number\(process\.env\.SB_HTTP_PORT\) \|\| (\d+);/, mockSrc);
+
+  // The payload types and the ticker:update rules.
+  {
+    const busTypes = [...new Set(['ticker-push.cs', 'ticker-command.cs', 'ticker-announce.cs']
+      .flatMap((f) => [...csCode(f).matchAll(/\\"type\\":\\"(ticker:[a-z]+)\\"/g)].map((m) => m[1])))].sort();
+    const statusType = first(/function statusSnapshot\(seq\) \{\n\s*return \{\n\s*type: '(ticker:[a-z]+)'/, sidecar);
+    const head = /\(`CPH\.WebsocketBroadcastJson`\)\. (\w+) payload types, each carrying a `type` key\. (\w+) are broadcast on their own: ([^.]*)\. The fifth, `([^`]+)`, travels as a JSON string in the `value` of a `ticker:command` whose command is `__status`/.exec(protocol);
+    const WORDS = { Three: 3, Four: 4, Five: 5, Six: 6 };
+    const headings = [...protocolRaw.matchAll(/^## (ticker:[a-z]+)$/gm)].map((m) => m[1]).sort();
+    const emptyUpdate = (first(/const string EMPTY_UPDATE = "((?:[^"\\]|\\.)*)";/, cs('ticker-push.cs')) || '').replace(/\\"/g, '"');
+    const update = {
+      types: busTypes.length === 4 && !!head && WORDS[head[1]] === busTypes.length + 1 && WORDS[head[2]] === busTypes.length
+        && same(ticks(head[3]).sort(), busTypes) && head[4] === statusType && same(headings, [...busTypes, statusType].sort()) && !protocol.includes('Three payload types'),
+      replay: protocol.includes('or because a page (the overlay or the control page: `panel-core.js` asks on every connect and reconnect) asked for the persisted replay. Like every broadcast, the replay goes to every client of the bus, so every open page and the sidecar get it, not only the page that asked.')
+        && !protocol.includes('or because an overlay (re)connected and asked'),
+      scores: tickerJs.includes('const bad = (v) => v == null || v < 0;') && tickerJs.includes('<span class="vs">def.</span>')
+        && protocol.includes('In a completed match, a negative score (a DQ or forfeit) counts as unreported, the same as `null`. A completed match with an unreported score reads "<winner> def. <loser>" when `winner` is 1 or 2, and "vs" when it is 0.')
+        && !protocol.includes('(`null` renders as "vs")'),
+      standings: protocol.includes('comes from start.gg (asked for on every poll') && protocol.includes('The overlay crawls the standings only when there is no message line and no match it can draw')
+        && !protocol.includes('is populated when a platform can\'t provide matches (Matcherino)'),
+      emptyUpdate: emptyUpdate.startsWith('{"type":"ticker:update","tournament":null')
+        && protocol.includes('`' + emptyUpdate + '`: `tournament` is `null`, and it has no `generatedAt` and no `message`. The sidecar never sends `tournament: null`.'),
+      generatedAt: sidecar.includes('lastStampMs = Math.max(Date.now(), lastStampMs + 1);')
+        && protocol.includes('While one sidecar process runs, each stamp is at least 1 ms later than the one before') && !protocol.includes('each one it stamps in one run is later than the last'),
+      // The blank payload's platform (the gate of 2026-11-28): the doc's examples go through
+      // detectPlatform, and the sidecar sets platformName only when a poll or fetch ends
+      // (good or failed) and in a setUrl that changes the URL.
+      emptyPlatform: (() => {
+        const m = /`platform` is `null` when no URL is set, when no platform recognises the URL \(an address on another site, or text that is neither an address nor a Challonge slug, such as `([^`]+)`; a bare `([^`]+)` is a Challonge slug\), and, just after a restart, until the first poll or one-off fetch has ended, good or failed, or a `setUrl` changes the URL\./.exec(protocol);
+        const poll = between(sidecar, 'async function pollOnce(', '\n}\n');
+        return !!m && detectPlatform(m[1]) === null && detectPlatform(m[2])?.displayName === 'Challonge'
+          && (poll.match(/\n {6}platformName = platform;\n/g) || []).length === 2 && sidecar.includes('let platformName = null;')
+          && caseBody('setUrl').includes('platformName = platformFor(config.tournamentUrl);')
+          && between(sidecar, 'function blankPayload() {', '\n}\n').includes('platform: platformName,')
+          && !protocol.includes('the URL is on no platform the sidecar recognises');
+      })(),
+    };
+    check('docs (row 11.1): PROTOCOL counts the payload types the actions and the sidecar send (four on their own, ticker:status inside a ticker:command), and its ticker:update rules say who asks for the replay and who gets it, how a score that is missing or below 0 reads, where standings come from, what the empty update holds (its platform as detectPlatform and the sidecar set it), and how generatedAt is stamped',
+      Object.values(update).every(Boolean), JSON.stringify({ ...update, busTypes, statusType }));
+  }
+
+  // ticker:status: the example and the meaning of every field statusSnapshot sends.
+  {
+    const body = between(sidecar, 'function statusSnapshot(seq) {', '\n}\n');
+    const top = [...body.matchAll(/^ {4}(\w+)\s*[:,]/gm)].map((m) => m[1]);
+    const sub = (name) => { const m = new RegExp(`^ {4}${name}: \\{([\\s\\S]*?)\\}`, 'm').exec(body); return m ? [...m[1].matchAll(/(?:^\s*|[{,]\s*|\n\s*)(\w+)\s*[:,]/g)].map((x) => x[1]) : []; };
+    const autoKeys = sub('auto'), seKeys = sub('se');
+    const ex = (first(/"value": "(\{\\"type\\":\\"ticker:status\\"[^\n]*?)" \}/, protocolRaw) || '').replace(/\\"/g, '"');
+    const exKeys = [];
+    for (let i = 0, depth = 0; i < ex.length; i++) {
+      const c = ex[i];
+      if (c === '{') depth++;
+      else if (c === '}') depth--;
+      else if (c === '"') {
+        const m = depth === 1 ? /^"(\w+)":/.exec(ex.slice(i)) : null;
+        if (m) { exKeys.push(m[1]); i += m[0].length - 1; } else { const end = ex.indexOf('"', i + 1); i = end < 0 ? ex.length : end; }
+      }
+    }
+    const rawStatus = between(protocolRaw, '## ticker:status', '### When the sidecar polls');
+    const bullets = rawStatus.split(/\n(?=- )/).filter((b) => b.startsWith('- ')).map((b) => flat(b.split(/\n(?! )/)[0]));
+    const named = new Set(bullets.flatMap((b) => (b.indexOf(' — ') < 0 ? [] : ticks(b.slice(2, b.indexOf(' — '))))));
+    const missing = [...top.filter((k) => !['type', 'seq', 'auto', 'se'].includes(k)), ...autoKeys].filter((k) => !named.has(k));
+    const platformBullet = bullets.find((b) => b.startsWith('- `platform` — ')) || '';
+    const sePara = between(protocol, '**The JWT never travels the bus**', '- **A threshold moves on');
+    const status = {
+      example: top.length > 15 && same(exKeys, top),
+      bullets: autoKeys.length === 5 && missing.length === 0,
+      platforms: PLATFORMS.length >= 5 && PLATFORMS.every((p) => platformBullet.includes('`' + p.name + '`')),
+      se: seKeys.length === 3 && seKeys.every((k) => sePara.includes('`' + k + '`')) && sePara.includes('Nothing sends a status because these change'),
+      // dispatch() drops every __status first, whoever sent it (the gate of 2026-11-28), and
+      // every other command, an unknown one too, ends in a status.
+      sent: protocol.includes('The sidecar ignores every `__status`, in any casing: its own echo, and one from any other sender too; the control page unwraps `value`. A status is sent after every poll or fetch (one thrown away after a `setUrl` too) and after every command but `__status`. One also goes out when the sidecar connects to Streamer.bot')
+        && protocol.includes('A StreamElements poll sends none of its own: its `se` fields go out with the next status.')
+        && !protocol.includes('after every command but its own `__status` echo')
+        && sidecar.includes("const folded = command.toLowerCase();\n  if (folded === '__status') return;")
+        && sidecar.includes("if (d.type !== 'ticker:command') return;\n      dispatch(String(d.command ?? ''), String(d.value ?? ''));")
+        && sidecar.includes('if (!name) { refuse(`unknown command')
+        && commandNames.length >= 16 && commandNames.every((n) => /pushStatus\(\)|refuse\(|applyMessageChange\(\)|startPolling\(\)|stopPolling\(\)/.test(caseBody(n)))
+        && ['function startPolling() {', 'function stopPolling() {', 'function applyMessageChange() {', 'function refuse(text) {'].every((f) => between(sidecar, f, '\n}\n').includes('pushStatus();')),
+      nextPollAt: protocol.includes('A poll a command asks for (`pollNow`, `start`, `setUrl`, or, while polling, a cap or option change that needs a fetch) skips the interval, the error backoff and the wait before an event')
+        && !protocol.includes('the minimum gap below, whichever is latest'),
+      eventState: protocol.includes('Matcherino always reads `in_progress`') && !protocol.includes('Matcherino never reports either'),
+      waitingUntil: sidecar.includes('const WAITING_POLL_MS = 300000;') && sidecar.includes('const UPCOMING_WAIT_CAP_MS = 15 * 60000;')
+        && protocol.includes('With no start time from the platform, or one no later than the end of the last poll, it is 5 minutes after the last poll')
+        && protocol.includes('With no start time, or one no later than the end of the last poll, it is 5 minutes away'),
+      lastError: sidecar.includes('throw new Error(`Unrecognized tournament URL: ${url}`)') && protocol.includes('fails every poll with `Unrecognized tournament URL: <the URL>`'),
+      unread: protocol.includes('A value the sidecar cannot read is not reported either: the command still counts as accepted, so it clears the notice.'),
+      // How a value that is not a number reads (the gate of 2026-11-28): the doc's examples
+      // run through the sidecar's own clampInt, with each case's own range.
+      notNumber: (() => {
+        const m = /A `setInterval`, `setMaxItems` or `setTopN` value is read as a number and rounded: text that is not a number, such as `([^`]+)`, keeps the setting, and an empty value reads as (\d+)\. In `setOptions`, an `intervalMs`, `maxItems` or `topN` is read from its JSON value the same way: a string as its text, (.+?) as (\d+), `([^`]+)` as (\d+), and an array of one number as that number; one that reads as no number, such as (.+?), keeps the setting\. (\d+) sets the lowest value: (\d+) ms, (\d+) item, or `topN` off; (\d+) sets (\d+) ms, (\d+) item, or a top-(\d+) filter\./.exec(protocol);
+        const opt = caseBody('setOptions');
+        const minInterval = num(/const MIN_INTERVAL_MS = (\d+);/, sidecar);
+        const range = (re) => { const x = re.exec(opt); return x ? [x[1] === 'MIN_INTERVAL_MS' ? minInterval : Number(x[1]), Number(x[2])] : null; };
+        const iv = range(/clampInt\(o\.intervalMs, (\w+), (\d+), config\.pollIntervalMs\)/);
+        const mi = range(/clampInt\(o\.maxItems, (\d+), (\d+), config\.maxItems\)/);
+        const tn = range(/clampInt\(o\.topN, (\d+), (\d+), config\.topN\)/);
+        if (!m || !iv || !mi || !tn || !sidecarClamp) return false;
+        const single = caseBody('setInterval').includes(`clampInt(value, MIN_INTERVAL_MS, ${iv[1]}, config.pollIntervalMs)`)
+          && caseBody('setMaxItems').includes(`clampInt(value, ${mi[0]}, ${mi[1]}, config.maxItems)`) && caseBody('setTopN').includes(`clampInt(value, ${tn[0]}, ${tn[1]}, config.topN)`);
+        const KEEP = -7; // clampInt's fallback: the setting kept (outside every range)
+        const as = (v, [lo, hi]) => sidecarClamp(v, lo, hi, KEEP);
+        const zeros = ticks(m[3]).map(jsonOf), keeps = ticks(m[7]).map(jsonOf), one = jsonOf(m[5]);
+        return single && sidecar.includes("dispatch(String(d.command ?? ''), String(d.value ?? ''));")
+          && sidecar.includes("function parseJson(v) {\n  try { return JSON.parse(String(v ?? '')); } catch { return null; }")
+          && as(m[1], tn) === KEEP && as('', tn) === Number(m[2]) && as('12', tn) === 12
+          && zeros.length >= 4 && zeros.every((j) => j.ok && as(j.v, tn) === Number(m[4]))
+          && one.ok && as(one.v, tn) === Number(m[6]) && as([50], tn) === 50
+          && keeps.length >= 2 && keeps.every((j) => j.ok && as(j.v, tn) === KEEP)
+          && as(Number(m[8]), iv) === Number(m[9]) && as(Number(m[8]), mi) === Number(m[10]) && as(Number(m[8]), tn) === 0
+          && as(Number(m[11]), iv) === Number(m[12]) && as(Number(m[11]), mi) === Number(m[13]) && as(Number(m[11]), tn) === Number(m[14])
+          && !protocol.includes('and so does a JSON `null`, `false` or `""` in `setOptions`');
+      })(),
+      // Every field and command named in the status prose is one the code has: each camelCase
+      // name in the section is a status, auto or se key, a command or a config.json key, and
+      // every auto., se., tournament., caps. and message. name in the docs is a key of its
+      // object (the gate of 2026-11-28: an `auto.waitUntil` passed).
+      names: (() => {
+        const known = new Set([...top, ...autoKeys, ...seKeys, ...commandNames, ...configTop]);
+        const camel = ticks(noFence(rawStatus)).filter((t) => /^[a-z]+[A-Z]\w*$/.test(t));
+        const keysOf = (s) => [...String(s || '').matchAll(/(\w+):/g)].map((x) => x[1]);
+        const parts = {
+          auto: autoKeys, se: seKeys,
+          tournament: keysOf(first(/tournament: \{ ([^}]*) \}/, between(sidecar, 'function blankPayload() {', '\n}\n'))),
+          caps: keysOf(first(/^ {2}caps: \{ ([^}]*) \},/m, configInit)),
+          message: [...keysOf(first(/^ {2}message: \{ ([^}]*) \},/m, configInit)), ...(between(sidecar, 'function messageBlock() {', '\n}\n').includes('{ lines }') ? ['lines'] : [])],
+        };
+        const dotted = [protocolRaw, readmeRaw, themingRaw].flatMap((s) => ticks(noFence(s))).filter((t) => /^(auto|se|tournament|caps|message)\.\w+$/.test(t));
+        return camel.length >= 20 && camel.every((t) => known.has(t)) && parts.tournament.length === 4 && parts.caps.length === 2 && parts.message.length === 3
+          && dotted.length >= 10 && dotted.every((t) => parts[t.split('.')[0]].includes(t.split('.')[1]));
+      })(),
+      // The settings' ranges and defaults in the status, as adoptConfig reads config.json and
+      // as the sidecar starts with none.
+      defaults: (() => {
+        const lim = (field) => { const x = new RegExp(`\\b${field}: clampInt\\(parsed\\.${field}, (\\w+), (\\d+), (\\d+)\\)`).exec(adoptBody); return x ? [x[1] === 'MIN_INTERVAL_MS' ? first(/const MIN_INTERVAL_MS = (\d+);/, sidecar) : x[1], x[2], x[3]] : null; };
+        const iv = lim('pollIntervalMs'), mi = lim('maxItems'), tn = lim('topN');
+        return !!iv && !!mi && !!tn && tn[2] === '0'
+          && configInit.includes(`\n  pollIntervalMs: ${iv[2]},`) && configInit.includes(`\n  maxItems: ${mi[2]},`) && configInit.includes(`\n  topN: ${tn[2]},`)
+          && protocol.includes(`\`intervalMs\` (${iv[0]}–${iv[1]}, default ${iv[2]}), \`maxItems\` (${mi[0]}–${mi[1]}, default ${mi[2]}), \`topN\` (${tn[0]}–${tn[1]}, 0 = off, the default)`)
+          && protocol.includes(`capped at the sidecar's \`maxItems\` (default ${mi[2]})`);
+      })(),
+      // The minimum gap between polls, wherever PROTOCOL and the README give it.
+      gap: (() => {
+        const g = num(/const MIN_POLL_GAP_MS = (\d+);/, sidecar) / 1000;
+        const all = (re, s) => [...s.matchAll(re)].map((x) => Number(x[1]));
+        const gapS = all(/the (\d+) s gap/g, protocol), betweenS = all(/(\d+) s between polls/g, protocol), readmeGap = all(/(\d+)-second gap/g, readme);
+        return Number.isInteger(g) && g > 0 && sidecar.includes("envLimit('ZIPPER_MIN_POLL_GAP_MS', MIN_POLL_GAP_MS, 0) : MIN_POLL_GAP_MS;")
+          && protocol.includes(`never sooner than ${g} s after the last poll (the minimum gap)`) && protocol.includes(`**At least ${g} s between polls**`)
+          && gapS.length >= 4 && gapS.every((n) => n === g) && betweenS.length >= 3 && betweenS.every((n) => n === g)
+          && readmeGap.length >= 1 && readmeGap.every((n) => n === g) && readme.includes(`no poll comes sooner than ${g} seconds after the last one`);
+      })(),
+    };
+    check('docs (row 11.1): PROTOCOL\'s ticker:status example carries every field statusSnapshot sends, in its order, and every field (auto\'s and se\'s too) has its meaning; when a status goes out (after every command but __status), nextPollAt, eventState, waitingUntil, an unrecognised URL\'s lastError, a value the sidecar cannot read and one that is not a number (run through the sidecar\'s own clampInt) are as the code has them; every field and command named in the status prose is one the code has, and the settings\' defaults and the minimum gap are the code\'s',
+      Object.values(status).every(Boolean), JSON.stringify({ ...status, top, exKeys, missing }));
+  }
+
+  // The command table, against dispatch.
+  {
+    const rows = between(protocolRaw, '## ticker:command', '\n## ticker:announce').split('\n').filter((l) => l.startsWith('| `'));
+    const row = (name) => flat(rows.find((l) => l.startsWith('| `' + name + '`')) || '');
+    const intervalMin = first(/const MIN_INTERVAL_MS = (\d+);/, sidecar);
+    const intervalMax = first(/clampInt\(value, MIN_INTERVAL_MS, (\d+),/, caseBody('setInterval'));
+    const capsTextMax = first(/config\.caps\.text = String\(value \?\? ''\)\.slice\(0, (\d+)\)/, caseBody('setCapsText'));
+    const messageMax = first(/const MESSAGE_MAX_CHARS = (\d+);/, sidecar);
+    const logoMax = first(/const LOGO_MAX = (\d+);/, sidecar);
+    const words = [...(first(/function truthy\(v\) \{[\s\S]*?return (s === [^;]*);/, sidecar) || '').matchAll(/'([^']+)'/g)].map((m) => m[1]);
+    const noUrl = first(/const NO_URL_MESSAGE = '([^']+)';/, sidecar);
+    const chatCs = (first(/static readonly string\[\] CHAT_ALLOWED = \{([^}]*)\};/, cs('ticker-command.cs')) || '').split(',').map((s) => s.trim().replace(/^"|"$/g, ''));
+    const chatSaid = first(/a `Ticker Command` pasted from 1\.0\.32 on relays only (.*?), matched without regard to case/, protocol);
+    const table = {
+      setIntervalOnce: rows.filter((l) => /^\| `setInterval`/.test(l)).length === 1 && !protocol.includes('| `setInterval` above,'),
+      interval: intervalMin === '15000' && intervalMax === '3600000' && row('setInterval').includes(`milliseconds, ${intervalMin}–${intervalMax}`)
+        && row('setInterval').includes('(single-field; for Stream Deck; `setOptions` is the batched form)') && !row('setOptions').includes('so it never cuts an error backoff'),
+      truthy: words.length === 4 && words.every((w) => row('setMessageEnabled').includes('`' + w + '`')) && row('setMessageEnabled').includes('anything else')
+        && row('setAutoSchedule').includes('read as for `setMessageEnabled`'),
+      cuts: capsTextMax === '120' && row('setCapsText').includes(`cut to its first ${capsTextMax} characters`) && row('setMessageText').includes(`cut to its first ${messageMax} characters`)
+        && row('setCapsLogo').includes(`cut to ${logoMax} characters before it is checked`),
+      startStop: noUrl === 'No tournament URL set' && row('start').includes(`Refused with "${noUrl}" in \`commandNotice\``) && row('stop').includes('a poll already under way is not stopped')
+        && protocol.includes('Whether polling is on is saved in `config.json` (`autoStart`)'),
+      refetch: row('setMaxItems').includes('fetched again too when that result was cut short (`cutShort`)') && row('setTopN').includes('single-field; for Stream Deck and chat')
+        && row('setTopN').includes('when it is switched on while that result was cut short (`cutShort`)'),
+      chat: same(chatCs, ['start', 'stop', 'pollNow', 'status', 'setTopN']) && same(ticks(chatSaid), chatCs),
+      oneRequest: protocol.includes('each control (button or checkbox) sends exactly **one**') && protocol.includes('Persistent message) carry them as one JSON value;')
+        && !protocol.includes('each control button sends exactly **one** command'),
+      // setMaxItems' and setTopN's ranges as their cases clamp them (the gate of 2026-11-28).
+      ranges: (() => {
+        const lim = (name, cfg) => (new RegExp(`clampInt\\(value, (\\d+), (\\d+), config\\.${cfg}\\)`).exec(caseBody(name)) || []).slice(1);
+        const mi = lim('setMaxItems', 'maxItems'), tn = lim('setTopN', 'topN');
+        return mi.length === 2 && tn.length === 2 && row('setMaxItems').startsWith(`| \`setMaxItems\` | ${mi[0]}–${mi[1]} |`)
+          && row('setTopN').startsWith(`| \`setTopN\` | ${tn[0]}–${tn[1]} (0 = off) |`);
+      })(),
+      // The message's line cap and character cut, as messageBlock and dispatch cut it.
+      messageLines: (() => {
+        const lines = first(/const MESSAGE_MAX_LINES = (\d+);/, sidecar);
+        return !!lines && row('setMessageText').includes(`blank lines are dropped, up to ${lines} show`) && protocol.includes(`capped at ${lines} lines / ${messageMax} characters`)
+          && between(sidecar, 'function messageBlock() {', '\n}\n').includes('.slice(0, MESSAGE_MAX_LINES);');
+      })(),
+    };
+    check('docs (row 11.1): PROTOCOL\'s command table names setInterval once, with the range, the cuts and the on/off words dispatch has; start, stop and the saved polling state; the refetch on setMaxItems and setTopN; the chat list as the Ticker Command from 1.0.32 has it; and setMaxItems\' and setTopN\'s ranges and the message\'s line cap as the sidecar has them',
+      Object.values(table).every(Boolean), JSON.stringify({ ...table, intervalMin, intervalMax, capsTextMax, messageMax, logoMax, words, chatCs }));
+  }
+
+  // ticker:announce, ticker:error and the test hook.
+  {
+    const queueMax = first(/const ANNOUNCE_QUEUE_MAX = (\d+);/, tickerJs);
+    const textMax = first(/text: a\.text\.trim\(\)\.slice\(0, (\d+)\)/, tickerJs);
+    const seTexts = [...between(sidecar, 'const SE_METRICS = {', '\n};').matchAll(/text: \(n\) => `([^`]*)`/g)].map((m) => m[1].replace('${n}', 'N'));
+    const duration = first(/sendJob\('Ticker Announce', 'announce', \{ kind: 'milestone', text, duration: '(\d+)' \}/, sidecar);
+    const argNames = [...csCode('ticker-announce.cs').matchAll(/\bArg\("(\w+)"\)/g)].map((m) => m[1]);
+    const st = /clampInt\(f\.status, (\d+), (\d+), (\d+)\)/.exec(sidecar) || [];
+    const err = between(protocol, '## ticker:error', '## Test hook');
+    const hook = between(protocol, '## Test hook', null);
+    const more = {
+      queue: queueMax === '10' && textMax === '200' && protocol.includes(`up to ${queueMax} wait behind the one on screen`) && protocol.includes(`shows at most its first ${textMax} characters`)
+        && !protocol.includes('Announcements queue (up to 10) and play back-to-back.'),
+      noName: csCode('ticker-announce.cs').includes('else if (user.Length > 0)') && protocol.includes('A sub or resub run with no name composes nothing'),
+      gifts: ['fromGiftBomb', 'anonymous', 'gifts'].every((a) => argNames.includes(a)) && !/totalGifts|subBombCount/.test(csCode('ticker-announce.cs'))
+        && protocol.includes('The action reads `fromGiftBomb`, `anonymous` and `gifts`, each as text; it does not read `totalGifts` or `subBombCount`.'),
+      milestones: duration === '10' && seTexts.length === 4 && seTexts.every((t) => protocol.includes(`"${t}"`)) && protocol.includes(`a duration of ${duration} s`),
+      errorRead: err.includes('Today\'s control page, overlay and sidecar do not read `action`. The control page and the sidecar do read the `ticker:error` itself'),
+      badPayload: err.includes('Only the first and last characters are checked, not the JSON: `{not json}` is accepted') && err.includes('A missing or blank `tickerPayload` is not refused: it is the connect-sync replay.'),
+      noCommand: err.includes('or that is given no command at all, broadcasts nothing and logs a warning'),
+      echoes: err.includes('it stops waiting for the echo of every request still waiting for one') && !err.includes('every click Streamer.bot has answered'),
+      // stubFail's status (the gate of 2026-11-28): the doc's examples run through the
+      // sidecar's own clampInt, with stubFailure's range and fallback.
+      stub: (() => {
+        const m = /Its status is read as a number and rounded, then kept within (\d+)–(\d+): (\d+) when it is absent or reads as no number, such as (.+?); `([^`]+)` gives (\d+), and (.+?) give (\d+)\. The Retry-After/.exec(hook);
+        if (!m || !sidecarClamp || st.length < 4) return false;
+        const [lo, hi, fb] = st.slice(1).map(Number);
+        const as = (v) => sidecarClamp(v, lo, hi, fb);
+        const none = ticks(m[4]).map(jsonOf), low = ticks(m[7]).map(jsonOf), given = jsonOf(m[5]);
+        return Number(m[1]) === lo && Number(m[2]) === hi && Number(m[3]) === fb && as(undefined) === fb
+          && none.length >= 2 && none.every((j) => j.ok && as(j.v) === fb)
+          && given.ok && as(given.v) === Number(m[6])
+          && low.length >= 4 && Number(m[8]) === lo && low.every((j) => j.ok && as(j.v) === lo)
+          && hook.includes('A hold file outside the repo folder is ignored') && hook.includes('`"startAt"` is the event\'s start time') && hook.includes('(`{tournamentName, state, startAt, matches, standings}`)')
+          && !hook.includes('when it is absent or not a number');
+      })(),
+      // An explicit text goes out trimmed: Arg() trims every argument, and a blank one is
+      // composed from the trigger's arguments, as no text is (the gate of 2026-11-28).
+      explicitText: csCode('ticker-announce.cs').includes('return CPH.TryGetArg(key, out v) && v != null ? Convert.ToString(v, CultureInfo.InvariantCulture).Trim() : "";')
+        && csCode('ticker-announce.cs').includes('string text = Arg("text");') && csCode('ticker-announce.cs').includes('if (text.Length == 0)\n            {\n                bool anonymous')
+        && protocol.includes('An explicit `text` is sent trimmed (the action trims every argument it reads), whatever `anonymous` holds; one that is blank once trimmed counts as no `text`.')
+        && !protocol.includes('An explicit `text` is sent as it is'),
+      // Every "N ms" (the gate of 2026-11-28: a 500 for an 800 passed): the sidecar's sends
+      // and its milestones against its send queue's release, the batched-commands box against
+      // panel-core's, ticker:error's against the control page's wait for an answer; any
+      // other is the 1 ms stamp step or the lowest interval.
+      releases: (() => {
+        const sideRel = num(/const SEND_RELEASE_MS = (\d+);/, sidecar), pageRel = num(/const SEND_RELEASE_MS = (\d+);/, panelCore);
+        const noAnswer = num(/const NO_ANSWER_MS = (\d+);/, controlHtml), minInterval = num(/const MIN_INTERVAL_MS = (\d+);/, sidecar);
+        const msIn = (s) => [...s.matchAll(/\b(\d+) ms\b/g)].map((x) => Number(x[1]));
+        const sends = msIn(between(protocol, '### The sidecar\'s sends', '## ticker:command')), box = msIn(between(protocol, '> **Why the batched', '## ticker:announce'));
+        const seMs = msIn(between(protocol, '### StreamElements milestones', '## ticker:error')), errMs = msIn(err);
+        return sideRel > 0 && pageRel > 0 && noAnswer === pageRel
+          && sends.length >= 2 && sends.every((n) => n === sideRel) && box.length >= 2 && box.every((n) => n === pageRel)
+          && seMs.length >= 1 && seMs.every((n) => n === sideRel) && errMs.length >= 2 && errMs.every((n) => n === noAnswer)
+          && msIn(protocol).every((n) => n === 1 || n === minInterval || n === sideRel || n === pageRel);
+      })(),
+    };
+    check('docs (row 11.1): PROTOCOL\'s ticker:announce gives the overlay\'s queue and cut, a sub with no name, the gift arguments the action reads, and the milestones\' texts and duration as the sidecar sends them; ticker:error says who reads it, what bad-payload checks, the run with no command, and which echoes the page stops waiting for; the test hook gives startAt, stubFail\'s status (its examples run through the sidecar\'s clampInt) and an outside hold file; an explicit announcement text goes out trimmed; and every 800 ms is the constant that times it',
+      Object.values(more).every(Boolean), JSON.stringify({ ...more, queueMax, textMax, seTexts, duration, argNames, stubStatus: st.slice(1) }));
+  }
+
+  // The README.
+  {
+    const adopt = between(sidecar, 'function adoptConfig(parsed) {', '\n}\n');
+    const clamp = (field) => { const m = new RegExp(`${field}: clampInt\\(parsed\\.[\\w?.]+, (\\w+), (\\d+), \\d+\\)`).exec(adopt); return m ? [m[1] === 'MIN_INTERVAL_MS' ? first(/const MIN_INTERVAL_MS = (\d+);/, sidecar) : m[1], m[2]] : null; };
+    const r = { interval: clamp('pollIntervalMs'), maxItems: clamp('maxItems'), topN: clamp('topN'), seconds: clamp('pollSeconds'), step: clamp('followers') };
+    const settings = Object.values(r).every(Boolean) && readme.includes(`When it loads the file it pulls each number into range without a warning: \`pollIntervalMs\` ${r.interval[0]} to ${r.interval[1]} (milliseconds), \`maxItems\` ${r.maxItems[0]} to ${r.maxItems[1]}, \`topN\` ${r.topN[0]} to ${r.topN[1]}, \`streamElements.pollSeconds\` ${r.seconds[0]} to ${r.seconds[1]}, and each \`milestones\` step ${r.step[0]} to ${r.step[1]}.`);
+    const metrics = [...between(sidecar, 'const SE_METRICS = {', '\n};').matchAll(/^ {2}(\w+): \{/gm)].map((m) => m[1]);
+    const labels = ['>Set<', '>Start polling<', '>Poll now<', '>Stop<', '>Apply<', '>Apply caps<', '> Auto start/stop<', '> Show this instead of results<'];
+    const mockHttp = first(/const HTTP_PORT = Number\(process\.env\.SB_HTTP_PORT\) \|\| (\d+);/, mockSrc);
+    const mockWs = first(/const WS_PORT = Number\(process\.env\.SB_WS_PORT\) \|\| (\d+);/, mockSrc);
+    const lang = 'https://challonge.com/fr/blko42';
+    const docs = {
+      tested: readme.includes('(tested on 1.0.4 and 1.0.7 as of Zipper 1.0.14; later releases were checked against a mock of Streamer.bot, and the actions in this version have been compiled only against a stand-in, not yet in Streamer.bot)'),
+      exception: readme.includes('the one exception, just after a restart, before the bracket has been fetched once: with polling off, or with polling on while the first poll is under way or the bracket site keeps failing')
+        && readme.includes('(except just after a restart, before the bracket has been fetched once, as described above)') && !readme.includes('just after a restart with polling off'),
+      noSidecar: labels.every((l) => controlHtml.includes(l))
+        && readme.includes('and the Set, Start polling, Poll now, Stop, Options Apply, Apply caps and message Apply buttons and the Auto start/stop and "Show this instead of results" checkboxes do nothing'),
+      banner: controlHtml.includes('A Zipper action failed in Streamer.bot: ') && controlHtml.includes('Streamer.bot refused ') && controlHtml.includes(' did not answer; check that it compiled')
+        && readme.includes('"Streamer.bot refused …" (any other error answer, in Streamer.bot\'s own words); "A Zipper action failed in Streamer.bot: … See Streamer.bot\'s log."')
+        && readme.includes('or "Ticker Command did not answer" or "Ticker Announce did not answer" (check that its code compiled)'),
+      stopSidecar: cs('ticker-sidecar-start.cs').includes('psi.WindowStyle = ProcessWindowStyle.Hidden;')
+        && readme.includes('One that the `Ticker Sidecar Start` action started runs hidden, with no window: end its `node.exe` in Task Manager'),
+      settings,
+      key: readme.includes('A key with a space, a line break or another character that is not printable ASCII inside it') && !readme.includes('is not used either, and the warning names it'),
+      startFail: readme.includes('If the sidecar stops by itself after it has started, the reason is the last line there.') && readme.includes('writes nothing there, so the last line is left over from an earlier run'),
+      upgrade: readme.includes('press **Poll now** once (it turns polling on and leaves it on)') && readme.includes('**Set** with the URL already set pushes nothing.') && !readme.includes('press **Set** or **Poll now**'),
+      logo: readme.includes('The logo is an http(s) address, or a path on Streamer.bot\'s HTTP server.') && !/'\.svg'/.test(mockSrc) && readme.includes('serves `.svg` files as `application/octet-stream`'),
+      challongeLanguage: detectPlatform(lang)?.name === 'challonge' && detectPlatform(lang).parseId(lang) === 'fr'
+        && readme.includes('A Challonge address with a language in it, such as `https://challonge.com/fr/blko42`, is not handled yet: it is read as the tournament `fr`.'),
+      announceRestart: readme.includes('The crawl then comes back from its first item. With nothing new, it comes back where it paused.'),
+      milestones: same(metrics, ['followers', 'subs', 'tips', 'cheers']) && readme.includes('as `"streamElements": { "jwtToken": "…" }`') && readme.includes('(`followers`, `subs`, `tips`, `cheers`; 0 = off)')
+        && !readme.includes('the ticker announces every time a counter crosses a step'),
+      refetch: readme.includes('fetches the event again, polling or not, as soon as the 15-second gap after the last poll (and any wait a site asked for) allows') && !readme.includes('fetches the event again at once'),
+      devPorts: mockHttp === '7474' && mockWs === '8080' && readme.includes(`npm start # mock Streamer.bot on ${mockHttp}/${mockWs}, Streamer.bot's own ports (see below)`)
+        && readme.includes(`set SB_HTTP_PORT=${HTTP_PORT}&& set SB_WS_PORT=${WS_PORT}&& npm start`),
+      browser: read('verify-render.mjs').includes("for (const channel of ['msedge', 'chrome', undefined])") && read(join('tools', 'shots.mjs')).includes("for (const channel of ['msedge', 'chrome', undefined])")
+        && readme.includes('needs Edge or Chrome, or run once: npx playwright-core install chromium'),
+      // The gate of 2026-11-28. A restart can repeat a milestone while saving has stopped
+      // or fails: saveConfig writes nothing for a refused or hand-edited config.json, and
+      // the poll saves a threshold only through persist().
+      restartRepeat: readme.includes('Announced steps are kept in `config.json`, so a restart does not repeat them. While saving the file has stopped or fails (the control page then shows a config warning), they are not saved, and a restart can repeat one.')
+        && between(sidecar, 'async function saveConfig() {', '\n}\n').includes('if (configLoadProblem) {') && between(sidecar, 'async function saveConfig() {', '\n}\n').includes('if (configEditedByHand) return;')
+        && between(sidecar, 'async function pollSe(channel) {', '\n}\n').includes('if (stateChanged) await persist();') && sidecar.includes('config.json could not be saved'),
+      // Task Manager's Command line column is hidden by default: a Windows fact, not the
+      // code's, so the sentence is pinned as it is.
+      taskManager: readme.includes('(on the Details tab; if several `node.exe` are listed, right-click a column header, choose Select columns and tick Command line: that column shows the one running `zipper-sidecar.mjs`)')
+        && !readme.includes('the Command line column shows'),
+      // One announcement per metric per check, the highest step reached: the sidecar's own
+      // milestone rule, given a jump past three steps, announces only the top one, and the
+      // poll pushes at most one announcement per metric.
+      milestoneTop: (() => {
+        let step = null;
+        try { step = new Function(`${sidecarBlock(sidecar, 'milestone rule')}\nreturn milestoneStep;`)(); } catch { step = null; }
+        let jump = null;
+        try { jump = step ? step({ saved: 100, savedKey: 'k', value: 350, key: 'k', step: 100 }) : null; } catch { jump = null; }
+        const pollSe = between(sidecar, 'async function pollSe(channel) {', '\n}\n');
+        return same(jump, { announce: 300 }) && (pollSe.match(/announcing\.push\(/g) || []).length === 1
+          && pollSe.includes('for (const [metric, def] of Object.entries(SE_METRICS)) {')
+          && readme.includes('after that, each check announces the highest new step the counter has reached (one announcement per metric per check, so a jump past several steps announces only the top one).');
+      })(),
+      // Every config.json key the docs name is one adoptConfig reads (an `streamElements.jwt`
+      // passed): the refused-key list, the dotted streamElements names, the keys saved in
+      // config.json, the JSON examples and the README's settings paragraph.
+      configKeys: (() => {
+        const keyNames = [...adoptBody.matchAll(/keyFor\(config\.[\w.]+, '([\w.]+)'/g)].map((x) => x[1]);
+        const listed = ticks(first(/\(for (`challongeApiKey`[^)]*)\), or the same for/, protocol));
+        const named = [protocolRaw, readmeRaw, themingRaw].flatMap((s) => ticks(noFence(s))).filter((t) => /^streamElements\.\w+$/.test(t));
+        const saved = [...protocol.matchAll(/`config\.json` \(`(\w+)`\)/g)].map((x) => x[1]);
+        const examples = (key) => [...`${protocolRaw}\n${readmeRaw}`.matchAll(new RegExp(`"${key}": \\{ ([^}]*) \\}`, 'g'))].flatMap((x) => [...x[1].matchAll(/"(\w+)":/g)].map((y) => `${key}.${y[1]}`));
+        const seJson = examples('streamElements'), msJson = examples('milestones');
+        const readmeNames = ticks(between(readme, 'Copy `config.example.json`', 'A key with a space')).filter((t) => /^[a-z][A-Za-z]*(\.[a-z][A-Za-z]*)?$/.test(t) && !/\.(?:json|tmp|log|exe|bat|mjs|js)$/.test(t));
+        const pollSecondsDefault = first(/pollSeconds: clampInt\(parsed\.streamElements\?\.pollSeconds, \d+, \d+, (\d+)\)/, adoptBody);
+        return keyNames.length === 3 && same(listed, keyNames)
+          && named.length >= 3 && named.every((n) => configNames.has(n))
+          && saved.length >= 3 && saved.every((n) => configTop.has(n))
+          && seJson.length >= 3 && seJson.every((n) => configNames.has(n)) && msJson.length >= 4 && msJson.every((n) => configNames.has(n))
+          && readmeNames.length >= 10 && readmeNames.every((n) => configNames.has(n) || configTop.has(n))
+          && !!pollSecondsDefault && protocolRaw.includes(`"streamElements": { "jwtToken": "…", "pollSeconds": ${pollSecondsDefault} }`);
+      })(),
+      // The side ports in every shell form the README gives (cmd and PowerShell), the ports
+      // verify-render.mjs and tools/shots.mjs use.
+      portForms: (() => {
+        const all = (re) => [...readme.matchAll(re)].map((x) => Number(x[1]));
+        const h = all(/SB_HTTP_PORT=(\d+)/g), w = all(/SB_WS_PORT=(\d+)/g);
+        const shared = ['verify-render.mjs', join('tools', 'shots.mjs')].every((f) => { const s = read(f); return num(/const HTTP_PORT = (\d+);/, s) === HTTP_PORT && num(/const WS_PORT = (\d+);/, s) === WS_PORT; });
+        return shared && h.length >= 2 && h.every((p) => p === HTTP_PORT) && w.length >= 2 && w.every((p) => p === WS_PORT)
+          && readme.includes(`(PowerShell: \`$env:SB_HTTP_PORT=${HTTP_PORT}; $env:SB_WS_PORT=${WS_PORT}; npm start\`), then open http://127.0.0.1:${HTTP_PORT}/.`);
+      })(),
+      // The log's rotation, as LOG_MAX_BYTES and LOG_OLD_PATH have it.
+      logRotate: (() => {
+        const m = /const LOG_MAX_BYTES = (\d+) \* (\d+);/.exec(sidecar);
+        const mb = m ? (Number(m[1]) * Number(m[2])) / 1048576 : NaN;
+        return Number.isFinite(mb) && mb > 0 && sidecar.includes('const LOG_OLD_PATH = `${LOG_BASE}.old.log`;')
+          && readme.includes(`The sidecar writes what it does to \`config.log\`, beside \`config.json\`; once that passes ${mb} MB it is moved to \`config.old.log\` and started again.`);
+      })(),
+      // How many announcements the strip keeps waiting (ticker.js's ANNOUNCE_QUEUE_MAX).
+      announceQueue: (() => {
+        const n = num(/const ANNOUNCE_QUEUE_MAX = (\d+);/, tickerJs);
+        return n > 0 && !!NUM_WORDS[n] && tickerJs.includes('if (announceQueue.length >= ANNOUNCE_QUEUE_MAX) return;')
+          && readme.includes(`(the strip keeps at most ${NUM_WORDS[n]} announcements waiting and drops any more,`);
+      })(),
+    };
+    check('docs (row 11.1): the README says what was tested, the exception before the first fetch, what needs the sidecar, every banner line, how to stop the sidecar, the settings\' ranges as config.json is read, a refused key, a sidecar that cannot start, the upgrade step, the logo, a Challonge address with a language, the crawl under an announcement, the milestone fields, when a refetch goes, the mock\'s ports (in cmd and PowerShell) and the browser the shots need; and a restart while saving has stopped, Task Manager\'s Command line column, one milestone per metric per check (the sidecar\'s own rule), the config.json keys adoptConfig reads, the log\'s rotation and the announcement queue as the code has them',
+      Object.values(docs).every(Boolean), JSON.stringify({ ...docs, ranges: r, metrics, mockHttp, mockWs }));
+  }
+
+  // THEMING, against ticker.css and ticker.js.
+  {
+    const rootBlock = between(tickerCss, ':root {', '\n}');
+    const cssVars = [...new Set([...tickerCss.matchAll(/--ticker-[a-z-]+[a-z]/g)].map((m) => m[0]))];
+    const uses = (v) => (tickerCss.match(new RegExp(`var\\(${v}\\)`, 'g')) || []).length;
+    const announceFallback = first(/background: var\(--ticker-announce-bg, var\((--[a-z-]+)\)\)/, tickerCss);
+    const wMin = first(/if \(w >= (\d+)\)/, tickerJs), hMin = first(/if \(h >= (\d+)\)/, tickerJs);
+    const logo = /\.cap-left img \{ max-height: calc\(var\(--ticker-height\) - (\d+)px\); max-width: (\d+)px;/.exec(tickerCss) || [];
+    const edge = first(/mask-image: linear-gradient\(to right, transparent 0, #000 (\d+)px/, tickerCss);
+    const theme = {
+      intro: !theming.includes('styled entirely by CSS custom properties') && theming.includes('The rest is fixed in its rules'),
+      everyVar: cssVars.length >= 15 && cssVars.every((v) => theming.includes(v + ':') || theming.includes('`' + v + '`')),
+      announceBg: announceFallback === '--ticker-bg' && !rootBlock.includes('--ticker-announce-bg')
+        && theming.includes('--ticker-announce-bg: not set by default; announcement bar background. Unset, the bar uses --ticker-bg'),
+      colours: uses('--ticker-accent') === 5 && uses('--ticker-live') === 4 && uses('--ticker-muted') === 4
+        && theming.includes('--ticker-accent: #ffd166; /* winner names, ◆ separators, standings places, sub + milestone pill */')
+        && theming.includes('--ticker-live: #ff4d5e; /* LIVE pip (and its ring) + tag, raid pill */')
+        && theming.includes('--ticker-muted: #8b94a3; /* round labels, "Up next", "vs"/"def.", the "waiting for results…" line, the default "Announcement" pill\'s background */'),
+      speed: tickerJs.includes("getComputedStyle(document.documentElement).getPropertyValue('--ticker-speed')") && theming.includes('read from :root only'),
+      params: wMin === '200' && hMin === '20' && theming.includes(`\`?w=640\` width (${wMin} or more), \`?h=48\` height (${hMin} or more)`)
+        && theming.includes('`window.__TICKER_WIDTH`, `window.__TICKER_HEIGHT` and `window.__TICKER_SPEED`') && theming.includes('`?sbport=8082`'),
+      fileUrl: read(join('overlay', 'ticker.html')).includes('<script src="/zipper-shared/panel-core.js"></script>') && theming.includes('so the strip never connects and stays on "waiting for results…"'),
+      logo: logo[1] === '24' && logo[2] === '220' && theming.includes(`it is at most the strip's height less ${logo[1]} px tall and ${logo[2]} px wide`),
+      font: theming.includes('A font named here must be installed on the PC, or loaded by the Custom CSS itself'),
+      anatomy: theming.includes('A cap shows only while ticker.js gives it `.on`') && theming.includes('The ◆ is `.item::after`, in `--ticker-accent`')
+        && theming.includes('`.vs` reads "vs", or "def." on a completed match') && theming.includes('`.track` gets the class `static` and holds a single `.item`')
+        && theming.includes('An announcement (`ticker:announce`) adds `.announcing` to `.zipper`'),
+      remeasure: theming.includes('The crawl is also measured again when the items or the strip\'s middle change width'),
+      edge: edge === '24' && first(/const EDGE_PX = (\d+);/, tickerJs) === edge && theming.includes(`fades the first and last ${edge} px of the scrolling area`),
+      devLoop: mockSrc.includes("path === '/mock/announce'") && theming.includes('/mock/announce?text=Hello&kind=raid&duration=8')
+        && theming.includes(`\`set SB_HTTP_PORT=${HTTP_PORT}&& set SB_WS_PORT=${WS_PORT}&& npm start\``) && theming.includes('stop a mock you started there first'),
+      // The gate of 2026-11-28. The params' inline style is on the root element, and the
+      // rule ticker.css reads the width and height in is named as the one that wins.
+      inline: (() => {
+        const sel = (/\n([^\n{}]+?) \{[^}]*\bwidth: var\(--ticker-width\);[^}]*\bheight: var\(--ticker-height\);/.exec(tickerCss) || [])[1];
+        return ['width', 'height', 'speed'].every((v) => tickerJs.includes(`document.documentElement.style.setProperty('--ticker-${v}'`))
+          && /^\.[\w-]+$/.test(sel || '') && tickerJs.includes("getComputedStyle(document.documentElement).getPropertyValue('--ticker-speed')")
+          && theming.includes(`so they win over the same variables set on \`:root\` in Custom CSS or \`ticker.css\`, unless that rule is marked \`!important\`. The root element only passes them down: a rule that sets \`--ticker-width\` or \`--ticker-height\` on \`${sel}\`, where ticker.css reads them, wins over \`?w\` and \`?h\`.`)
+          && !theming.includes('so they win over the same variables in Custom CSS');
+      })(),
+      // THEMING's :root block is ticker.css's, value for value and in its order; the README's
+      // ?w and ?h defaults and ticker.js's speed fallback are its figures too.
+      rootDefaults: (() => {
+        const decls = (s) => [...String(s).matchAll(/^\s*(--ticker-[a-z-]+):\s*([^;]+);/gm)].map((x) => [x[1], x[2].trim()]);
+        const css = decls(rootBlock), doc = decls(between(themingRaw, '```css\n:root {', '\n}\n```'));
+        const val = (v) => (css.find(([k]) => k === v) || [])[1];
+        return css.length >= 15 && same(doc, css)
+          && readme.includes(`\`?w=\` width (default ${parseInt(val('--ticker-width'), 10)}), \`?h=\` height (default ${parseInt(val('--ticker-height'), 10)})`)
+          && tickerJs.includes(`getPropertyValue('--ticker-speed')) || ${val('--ticker-speed')};`);
+      })(),
+      // The most copies of the segment ticker.js puts on the track.
+      copies: (() => {
+        const n = num(/const MAX_COPIES = (\d+);/, tickerJs);
+        return n >= 2 && !!NUM_WORDS[n] && tickerJs.includes('track.children.length < MAX_COPIES') && theming.includes(`more copies (up to ${NUM_WORDS[n]} in all) are added at once`);
+      })(),
+      // An announcement's duration: ticker.js, the mock and Ticker Announce clamp it alike,
+      // and THEMING (twice) and PROTOCOL give that range and default.
+      announceTime: (() => {
+        const js = /durationMs: Math\.min\((\d+), Math\.max\((\d+), Number\(a\.duration\) \|\| (\d+)\)\) \* 1000/.exec(tickerJs) || [];
+        const mock = /Math\.min\((\d+), Math\.max\((\d+), parseInt\(query\.get\('duration'\), 10\) \|\| (\d+)\)\)/.exec(mockSrc) || [];
+        const csA = csCode('ticker-announce.cs');
+        const csClamp = /duration = Math\.Min\((\d+), Math\.Max\((\d+), duration\)\);/.exec(csA) || [];
+        const [max, min, def] = js.slice(1);
+        return !!def && same(mock.slice(1), js.slice(1)) && first(/out duration\)\) duration = (\d+);/, csA) === def && csClamp[1] === max && csClamp[2] === min
+          && theming.includes(`When its time is up (${min} to ${max} s, default ${def}) the bar goes at once.`)
+          && theming.includes(`duration ${min} to ${max} seconds, ${def} by default`)
+          && protocol.includes(`\`duration\` is clamped ${min}–${max} s (default ${def})`);
+      })(),
+      // The kinds and the pill's labels, as ticker.js's PILL_LABELS and its fallbacks have
+      // them, in THEMING (the data-kind list, the labels, the dev loop) and PROTOCOL.
+      kinds: (() => {
+        const pill = [...(first(/const PILL_LABELS = \{([^}]*)\};/, tickerJs) || '').matchAll(/(\w+): '([^']+)'/g)].map((x) => [x[1], x[2]]);
+        const fallbackLabel = first(/PILL_LABELS\[kind\] \|\| '([^']+)'/, tickerJs);
+        const fallbackKind = first(/hasOwnProperty\.call\(PILL_LABELS, a\.kind\) \? a\.kind : '(\w+)'/, tickerJs);
+        const kinds = [...pill.map(([k]) => k), fallbackKind], labels = [...pill.map(([, l]) => l), fallbackLabel];
+        const dataKind = /`\.announce-wrap` carries `data-kind` = (.+?) \(any other kind shows as `([^`]+)`\)/.exec(theming) || [];
+        const devKinds = /\(kind (.+?), where any other kind shows as `([^`]+)`;/.exec(theming) || [];
+        return pill.length >= 3 && !!fallbackLabel && !!fallbackKind
+          && same(ticks(dataKind[1]), kinds) && dataKind[2] === fallbackKind && same(ticks(devKinds[1]), kinds) && devKinds[2] === fallbackKind
+          && theming.includes(`The pill reads ${labels.slice(0, -1).join(', ')} or ${labels[labels.length - 1]} (uppercased by the CSS)`)
+          && /\.announce-wrap \.pill \{[^}]*text-transform: uppercase;/.test(tickerCss)
+          && protocol.includes(`\`kind\` ∈ \`${kinds.join(' | ')}\` (styles the pill; anything else renders as custom)`);
+      })(),
+      // The bar's fade-in, as ticker.css runs announce-in.
+      announceIn: (() => {
+        const s = first(/\.zipper\.announcing \.announce-wrap \{[^}]*animation: announce-in (\d*\.?\d+)s/, tickerCss);
+        return !!s && tickerCss.includes('@keyframes announce-in') && theming.includes(`(\`announce-in\`, ${Number(s)} s)`);
+      })(),
+      // The bar's text cut, as ticker.js cuts it.
+      announceCut: (() => {
+        const cut = first(/text: a\.text\.trim\(\)\.slice\(0, (\d+)\)/, tickerJs);
+        return !!cut && theming.includes(`(trimmed, cut to ${cut} characters, and ending in "…" if it still does not fit)`);
+      })(),
+      // The swap fade's length and the item's left padding, as ticker.css has them.
+      swapFade: (() => {
+        const s = first(/\n\.track \{[^}]*transition: opacity (\d*\.?\d+)s/, tickerCss);
+        return !!s && tickerCss.includes('.track.swap-fade { opacity: 0; }') && theming.includes(`(\`.track.swap-fade\`, opacity 0 over ${Number(s)} s)`);
+      })(),
+      itemPad: (() => {
+        const p = first(/\n\.item \{[^}]*padding: 0 (\d+)px;/, tickerCss);
+        return !!p && theming.includes(`starts with an \`.item\`'s left padding (${p} px by default), which is empty`) && theming.includes(`keep at least ${edge} px of left padding on \`.item\``);
+      })(),
+      // The side ports in all three shell forms (cmd, PowerShell, Git Bash), every
+      // ?sbport= and every local address.
+      portForms: (() => {
+        const all = (re) => [...theming.matchAll(re)].map((x) => Number(x[1]));
+        const h = all(/SB_HTTP_PORT=(\d+)/g), w = all(/SB_WS_PORT=(\d+)/g), sb = all(/sbport=(\d+)/g), local = all(/127\.0\.0\.1:(\d+)/g);
+        return h.length >= 3 && h.every((p) => p === HTTP_PORT) && w.length >= 3 && w.every((p) => p === WS_PORT) && sb.length >= 2 && sb.every((p) => p === WS_PORT)
+          && local.length >= 5 && local.every((p) => p === mockHttpPort || p === HTTP_PORT)
+          && theming.includes(`in PowerShell \`$env:SB_HTTP_PORT=${HTTP_PORT}; $env:SB_WS_PORT=${WS_PORT}; npm start\`, in Git Bash \`SB_HTTP_PORT=${HTTP_PORT} SB_WS_PORT=${WS_PORT} npm start\`. Then use ${HTTP_PORT} in place of ${mockHttpPort} in the addresses above`);
+      })(),
+    };
+    check('docs (row 11.1): THEMING names every --ticker-* variable ticker.css has (--ticker-announce-bg with its fallback), says what each colour paints as ticker.css uses it, the URL params\' limits ticker.js applies, why file:// never connects, the logo\'s height, fonts, the anatomy (caps, items, the static line, the announcement bar, re-measuring, the edge fade), a dev loop that keeps clear of the suites\' ports (in cmd, PowerShell and Git Bash), and the :root defaults, the params\' inline style against a rule on .zipper, the copies\' cap, the announcement bar\'s kinds, labels, duration, cut and fade-in, the swap fade and the item padding as ticker.css and ticker.js have them',
+      Object.values(theme).every(Boolean), JSON.stringify({ ...theme, cssVars, announceFallback, wMin, hMin, logoFigures: logo.slice(1), edgePx: edge }));
+  }
+
+  // The action headers (comments only: the code the owner pastes is unchanged).
+  {
+    const ann = csHeader('ticker-announce.cs'), cmd = csHeader('ticker-command.cs'), push = csHeader('ticker-push.cs');
+    const headers = {
+      announceText: ann.includes('To change the text for one trigger, give that trigger an action of its own') && ann.includes('A Set Argument inside Ticker Announce itself runs on every run of it')
+        && !ann.includes('Set Argument before this sub-action'),
+      announceNoName: ann.includes('A missing name reads "Someone" in a raid, a gift sub or a gift bomb (a sub with no name has nothing to compose from'),
+      // A Stream Deck action of its own that runs Ticker Command: how Run Action carries the
+      // arguments was not checked, as Ticker Announce's header says of the same mechanism
+      // (the gate of 2026-11-28).
+      commandDeck: cmd.includes('Never add Set Argument sub-actions to Ticker Command itself') && !cmd.includes('Set Argument sub-actions before this one')
+        && cmd.includes('(Set Argument sub-actions, then Core → Actions → Run Action; how it carries the arguments was not checked here)')
+        && ann.includes('(Core → Actions → Run Action; how it carries the arguments was not checked here)') && !cmd.includes('then Run Action). Never'),
+      commandMock: cmd.includes('mock-sb-server.mjs (runTickerCommand) copies Execute()\'s relay') && !cmd.includes('(runTickerCommand) copies Execute() line for line'),
+      push: push.startsWith('Streamer.bot "Ticker Push" action — the one way a ticker:update reaches the pages.') && !push.includes('the single broadcast surface'),
+    };
+    check('docs (row 11.1): the action headers say how to give one trigger its own text, that a sub with no name is skipped, that a Stream Deck sets its arguments outside Ticker Command (and that how Run Action carries them was not checked), what the mock copies of Ticker Command, and that Ticker Push is the one way a ticker:update gets out',
+      Object.values(headers).every(Boolean), JSON.stringify(headers));
+  }
+}
+
 // ── Run ───────────────────────────────────────────────────────────────────────
 
 try {
@@ -7803,6 +8370,7 @@ try {
   await testStartggPaging();
   await testSidecarBlocks();
   testPanelCoreVm();
+  testDocsSweep();
   await startMock();
   await testPanelCore();
   await testMock();
