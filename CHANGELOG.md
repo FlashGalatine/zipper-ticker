@@ -10,6 +10,65 @@ traceability.
 
 ## [Unreleased]
 
+## [1.0.32] — 2026-11-28
+
+Copy the folder and refresh the OBS overlay source. Then, in Streamer.bot,
+re-paste **Ticker Command**, **Ticker Announce** and **Ticker Push**, and only
+after `Ticker Announce` compiles add its **Gift Subscription** and **Gift Bomb**
+triggers. The sidecar needs no restart and the control dock no reload. Re-pasting
+**Ticker Sidecar Start** is optional; if you do, set `BUNDLE` to your Zipper
+folder again and keep the `System.dll` reference.
+
+### Changed
+
+- **Chat can send five commands only:** `start`, `stop`, `pollNow`, `status` and
+  `setTopN`, in any letter case. Every other command, `setUrl` and the message
+  commands included, is refused with one warning in Streamer.bot's log and
+  never reaches the sidecar. The control page and a Stream Deck are not
+  limited. Before, the sidecar refused them; now the action does, too.
+- **A gift sub reads "Gifter gifted a sub to Recipient!"**, and a gift bomb is
+  announced once ("Gifter gifted 5 subs!"). The gift subs that belong to a bomb
+  announce nothing. An anonymous gift reads "Someone".
+- **The strip shows a repeated announcement once.** An announcement identical to
+  the one just before it is dropped.
+- **An action's error names the action and no longer carries the exception's
+  text.** `ticker:error` is `{ type, code, message, action }`; the full error is
+  in Streamer.bot's log. See `docs/PROTOCOL.md`.
+- **`Ticker Push` refuses a payload that is not a JSON object** with the code
+  `bad-payload`.
+
+### Fixed
+
+- **Streamer.bot's log no longer fills with status lines.** An open control page
+  wrote two lines every 10 seconds, and every poll two more. A command typed in
+  chat is still logged.
+- **`Ticker Sidecar Start` no longer carries the author's own folder.** It has a
+  placeholder `BUNDLE`, says so when the folder is wrong, does not start a
+  second sidecar when one already holds port 7496, and says whether the new one
+  came up within about 3 seconds.
+
+### Development
+
+- The mock refuses what the C# refuses and counts it (`refusedCount`);
+  `/mock/oldcs?on=1` stands in for an action pasted before this release.
+- `npm run verify:cs` compiles the launcher with and without `System.dll` and
+  runs a copy of it on side ports.
+- `npm run verify` 579 checks (was 568), `npm run verify:render` 181 (was 173),
+  `npm run verify:cs` 45 (was 19).
+
+### Not checked
+
+- Nothing was compiled or run in Streamer.bot. The three actions and the
+  launcher were compiled with the .NET compilers against a stub.
+- Whether Streamer.bot gives `fromGiftBomb` and `gifts` to the action the way
+  the stub does. No suite can tell; only a gift sub and a gift bomb in
+  Streamer.bot show it.
+- A live gift bomb: how its runs arrive, whether its gift subs carry
+  `fromGiftBomb`, and what name an anonymous gift has. Test Trigger on Gift
+  Subscription gave `fromGiftBomb` as true, so that test shows nothing.
+- Streamer.bot's own compile error for the launcher without `System.dll`.
+- Nothing was looked at in OBS. The suites ran on Node 22, not Node 20.
+
 ## [1.0.30] — 2026-11-27
 
 Copy the folder, restart the sidecar, then reload the control dock (the dock has
@@ -628,7 +687,8 @@ Initial release — scrolling tournament-results ticker for Streamer.bot.
 Live-validated keyless against real start.gg and Challonge brackets across
 pre-start, mid-event and completed states.
 
-[Unreleased]: https://github.com/FlashGalatine/zipper-ticker/compare/v1.0.30...main
+[Unreleased]: https://github.com/FlashGalatine/zipper-ticker/compare/v1.0.32...main
+[1.0.32]: https://github.com/FlashGalatine/zipper-ticker/compare/v1.0.30...v1.0.32
 [1.0.30]: https://github.com/FlashGalatine/zipper-ticker/compare/v1.0.28...v1.0.30
 [1.0.28]: https://github.com/FlashGalatine/zipper-ticker/compare/v1.0.26...v1.0.28
 [1.0.26]: https://github.com/FlashGalatine/zipper-ticker/compare/v1.0.24...v1.0.26
