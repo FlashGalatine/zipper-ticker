@@ -503,19 +503,25 @@
   });
 
   // ── Announcement takeover: pause the crawl, show the announcement, resume.
-  // Queued so back-to-back subs/raids play one after another.
+  // Queued so back-to-back subs/raids play one after another. An announcement identical to
+  // the one before it (the last one waiting, or, with none waiting, the one on screen) is
+  // dropped (ZIP-10): an older Ticker Announce sends the same line for every gift of a gift
+  // bomb. Identical means as it would show: the same pill, text and duration. Once the one
+  // before it has gone, the same announcement shows again.
   const announceWrap = document.getElementById('announce');
   const announcePill = document.getElementById('announce-pill');
   const announceText = document.getElementById('announce-text');
   const PILL_LABELS = { sub: 'New Sub', raid: 'Raid', milestone: 'Milestone' };
-  const announceQueue = [];
-  let announcing = false;
+  const ANNOUNCE_QUEUE_MAX = 10; // sanity cap during raid trains
+  const announceQueue = [];      // each as it shows: { kind, text, durationMs }
+  let announcing = null;         // the one on screen, or null
+  const sameAnnouncement = (a, b) => !!a && !!b && a.kind === b.kind && a.text === b.text && a.durationMs === b.durationMs;
 
   function pumpAnnouncements() {
     if (announcing || !announceQueue.length) return;
-    announcing = true;
     const a = announceQueue.shift();
-    const kind = PILL_LABELS[a.kind] ? a.kind : 'custom';
+    announcing = a;
+    const kind = a.kind;
     announceWrap.dataset.kind = kind;
     announcePill.textContent = PILL_LABELS[kind] || 'Announcement';
     announceText.textContent = a.text;
@@ -525,19 +531,26 @@
     // new is cut short too, and the same content goes on from the crawl's place. With nothing
     // waiting and no fade, the crawl pauses where it is.
     if (held || entering || fading) showNow(held || entering || shown, held || entering ? 0 : loopOffset());
-    const durationMs = Math.min(30, Math.max(2, Number(a.duration) || 8)) * 1000;
     setTimeout(() => {
       zipper.classList.remove('announcing');
-      announcing = false;
+      announcing = null;
       pumpAnnouncements();
-    }, durationMs);
+    }, a.durationMs);
   }
 
   window.addEventListener('ticker:announce', (e) => {
     const a = e.detail || {};
     if (typeof a.text !== 'string' || !a.text.trim()) return;
-    if (announceQueue.length >= 10) return; // sanity cap during raid trains
-    announceQueue.push({ kind: a.kind, text: a.text.trim().slice(0, 200), duration: a.duration });
+    const next = {
+      // Only the pill's own names: a plain object also answers to "constructor",
+      // "toString" or "__proto__", which would put Object's text in the pill.
+      kind: typeof a.kind === 'string' && Object.prototype.hasOwnProperty.call(PILL_LABELS, a.kind) ? a.kind : 'custom',
+      text: a.text.trim().slice(0, 200),
+      durationMs: Math.min(30, Math.max(2, Number(a.duration) || 8)) * 1000,
+    };
+    if (sameAnnouncement(next, announceQueue.length ? announceQueue[announceQueue.length - 1] : announcing)) return;
+    if (announceQueue.length >= ANNOUNCE_QUEUE_MAX) return;
+    announceQueue.push(next);
     pumpAnnouncements();
   });
 

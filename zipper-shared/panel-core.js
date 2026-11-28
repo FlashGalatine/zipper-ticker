@@ -13,8 +13,11 @@
 //                     sidecar's status arrives this way too, as command "__status"
 //                     with the status JSON as its value.
 //   ticker:announce — an announcement: { kind, text, duration }.
-//   ticker:error    — an action threw: { message }, and a `code` once the actions
-//                     send one. Read `message`; read `code` only when it is there.
+//   ticker:error    — an action threw, or refused what it was sent: { code, message,
+//                     action }, action being the sender's name (an action pasted
+//                     before 1.0.32 sends { message } alone). Read `message`; read
+//                     `code` only when it is there. Nothing here or on the pages
+//                     reads `action`.
 //
 // It raises these of its own, named outside ticker:* so no broadcast can pass for one:
 //

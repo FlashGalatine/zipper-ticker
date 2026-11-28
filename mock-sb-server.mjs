@@ -14,9 +14,12 @@
 //     run), with the request's own args plus actionId, actionName, queueName,
 //     runningActionId and actionQueuedAt; and with an error when no action has that
 //     name. Then it runs a copy of the C# action, line for line:
-//       Ticker Push      actions/ticker-push.cs      (store + broadcast, or replay)
-//       Ticker Command   actions/ticker-command.cs   (the relay, chat parsing included)
-//       Ticker Announce  actions/ticker-announce.cs  (compose, clamp, broadcast)
+//       Ticker Push      actions/ticker-push.cs      (store + broadcast, or replay;
+//                                                    a bad payload refused with bad-payload)
+//       Ticker Command   actions/ticker-command.cs   (the relay, chat parsing and the
+//                                                    chat list included)
+//       Ticker Announce  actions/ticker-announce.cs  (compose, a gift bomb once, clamp,
+//                                                    broadcast)
 //     Every broadcast goes to EVERY subscribed client, as CPH.WebsocketBroadcastJson
 //     does — the connect-sync replay of Ticker Push too, not only to the client that
 //     asked. tools/cs/ticker-cases.json is the table both are run against: verify.mjs
@@ -38,7 +41,13 @@
 //   /mock/silent?name=…&on=1|0    that action is queued (the reply is "ok") and its run
 //                                 does nothing: an action that never answers
 //   /mock/throw?name=…&on=1|0[&message=…]   that action's run sends ticker:error, as its
-//                                 catch block does when it throws (it stands for any throw)
+//                                 catch block does when it throws (it stands for any throw):
+//                                 code exception, the action's fixed text (or message= in
+//                                 its place when one is given) and the action's name
+//   /mock/oldcs?on=1|0            Ticker Command as pasted before the chat list: every chat
+//                                 command, and every bare rawInput with no command argument,
+//                                 is relayed (a dedicated chat command lower-cased), not only
+//                                 start, stop, pollNow, status and setTopN. Off by default.
 //   /mock/queue?name=…&queue=…    the replies for that action carry this queueName,
 //                                 whatever bleed mode says; an empty queue= clears it
 //   /mock/delay?name=…&ms=…       a slow Streamer.bot: the reply to each DoAction for that
@@ -48,7 +57,10 @@
 //                                 found") is decided when the request arrives. A request
 //                                 whose connection closes during the wait gets neither.
 //   /mock/kick            closes every open WebSocket connection
-//   /mock/stats           counters, switches and the stored payload, for the suites
+//   /mock/stats           counters, switches and the stored payload, for the suites;
+//                         refusedCount counts the commands Ticker Command refused from
+//                         chat or from a bare rawInput with no command argument (standing
+//                         for the warning the C# logs for each)
 // A switch's on= takes 1 or 0 only; any other value gets a 400 and changes nothing.
 //
 // Where it differs from Streamer.bot, on purpose: it refuses WebSocket connections from
@@ -92,7 +104,9 @@ const MIME = {
 
 // The C# action's persisted global, mirrored: the last tickerPayload string.
 let storedPayload = null;
-const stats = { pushCount: 0, commandCount: 0, announceCount: 0 };
+// refusedCount: commands Ticker Command refused from chat or from a bare rawInput (the
+// warning the C# logs for each).
+const stats = { pushCount: 0, commandCount: 0, announceCount: 0, refusedCount: 0 };
 
 // EMPTY_UPDATE in actions/ticker-push.cs, the same text.
 const EMPTY_UPDATE = '{"type":"ticker:update","tournament":null,"matches":[],"standings":[],"caps":{"text":"","logo":""}}';
@@ -149,11 +163,11 @@ Feed live data by running the sidecar against this mock:
 const ACTIONS = ['Ticker Push', 'Ticker Command', 'Ticker Announce'];
 const ACTION_IDS = Object.fromEntries(ACTIONS.map((name) => [name, randomUUID()]));
 const BLEED_WINDOW_MS = 10;          // requests for one action this close together overlap
-const DEFAULT_THROW_MESSAGE = 'mock: the action threw (the throw switch is on)';
 let argBleed = process.env.MOCK_ARG_BLEED === '1';
+let oldCs = false;                   // Ticker Command as pasted before the chat list (/mock/oldcs)
 const missing = new Set();           // action names that answer "was not found"
 const silent = new Set();            // action names whose runs do nothing
-const throwing = new Map();          // action name → the message its ticker:error carries
+const throwing = new Map();          // action name → the message its ticker:error carries ('' = the action's fixed text)
 const queueFor = new Map();          // action name → the queueName its replies carry
 const delayFor = new Map();          // action name → how long its replies are held, in ms
 const MAX_DELAY_MS = 60000;
@@ -247,6 +261,12 @@ async function handleHttp(req, res) {
     if (on !== undefined) argBleed = on;
     return json(res, { argBleed });
   }
+  if (path === '/mock/oldcs') {
+    const on = onParam(query);
+    if (on === null) return json(res, BAD_ON, 400);
+    if (on !== undefined) oldCs = on;
+    return json(res, { oldcs: oldCs });
+  }
   if (path === '/mock/missing' || path === '/mock/silent' || path === '/mock/throw' || path === '/mock/queue' || path === '/mock/delay') {
     const name = query.get('name');
     if (!ACTIONS.includes(name)) return json(res, { ok: false, error: `name must be one of: ${ACTIONS.join(', ')}` }, 400);
@@ -264,7 +284,7 @@ async function handleHttp(req, res) {
     const on = onParam(query);
     if (on === null) return json(res, BAD_ON, 400);
     if (path === '/mock/throw') {
-      if (on === true) throwing.set(name, query.get('message') || DEFAULT_THROW_MESSAGE);
+      if (on === true) throwing.set(name, query.get('message') || '');
       else if (on === false) throwing.delete(name);
       return json(res, { throwing: Object.fromEntries(throwing) });
     }
@@ -281,7 +301,7 @@ async function handleHttp(req, res) {
   if (path === '/mock/stats') {
     return json(res, {
       ...stats, totalRuns, clients: clients.size, hasPayload: !!storedPayload, storedPayload,
-      argBleed, missing: [...missing], silent: [...silent], throwing: Object.fromEntries(throwing), queues: Object.fromEntries(queueFor),
+      argBleed, oldcs: oldCs, missing: [...missing], silent: [...silent], throwing: Object.fromEntries(throwing), queues: Object.fromEntries(queueFor),
       delays: Object.fromEntries(delayFor),
     });
   }
@@ -484,20 +504,40 @@ function jsonStr(s) {
   return out + '"';
 }
 
-// The catch block every action has: a warning in the log, and ticker:error to every
-// subscriber with the exception's message.
+// ErrorJson in the actions: { type, code, message, action }, in that order, with action the
+// exact name of the action that sends it (ACTION_NAME in each).
+function errorJson(code, message, action) {
+  return '{"type":"ticker:error","code":' + jsonStr(code) + ',"message":' + jsonStr(message) + ',"action":' + jsonStr(action) + '}';
+}
+// EXCEPTION_MESSAGE in each action: the fixed text its catch block broadcasts.
+const EXCEPTION_MESSAGES = {
+  'Ticker Push': 'Ticker Push threw an exception',
+  'Ticker Command': 'Ticker Command threw an exception',
+  'Ticker Announce': 'Ticker Announce threw an exception',
+};
+// The catch block every action has: a warning in the log (with the exception), and
+// ticker:error to every subscriber with code exception, the action's fixed text and its
+// name, never the exception's own message. The throw switch's message=, when given, stands
+// in for the fixed text (a test tool's own words); the name is the action's either way.
 function actionThrew(name, message) {
-  console.log(`[mock] ${name} ERROR: ${message}`);
-  broadcast(customEvent('{"type":"ticker:error","message":' + jsonStr(message) + '}'));
+  console.log(`[mock] ${name} ERROR: ${message || '(the throw switch is on)'}`);
+  broadcast(customEvent(errorJson('exception', message || EXCEPTION_MESSAGES[name], name)));
 }
 
 // actions/ticker-push.cs
+const BAD_PAYLOAD_CODE = 'bad-payload';
+const BAD_PAYLOAD_MESSAGE = 'tickerPayload is not a JSON object';
 function runTickerPush(args) {
   let payload = tryGetArg(args, 'tickerPayload');
   if (payload !== null && !isNullOrWhiteSpace(payload)) {
     // Sidecar push: cheap sanity check only — the sidecar owns the shape.
     payload = csTrim(payload);
-    if (!csStartsWith(payload, '{') || !csEndsWith(payload, '}')) { actionThrew('Ticker Push', 'tickerPayload is not a JSON object'); return; }
+    if (!csStartsWith(payload, '{') || !csEndsWith(payload, '}')) {
+      // Refused: the stored payload stays as it was.
+      console.log(`[mock] Ticker Push refused (${BAD_PAYLOAD_CODE}): ${BAD_PAYLOAD_MESSAGE} (${payload.length} chars); nothing was stored`);
+      broadcast(customEvent(errorJson(BAD_PAYLOAD_CODE, BAD_PAYLOAD_MESSAGE, 'Ticker Push')));
+      return;
+    }
     storedPayload = payload; // CPH.SetGlobalVar("ticker.payload", payload, true)
     stats.pushCount++;
     console.log(`[mock] Ticker Push (sidecar) — broadcasting ${payload.length} chars`);
@@ -510,16 +550,29 @@ function runTickerPush(args) {
   broadcast(customEvent(payload));
 }
 
-// actions/ticker-command.cs
+// actions/ticker-command.cs. What chat may send (decision 1): matched without regard to
+// case, relayed as written here. /mock/oldcs?on=1 skips the list, as a Ticker Command
+// pasted before it does: every chat command and every bare rawInput is relayed, a
+// dedicated chat command lower-cased.
+const CHAT_ALLOWED = ['start', 'stop', 'pollNow', 'status', 'setTopN'];
+// toLowerCase() stands in for ToLowerInvariant(), as in the chat branch below; none of the
+// five names has a letter whose two lower cases differ.
+function chatName(command) {
+  const lower = command.toLowerCase();
+  return CHAT_ALLOWED.find((name) => lower === name.toLowerCase()) ?? null;
+}
 function runTickerCommand(args) {
   let command = '';
   let value = '';
+  let chat = false;      // a chat Command trigger (commandId set)
+  let bareInput = false; // rawInput alone, with no command argument
   let raw = tryGetArg(args, 'rawInput');
   raw = raw == null ? '' : csTrim(raw);
   const cid = tryGetArg(args, 'commandId');
   // A chat Command trigger sets ITS OWN `command` argument (the matched chat command,
   // e.g. "!ticker") plus a `commandId`, which a control-page DoAction never carries.
   if (cid !== null && !isNullOrWhiteSpace(cid)) {
+    chat = true;
     const c = tryGetArg(args, 'command');
     // .Trim().TrimStart('!').ToLowerInvariant(). toLowerCase() stands in for
     // ToLowerInvariant(); the table compares the two on ASCII letters only.
@@ -540,7 +593,9 @@ function runTickerCommand(args) {
       const v = tryGetArg(args, 'value');
       if (v !== null) value = v;
     } else if (raw.length > 0) {
-      // Bare rawInput fallback (manual Set Argument setups).
+      // Bare rawInput (a trigger, or a Set Argument setup, that carries only rawInput):
+      // limited to the chat list below, as chat is.
+      bareInput = true;
       const sp = raw.indexOf(' ');
       command = sp < 0 ? raw : raw.substring(0, sp);
       value = sp < 0 ? '' : csTrim(raw.substring(sp + 1));
@@ -550,6 +605,19 @@ function runTickerCommand(args) {
     console.log('[mock] Ticker Command: no command argument — nothing to relay');
     return;
   }
+  // Chat, and a bare rawInput, may send only the allowed commands (decision 1). A refusal
+  // is never broadcast; refusedCount stands for the warning the C# logs.
+  if ((chat || bareInput) && !oldCs) {
+    const allowed = chatName(command);
+    if (allowed === null) {
+      stats.refusedCount++;
+      console.log(`[mock] Ticker Command: refused ${chat ? 'from chat' : 'from a rawInput with no command argument'}: "${Array.from(command).slice(0, 40).join('')}"; nothing was relayed`);
+      return;
+    }
+    command = allowed;
+  }
+  // Not copied: which relays the C# logs at info (a status that does not come from chat is
+  // not logged). verify-cs.mjs checks that from the table's quiet rows.
   stats.commandCount++;
   broadcast(customEvent('{"type":"ticker:command","command":' + jsonStr(command) + ',"value":' + jsonStr(value) + '}'));
   console.log(`[mock] Ticker Command → ${command}`);
@@ -570,20 +638,40 @@ function intTryParse(s) {
 
 // actions/ticker-announce.cs
 function runTickerAnnounce(args) {
+  // A trigger's Boolean or Int32 argument (fromGiftBomb, gifts) arrives over the bus as a
+  // JSON true or number; tryGetArg gives its text ("true", "5"), as TryGetArg<string> gives
+  // "True" and "5" in the C#. The comparisons below are made in lower case.
   const arg = (key) => { const v = tryGetArg(args, key); return v != null ? csTrim(v) : ''; };
   const firstArg = (...keys) => { for (const k of keys) { const v = arg(k); if (v.length > 0) return v; } return ''; };
+  // A Gift Subscription run that is part of a gift bomb: the Gift Bomb run announces the
+  // bomb once, so this one is skipped.
+  if (arg('fromGiftBomb').toLowerCase() === 'true') {
+    console.log('[mock] Ticker Announce: a gift sub from a gift bomb: skipped (the Gift Bomb run announces the bomb)');
+    return;
+  }
   let kind = arg('kind');
   let text = arg('text');
   const user = firstArg('user', 'userName', 'displayName');
   // Auto-compose from common Twitch trigger arguments when no explicit text was set.
   if (text.length === 0) {
+    // An anonymous gift (its anonymous argument is true) reads "Someone" whatever `user` holds.
+    const anonymous = arg('anonymous').toLowerCase() === 'true';
+    const who = user.length > 0 && !anonymous ? user : 'Someone';
     const viewers = firstArg('viewers', 'viewerCount', 'raiders');
+    const gifts = arg('gifts');
+    const recipient = arg('recipientUser');
     if (viewers.length > 0) {
       if (kind.length === 0) kind = 'raid';
-      text = (user.length > 0 ? user : 'Someone') + ' is raiding with ' + viewers + ' viewers!';
+      text = who + ' is raiding with ' + viewers + ' viewers!';
+    } else if (gifts.length > 0) {
+      if (kind.length === 0) kind = 'sub';
+      text = gifts === '1' ? who + ' gifted a sub!' : who + ' gifted ' + gifts + ' subs!';
+    } else if (recipient.length > 0) {
+      if (kind.length === 0) kind = 'sub';
+      text = who + ' gifted a sub to ' + recipient + '!';
     } else if (user.length > 0) {
       if (kind.length === 0) kind = 'sub';
-      text = user + ' just subscribed!';
+      text = who + ' just subscribed!';
     }
   }
   if (kind.length === 0) kind = 'custom';

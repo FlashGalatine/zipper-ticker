@@ -171,8 +171,9 @@ const RENAME_RETRY_MS = 50;
 // likely to match ordinary text.
 const REDACT_MIN_CHARS = 8;
 // An unknown command is reported by its name only, cut to this many characters (the
-// longest real name, setMessageEnabled, has 17). The name can come from chat or any
-// local program, so nothing else limits its length.
+// longest real name, setMessageEnabled, has 17). The name can come from any local
+// program, or from chat through a Ticker Command pasted before 1.0.32 (the one from
+// 1.0.32 relays only five names from chat), so nothing else limits its length.
 const COMMAND_NAME_MAX = 40;
 // A result's pollNotice is kept to this many characters, cut after redaction (row 8.3).
 // An adapter's notice is fixed words well under it; a stub: file can carry anything.
@@ -854,7 +855,7 @@ function parseJson(v) {
 }
 
 // Booleans arrive as JSON true/false from the control page, but as words from
-// chat and Stream Deck ("!ticker setMessageEnabled on").
+// a Stream Deck (setMessageEnabled on).
 function truthy(v) {
   if (typeof v === 'boolean') return v;
   const s = String(v ?? '').trim().toLowerCase();
@@ -1652,9 +1653,9 @@ async function pollSe(channel) {
 //                reply yet, but the job's own broadcast arrived while it was in flight,
 //                when its release comes or the socket closes (the run has happened)
 //   'refused'    an error reply, such as "The action 'Ticker Push' was not found"
-//   'failed'     a ticker:error arrived while it was in flight (ticker:error names no
-//                sender, so a page's failed run at that moment, or the run of an earlier
-//                job still waiting for its reply, counts against the job)
+//   'failed'     a ticker:error arrived while it was in flight (the queue does not read
+//                which action sent it, so a page's failed run at that moment, or the run
+//                of an earlier job still waiting for its reply, counts against the job)
 //   'timed out'  no reply within SEND_OUTCOME_MS of the send, and no broadcast of its own
 //                while it was in flight
 //   'dropped'    the socket was closed when it was to be sent, or closed while it waited,
@@ -1995,8 +1996,10 @@ function applyMessageChange() {
 }
 
 // The commands dispatch() runs, keyed by their names in lower case. A name matches
-// without regard to case (ZIP-08): chat lower-cases a dedicated command, so "!pollnow"
-// arrives as "pollnow". The cases below keep the camelCase names docs/PROTOCOL.md uses.
+// without regard to case (ZIP-08): a Ticker Command pasted before the chat list
+// lower-cases a dedicated chat command, so "!pollnow" arrives as "pollnow" (the current
+// one relays the chat list's own spelling, "pollNow"). The cases below keep the camelCase
+// names docs/PROTOCOL.md uses.
 const COMMANDS = new Map([
   'setUrl', 'start', 'stop', 'pollNow', 'setInterval', 'setCapsText', 'setCapsLogo',
   'setTopN', 'setMaxItems', 'setCaps', 'setMessage', 'setMessageText',
@@ -2148,8 +2151,8 @@ function dispatch(command, value) {
     // Batched setters — the control page sends ONE of these per button so it
     // never fires a burst of DoActions (Streamer.bot bleeds arguments between
     // action invocations that arrive within a few ms, which corrupted the caps
-    // text). Value is a JSON object. The per-field commands above stay for chat
-    // / Stream Deck, where one action fires at a time.
+    // text). Value is a JSON object. The per-field commands above stay for
+    // Stream Deck, where one action fires at a time.
     case 'setCaps': {
       const o = parseJson(value);
       if (o && typeof o === 'object') {
@@ -2166,7 +2169,7 @@ function dispatch(command, value) {
       return;
     }
     // Persistent message mode — batched (text + enabled in one command) for the
-    // control page; the single-field variants below are for chat / Stream Deck.
+    // control page; the single-field variants below are for Stream Deck.
     case 'setMessage': {
       const o = parseJson(value);
       if (o && typeof o === 'object') {

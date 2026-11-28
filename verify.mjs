@@ -38,15 +38,21 @@
 //      replies, and its send queue under the mock's bleed mode (decision 13).
 //   4. The mock itself: its HTTP maps, DoAction replies in Streamer.bot's shape,
 //      its test switches (the delay switch, a slow Streamer.bot whose reply is decided
-//      when the request arrives, among them), and what it refuses (bad requests, other
-//      sites, messages over 1 MiB), and the file types it serves. Section 3's panel-core
-//      is then retired: its socket closed, and nothing it dials after that connects.
+//      when the request arrives, among them; the throw switch's coded ticker:error; the
+//      oldcs switch, a Ticker Command pasted before the chat list), and what it refuses
+//      (bad requests, other sites, messages over 1 MiB), and the file types it serves.
+//      Section 3's panel-core is then retired: its socket closed, and nothing it dials
+//      after that connects.
 //   5. The three bus actions as the mock runs them, against the case table
 //      tools/cs/ticker-cases.json (verify-cs.mjs runs the same rows through the
-//      compiled C#).
+//      compiled C#): the chat list (row 9.1, each refusal counted in refusedCount), the
+//      gift texts and a gift bomb announced once (row 9.2), and ticker:error's codes
+//      (row 9.4).
 //   6. Sidecar E2E: the REAL zipper-sidecar.mjs runs against the mock with the
 //      stub: platform — command round-trips, payload shape, diff suppression,
-//      caps re-push, auto-scheduling (stop on completed / wait for start), a stub
+//      caps re-push, chat commands (the five chat may send relayed in camelCase, the
+//      rest refused before the sidecar sees them; with the oldcs switch, the sidecar's
+//      own refusals), auto-scheduling (stop on completed / wait for start), a stub
 //      poll held open and released, every command in docs/PROTOCOL.md (as named
 //      there, and lower-cased), every range on the command path and the config path,
 //      and which commands it accepts: stub: URLs only with ZIPPER_ALLOW_STUB=1 and
@@ -1367,6 +1373,31 @@ async function testSidecarBlocks() {
           a.v === 'failed' && beforeReply && b.v === 'failed', JSON.stringify({ a: a.v, beforeReply, b: b.v }));
       }
       {
+        // The owner's ruling of 2026-11-27: an action pasted from 1.0.32 names itself in
+        // ticker:error's action. The queue does not read it (docs/PROTOCOL.md): a ticker:error
+        // that names the job's own action, or another one, ends the job in flight "failed",
+        // before or after its reply, as one with no action (an older paste) does.
+        const errs = {
+          own: { type: 'ticker:error', code: 'exception', message: 'Ticker Announce threw an exception', action: 'Ticker Announce' },
+          other: { type: 'ticker:error', code: 'bad-payload', message: 'tickerPayload is not a JSON object', action: 'Ticker Push' },
+          none: { type: 'ticker:error', message: 'boom' },
+        };
+        const seen = {};
+        for (const [key, err] of Object.entries(errs)) {
+          for (const order of ['after', 'before']) {
+            const e = fake();
+            const a = ann(e, `${key} ${order}`);
+            await turn();
+            if (order === 'after') { e.q.reply(ok(e.sent[0])); e.q.broadcast(err); }
+            else { e.q.broadcast(err); await turn(); e.q.reply(ok(e.sent[0])); }
+            await turn();
+            seen[`${key} ${order}`] = `${a.v}/${e.timers.size}`;
+          }
+        }
+        check('send queue: a ticker:error that names its sender (action, from an action pasted from 1.0.32) ends the job in flight "failed", before or after its reply, whichever action it names, as one with no action does; the queue does not read the field',
+          Object.values(seen).length === 6 && Object.values(seen).every((v) => v === 'failed/0'), JSON.stringify(seen));
+      }
+      {
         const e = fake();
         const a = push(e, '2026-11-25T10:00:00.002Z');
         await turn();
@@ -2410,11 +2441,39 @@ async function testMock() {
     const given = await actAndCollect(a, 'Ticker Announce', { text: 'x' });
     await mockGet(`/mock/throw?name=${enc('Ticker Announce')}&on=0`);
     const fine = await actAndCollect(a, 'Ticker Announce', { text: 'x' });
-    check('mock: /mock/throw makes an action send ticker:error, as its catch block does (with a given message when one is given); off, it runs again',
-      thrown.got?.length === 1 && thrown.got[0]?.type === 'ticker:error' && typeof thrown.got[0].message === 'string' && thrown.got[0].message.length > 0
-        && given.got?.length === 1 && given.got[0]?.message === 'a given message'
+    check('mock: /mock/throw makes an action send ticker:error, as its catch block does: code exception, the action\'s fixed text (row 9.4) and its exact name as action (the owner\'s ruling of 2026-11-27), or a given message when one is given; off, it runs again',
+      thrown.got?.length === 1 && JSON.stringify(thrown.got[0]) === JSON.stringify({ type: 'ticker:error', code: 'exception', message: 'Ticker Announce threw an exception', action: 'Ticker Announce' })
+        && given.got?.length === 1 && JSON.stringify(given.got[0]) === JSON.stringify({ type: 'ticker:error', code: 'exception', message: 'a given message', action: 'Ticker Announce' })
         && fine.got?.length === 1 && fine.got[0]?.type === 'ticker:announce',
       JSON.stringify({ thrown: thrown.got, given: given.got, fine: fine.got }));
+  }
+  // /mock/oldcs (row 9.1): a Ticker Command pasted before the chat list relays every chat
+  // command, a dedicated one lower-cased; the new one refuses what chat may not send and
+  // counts it in refusedCount. Explicit { command, value } runs are relayed either way.
+  {
+    const chatArgs = (command, rawInput) => ({ command, commandId: 'verify-oldcs', rawInput });
+    const relayOf = (got) => (got || []).filter((d) => d?.type === 'ticker:command').map((d) => `${d.command}=${d.value}`);
+    const st0 = await stats();
+    const nowSet = await actAndCollect(a, 'Ticker Command', chatArgs('!ticker', 'setCapsText @Old'));
+    const nowDedicated = await actAndCollect(a, 'Ticker Command', chatArgs('!PollNow', ''));
+    const nowExplicit = await actAndCollect(a, 'Ticker Command', { command: 'setCapsText', value: '@Page' });
+    const st1 = await stats();
+    let oldSet = null, oldDedicated = null, oldOn = null, st2 = null;
+    try {
+      oldOn = await mockGet('/mock/oldcs?on=1');
+      oldSet = await actAndCollect(a, 'Ticker Command', chatArgs('!ticker', 'setCapsText @Old'));
+      oldDedicated = await actAndCollect(a, 'Ticker Command', chatArgs('!PollNow', ''));
+      st2 = await stats();
+    } finally {
+      await mockGet('/mock/oldcs?on=0');
+    }
+    const st3 = await stats();
+    check('mock: /mock/oldcs?on=1 restores the relay of every chat command (an install that has not re-pasted Ticker Command); off, chat may send only the list, a refusal is counted in refusedCount and broadcasts nothing, and an explicit command is relayed either way',
+      st0.oldcs === false && relayOf(nowSet.got).length === 0 && JSON.stringify(relayOf(nowDedicated.got)) === '["pollNow="]' && JSON.stringify(relayOf(nowExplicit.got)) === '["setCapsText=@Page"]'
+        && st1.refusedCount === st0.refusedCount + 1
+        && oldOn?.oldcs === true && JSON.stringify(relayOf(oldSet?.got)) === '["setCapsText=@Old"]' && JSON.stringify(relayOf(oldDedicated?.got)) === '["pollnow="]'
+        && st2?.oldcs === true && st2.refusedCount === st1.refusedCount && st3.oldcs === false,
+      JSON.stringify({ st0: [st0.oldcs, st0.refusedCount], nowSet: nowSet.got, nowDedicated: nowDedicated.got, nowExplicit: nowExplicit.got, st1: st1.refusedCount, oldOn, oldSet: oldSet?.got, oldDedicated: oldDedicated?.got, st2: [st2?.oldcs, st2?.refusedCount], st3: st3.oldcs }));
   }
   {
     await mockGet(`/mock/queue?name=${enc('Ticker Push')}&queue=Default`);
@@ -2485,6 +2544,7 @@ async function testMock() {
       [`/mock/missing?name=${enc('Ticker Push')}&`, 'true', async () => (await stats()).missing.includes('Ticker Push')],
       [`/mock/silent?name=${enc('Ticker Push')}&`, 'yes', async () => (await stats()).silent.includes('Ticker Push')],
       [`/mock/throw?name=${enc('Ticker Push')}&`, 'ON', async () => 'Ticker Push' in (await stats()).throwing],
+      ['/mock/oldcs?', 'true', async () => (await stats()).oldcs === true],
     ];
     for (const [prefix, spelling, isOn] of tries) {
       try {
@@ -2498,7 +2558,7 @@ async function testMock() {
     }
     const st = await stats();
     check('mock: a switch given on= other than 1 or 0 (true, yes, ON) answers 400 and changes nothing',
-      wrong.length === 0 && st.argBleed === false && st.missing.length === 0 && st.silent.length === 0 && Object.keys(st.throwing).length === 0,
+      wrong.length === 0 && st.argBleed === false && st.missing.length === 0 && st.silent.length === 0 && Object.keys(st.throwing).length === 0 && st.oldcs === false,
       wrong.join('; ') || JSON.stringify(st));
   }
 
@@ -2654,17 +2714,95 @@ async function testCaseTable() {
         if (row.start === null) await mockGet('/mock/reset');
         else await fetch(`${HTTP}/mock/push`, { method: 'POST', body: row.start });
       }
-      if (row.throw) await mockGet(`/mock/throw?name=${enc(action)}&on=1&message=${enc(table.throwMessage)}`);
+      // The throw switch with no message= sends what the C#'s catch block sends: code
+      // exception and the action's own fixed text (row 9.4).
+      if (row.throw) await mockGet(`/mock/throw?name=${enc(action)}&on=1`);
+      const refusedBefore = (await stats()).refusedCount;
       let res;
-      try { res = await actAndCollect(c, action, row.args); }
+      try { res = await actAndCollect(c, action, table.typedArgs(row)); }
       finally { if (row.throw) await mockGet(`/mock/throw?name=${enc(action)}&on=0`); }
       const want = row.broadcast === null ? [] : [asData(row.broadcast)];
-      let ok = res.reply?.m?.status === 'ok' && !!res.got && same(res.got, want);
-      if (action === 'Ticker Push') ok = ok && (await stats()).storedPayload === row.stored;
-      if (!ok) wrong.push(`"${row.name}": wanted ${JSON.stringify(want)}${action === 'Ticker Push' ? ` stored ${JSON.stringify(row.stored)}` : ''}; got ${JSON.stringify(res.got)}`);
+      const st = await stats();
+      // A chat command the C# refuses with its warning is counted in refusedCount (row 9.1),
+      // and nothing else is.
+      const refusedNow = st.refusedCount - refusedBefore;
+      let ok = res.reply?.m?.status === 'ok' && !!res.got && same(res.got, want) && refusedNow === (row.refused ? 1 : 0);
+      if (action === 'Ticker Push') ok = ok && st.storedPayload === row.stored;
+      if (!ok) wrong.push(`"${row.name}": wanted ${JSON.stringify(want)}${action === 'Ticker Push' ? ` stored ${JSON.stringify(row.stored)}` : ''} refused ${row.refused ? 1 : 0}; got ${JSON.stringify(res.got)} refused ${refusedNow}`);
     }
     check(`${action}: the mock answers every one of the table's ${rows.length} rows as the table says (verify:cs runs the same rows through the C#)`,
       rows.length > 0 && wrong.length === 0, wrong.slice(0, 6).join(' || '));
+  }
+  // The chat list, the same three times: in the table, in the C# and in the mock.
+  {
+    const listOf = (src, re) => { const m = re.exec(src); return m ? m[1].split(',').map((s) => s.trim().replace(/^['"]|['"]$/g, '')) : null; };
+    const cs = listOf(await readFile(resolve(__dirname, 'actions', 'ticker-command.cs'), 'utf-8'), /static readonly string\[\] CHAT_ALLOWED = \{([^}]*)\};/);
+    const mock = listOf(await readFile(resolve(__dirname, 'mock-sb-server.mjs'), 'utf-8'), /const CHAT_ALLOWED = \[([^\]]*)\];/);
+    check('the chat list (decision 1) is the same in the table, in ticker-command.cs and in the mock: start, stop, pollNow, status, setTopN',
+      JSON.stringify(table.chatAllowed) === JSON.stringify(['start', 'stop', 'pollNow', 'status', 'setTopN'])
+        && JSON.stringify(cs) === JSON.stringify(table.chatAllowed) && JSON.stringify(mock) === JSON.stringify(table.chatAllowed),
+      JSON.stringify({ table: table.chatAllowed, cs, mock }));
+  }
+  // A gift bomb through the mock, as verify:cs runs it through the C#: one Gift Bomb run and
+  // its three Gift Subscription runs, in either order, broadcast ONE announcement (row 9.2).
+  {
+    const bomb = { user: 'Gifter', gifts: 3, totalGifts: 7 };
+    const gift = (n) => ({ user: 'Gifter', recipientUser: `R${n}`, fromGiftBomb: true, subBombCount: 3, monthsGifted: '1' });
+    const runAll = async (list) => { const out = []; for (const args of list) out.push(...((await actAndCollect(c, 'Ticker Announce', args)).got || [])); return out; };
+    const first = await runAll([bomb, gift(1), gift(2), gift(3)]);
+    const last = await runAll([gift(1), gift(2), gift(3), bomb]);
+    const one = (got) => got.length === 1 && got[0]?.type === 'ticker:announce' && got[0].kind === 'sub' && got[0].text === 'Gifter gifted 3 subs!';
+    check('Ticker Announce (the mock): one Gift Bomb run and its 3 Gift Subscription runs (fromGiftBomb true), in either order, broadcast ONE announcement, "Gifter gifted 3 subs!"',
+      one(first) && one(last), JSON.stringify({ first, last }));
+  }
+  // The docs that go with row 9.2 (review of Sprint 9): the gift triggers wait for the
+  // blocking queue (in the Default queue a bomb's runs can mix their arguments, and the Gift
+  // Bomb run can then be skipped too, so the bomb shows nothing), and an anonymous gift reads
+  // "Someone".
+  {
+    const flat = (p) => readFileSync(resolve(__dirname, p), 'utf-8').replace(/\s+/g, ' ');
+    const readme = flat('README.md');
+    const protocol = flat(join('docs', 'PROTOCOL.md'));
+    const header = flat(join('actions', 'ticker-announce.cs')).replace(/ ?\/\/ ?/g, ' ');
+    const docs = {
+      readmeQueue: readme.includes('Add them only once the three bus actions are in the blocking queue of step 1')
+        && readme.includes('so the Gift Bomb run can read a gift sub\'s `fromGiftBomb` and be skipped as well'),
+      headerQueue: header.includes('add them only once this action is in the blocking queue')
+        && header.includes('the Gift Bomb run can then read a gift sub\'s fromGiftBomb and be skipped too'),
+      protocolQueue: protocol.includes('That needs the blocking queue: in the Default queue a bomb\'s runs can mix their arguments'),
+      anonymous: readme.includes('An anonymous gift reads "Someone"') && protocol.includes('as does a gift whose `anonymous` is true')
+        && header.includes('and so does an anonymous gift (its anonymous argument is true)'),
+      // Round 2 of Sprint 9: what the streamer would see if a live bomb's runs lacked the flag.
+      readmeNoFlag: readme.includes('If a live bomb\'s Gift Subscription runs did not carry `fromGiftBomb`, the strip would show several "Gifter gifted a sub to Recipient!" lines, one per recipient,')
+        && readme.includes('whether they carry it was not seen on a live bomb.'),
+      // The order the owner ruled on (2026-11-27): the gift triggers come after the compile.
+      readmeOrder: readme.includes('Add the two gift triggers only after the `Ticker Announce` from this version compiles'),
+    };
+    check('docs (row 9.2, review): the README, PROTOCOL and Ticker Announce\'s header say to add the gift triggers only once the actions are in the blocking queue (in the Default queue a bomb\'s Gift Bomb run can be skipped too), and that an anonymous gift reads "Someone"; the README says what a live bomb whose gift subs lacked fromGiftBomb would show, and that this was not seen live',
+      Object.values(docs).every(Boolean), JSON.stringify(docs));
+  }
+  // ticker:error's sender (the owner's ruling of 2026-11-27): PROTOCOL and each bus action's
+  // ERRORS header say that action names the action that sent it, that an action pasted
+  // before 1.0.32 sends none, and that today's pages and sidecar do not read it.
+  {
+    const flat = (p) => readFileSync(resolve(__dirname, p), 'utf-8').replace(/\s+/g, ' ');
+    const protocol = flat(join('docs', 'PROTOCOL.md'));
+    const section = protocol.slice(protocol.indexOf('## ticker:error'), protocol.indexOf('## Test hook'));
+    const headerOf = (file) => flat(join('actions', file)).replace(/ ?\/\/ ?/g, ' ');
+    const sender = {
+      shape: section.includes('`{ "type": "ticker:error", "code": "…", "message": "…", "action": "…" }`'),
+      names: section.includes('`action` names the action that sent it (`Ticker Push`, `Ticker Command` or `Ticker Announce`), whatever the code.'),
+      notRead: section.includes('Today\'s control page, overlay and sidecar do not read it.'),
+      older: section.includes('An action pasted before 1.0.32 sends neither `code` nor `action`'),
+      queue: protocol.includes('(the sidecar does not read which action sent it, so'),
+      headers: ['ticker-push.cs', 'ticker-command.cs', 'ticker-announce.cs'].every((f) => {
+        const h = headerOf(f);
+        const name = { 'ticker-push.cs': 'Ticker Push', 'ticker-command.cs': 'Ticker Command', 'ticker-announce.cs': 'Ticker Announce' }[f];
+        return h.includes(`code:"exception", message:"<fixed text>", action:"${name}" }`) && h.includes('the control page and the sidecar do not read it');
+      }),
+    };
+    check('docs (the owner\'s ruling of 2026-11-27): PROTOCOL\'s ticker:error section and the three bus actions\' ERRORS headers give { type, code, message, action }, say action names the action that sent it, that one pasted before 1.0.32 sends none, and that today\'s pages and sidecar do not read it',
+      Object.values(sender).every(Boolean), JSON.stringify(sender));
   }
   // Leave the store as section 6 found it before this table existed: the sample.
   await fetch(`${HTTP}/mock/push`, { method: 'POST', body: await readFile(FIX('sample-update.json'), 'utf-8') });
@@ -2820,15 +2958,31 @@ async function testSidecar() {
   check('sidecar: caps change forces re-push', !!upd2, 'no update with the new caps text after setCapsText');
 
   // Chat "!ticker <cmd> …" exactly as a real SB Command trigger fires it: SB's
-  // OWN command arg ("!ticker") + commandId + rawInput — the action must parse
-  // rawInput instead of relaying "!ticker" verbatim.
-  const atChat = mark();
-  client.ws.send(JSON.stringify({
+  // OWN command arg ("!ticker") + commandId + rawInput. Chat may send only start, stop,
+  // pollNow, status and setTopN (decision 1, row 9.1): anything else is refused by
+  // Ticker Command (here the mock's copy of it), never relayed, and counted in the mock's
+  // refusedCount. Each refused command is followed by an allowed marker on the same
+  // socket (the mock runs one socket's requests in order); nothing the refused command
+  // would have relayed may arrive before the marker's own relay.
+  const chat = (rawInput, id = 'trig-1') => client.ws.send(JSON.stringify({
     request: 'DoAction', id: 'c', action: { name: 'Ticker Command' },
-    args: { command: '!ticker', commandId: 'trig-1', rawInput: 'setCapsText @ChatSet' },
+    args: { command: '!ticker', commandId: id, rawInput },
   }));
-  const updChat = await since(atChat, (d) => isUpdate(d) && d.caps?.text === '@ChatSet');
-  check('sidecar: chat !ticker maps through the trigger shape', !!updChat, 'no update with the caps text sent from chat');
+  for (const [rawInput, name, value] of [['setCapsText @ChatSet', 'setcapstext', '@ChatSet'], ['__status {}', '__status', '{}']]) {
+    const refusedBefore = (await stats()).refusedCount;
+    const atChat = mark();
+    chat(rawInput);
+    chat('status', 'trig-marker'); // relayed as ticker:command "status"
+    const marker = await since(atChat, (d) => d?.type === 'ticker:command' && d.command === 'status' && d.value === '');
+    const markerAt = marker ? client.events.indexOf(marker, atChat) : -1;
+    const leaked = markerAt < 0 ? null : client.events.slice(atChat, markerAt)
+      .filter((d) => d?.type === 'ticker:command' && String(d.command).toLowerCase() === name && d.value === value);
+    const capsLeak = client.events.slice(atChat).some((d) => isUpdate(d) && d.caps?.text === '@ChatSet');
+    const refusedAfter = (await stats()).refusedCount;
+    check(`sidecar: chat !ticker ${rawInput} is refused (decision 1): no ticker:command for it arrives before the allowed marker that followed it, and the mock's refusedCount went up by one`,
+      markerAt >= 0 && leaked?.length === 0 && !capsLeak && refusedAfter === refusedBefore + 1,
+      JSON.stringify({ marker: markerAt, leaked, capsLeak, refusedBefore, refusedAfter }));
+  }
 
   // Batched setCaps (one command, JSON value — the control page's burst-safe
   // path). Sets both text and logo at once; '@'-leading text must survive.
@@ -2858,6 +3012,20 @@ async function testSidecar() {
   cmd('setTopN', '0');
   const updReset = await since(atReset, (d) => isUpdate(d) && d.matches.length === 3);
   check('sidecar: topN 0 restores every match', !!updReset, 'no re-push after setTopN 0');
+  // The same through chat, lower case and with a value: "!ticker settopn 2" is on the chat
+  // list, relayed as setTopN (row 9.1), and cuts the matches to 2 (the rawInput split and
+  // ZIP-08's lower-case subcommand).
+  const atChatTop = mark();
+  chat('settopn 2', 'trig-top');
+  const updChatTop = await since(atChatTop, (d) => isUpdate(d) && d.matches.length === 2);
+  const relayedTop = client.events.slice(atChatTop).find((d) => d?.type === 'ticker:command' && d.command !== '__status');
+  check('sidecar: chat !ticker settopn 2 is relayed as setTopN 2 and cuts the matches to the top-placed 2',
+    !!updChatTop && relayedTop?.command === 'setTopN' && relayedTop.value === '2'
+      && updChatTop.matches.every((m) => ['Flash', 'Rival'].includes(m.p1.name) || ['Flash', 'Rival'].includes(m.p2.name)),
+    JSON.stringify({ relayed: relayedTop, matches: updChatTop?.matches?.map((m) => `${m.p1.name} vs ${m.p2.name}`) }));
+  const atReset2 = mark();
+  cmd('setTopN', '0');
+  check('sidecar: and topN 0 restores every match again', !!(await since(atReset2, (d) => isUpdate(d) && d.matches.length === 3)), 'no re-push after setTopN 0');
 
   // Persistent message mode: takes the strip over, results ride along underneath.
   const atMsg = mark();
@@ -3484,7 +3652,11 @@ async function testAccepts(client, sc, since, mark, cmd, cfgPath) {
       JSON.stringify({ commandNotice: eh?.commandNotice }));
   }
 
-  // The chat path: names arrive lower-cased (the C# lower-cases a dedicated command).
+  // The chat path. Ticker Command (the mock's copy) now relays only the chat list, in
+  // camelCase (row 9.1): "!pollnow" arrives as "pollNow", and "!ticker seturl …" is refused
+  // before the sidecar sees it. The cases below that test the sidecar's own refusals run
+  // with /mock/oldcs?on=1, as on an install that has not re-pasted Ticker Command: that one
+  // relays every chat command, a dedicated one lower-cased.
   {
     let at = mark();
     cmd('status');
@@ -3492,8 +3664,45 @@ async function testAccepts(client, sc, since, mark, cmd, cfgPath) {
     at = mark();
     chat('!pollnow', '');
     const polled = await since(at, (d) => !!statusOf(d)?.lastPollAt && statusOf(d).lastPollAt !== before?.lastPollAt);
-    check('chat: !pollnow (relayed as "pollnow") polls', !!polled && statusOf(polled).lastError === '',
-      polled ? JSON.stringify({ lastError: statusOf(polled).lastError }) : 'no poll after !pollnow');
+    const relayedPoll = client.events.slice(at).find((d) => d?.type === 'ticker:command' && d.command !== '__status');
+    check('chat: !pollnow (relayed as "pollNow", the chat list\'s spelling) polls', !!polled && statusOf(polled).lastError === '' && relayedPoll?.command === 'pollNow',
+      polled ? JSON.stringify({ lastError: statusOf(polled).lastError, relayed: relayedPoll?.command }) : 'no poll after !pollnow');
+    at = mark();
+    cmd('stop');
+    await since(at, (d) => statusOf(d)?.polling === false);
+
+    // The same refusals with today's Ticker Command, which the chat list now stops first:
+    // nothing reaches the sidecar, so its URL and logo stay, and nothing is relayed.
+    {
+      const base = statusOf(await (async () => { const a2 = mark(); cmd('status'); return since(a2, isStatus); })());
+      const refusedBefore = (await stats()).refusedCount;
+      at = mark();
+      chat('!ticker', 'seturl stub:./platforms/fixtures/stub-result.json');
+      chat('!ticker', 'setcapslogo javascript:alert(1)');
+      chat('!ticker', 'seturl');
+      chat('!ticker', 'status'); // the marker: relayed, and answered with a status
+      const marker = await since(at, (d) => d?.type === 'ticker:command' && d.command === 'status');
+      const markerAt = marker ? client.events.indexOf(marker, at) : -1;
+      const relayed = markerAt < 0 ? null : client.events.slice(at, markerAt).filter((d) => d?.type === 'ticker:command' && d.command !== '__status').map((d) => d.command);
+      const after = statusOf(await since(at, isStatus));
+      const refusedAfter = (await stats()).refusedCount;
+      check('chat: !ticker seturl (with a stub: URL inside the repo, and with no value) and !ticker setcapslogo are refused by Ticker Command before the sidecar sees them: none is relayed before the marker after them, refusedCount goes up by 3, and the URL and the logo stay',
+        markerAt >= 0 && relayed?.length === 0 && refusedAfter === refusedBefore + 3 && after?.url === base?.url && after?.caps?.logo === base?.caps?.logo && after?.commandNotice === '',
+        JSON.stringify({ markerAt, relayed, refusedBefore, refusedAfter, url: [base?.url, after?.url], logo: [base?.caps?.logo, after?.caps?.logo], commandNotice: after?.commandNotice }));
+    }
+  }
+  try {
+    await mockGet('/mock/oldcs?on=1');
+    let at = mark();
+    cmd('status');
+    const before = statusOf(await since(at, isStatus));
+    at = mark();
+    chat('!pollnow', '');
+    const polledOld = await since(at, (d) => !!statusOf(d)?.lastPollAt && statusOf(d).lastPollAt !== before?.lastPollAt);
+    const relayedOld = client.events.slice(at).find((d) => d?.type === 'ticker:command' && d.command !== '__status');
+    check('chat (an older Ticker Command, /mock/oldcs): !pollnow is relayed as "pollnow", and the sidecar, which matches names without regard to case, polls',
+      !!polledOld && statusOf(polledOld).lastError === '' && relayedOld?.command === 'pollnow',
+      JSON.stringify({ polled: !!polledOld, relayed: relayedOld?.command }));
     at = mark();
     cmd('stop');
     await since(at, (d) => statusOf(d)?.polling === false);
@@ -3531,6 +3740,8 @@ async function testAccepts(client, sc, since, mark, cmd, cfgPath) {
     check('chat: !ticker seturl with no value while polling clears the URL and stops polling',
       !!chatRunning && emptied?.url === null && emptied?.polling === false && emptied?.commandNotice === '',
       JSON.stringify({ running: !!chatRunning, url: emptied?.url, polling: emptied?.polling, commandNotice: emptied?.commandNotice }));
+  } finally {
+    await mockGet('/mock/oldcs?on=0');
   }
 
   // Confinement (ZIPPER_ALLOW_STUB=1 here), checked as text before any file call.

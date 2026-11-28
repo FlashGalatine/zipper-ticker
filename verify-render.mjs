@@ -17,7 +17,8 @@
 // page sets, with skewClock (the logo page); a late web font (fontCss, the late-font
 // pages), with the first loop paused (pauseFirstLoop) on all but the first of them, and an
 // announcement on the first update (announceFirst) or the moment the re-measure's fade
-// starts (announceOnFade). Routes serve three test logos (one 1.5 s late, one that fails
+// starts (announceOnFade). The announcement de-dup page records each announcement put on
+// the strip (annShown). Routes serve three test logos (one 1.5 s late, one that fails
 // once) and a system font file 1.5 s late, and the wrap-swap page has every request
 // beyond 127.0.0.1 aborted. It runs in a real Chromium (system Edge/Chrome via
 // playwright-core; nothing bundled) against the mock SB server, injects the sample
@@ -55,6 +56,20 @@ async function sendStatus(status) {
     await new Promise((res, rej) => { ws.once('open', res); ws.once('error', rej); });
     const answered = new Promise((res) => ws.on('message', (raw) => { try { if (JSON.parse(String(raw)).id === 'status') res(true); } catch {} }));
     ws.send(JSON.stringify({ request: 'DoAction', id: 'status', action: { name: 'Ticker Command' }, args: { command: '__status', value: JSON.stringify(status) } }));
+    await Promise.race([answered, sleep(3000)]);
+  } finally {
+    try { ws.close(); } catch {}
+  }
+}
+
+// One DoAction of an action, with these arguments, through the mock's copy of it, from a
+// client of the suite's own (as the sidecar sends).
+async function doAction(name, args) {
+  const ws = new WebSocket(`ws://127.0.0.1:${WS_PORT}/`);
+  try {
+    await new Promise((res, rej) => { ws.once('open', res); ws.once('error', rej); });
+    const answered = new Promise((res) => ws.on('message', (raw) => { try { if (JSON.parse(String(raw)).id === 'render-do') res(true); } catch {} }));
+    ws.send(JSON.stringify({ request: 'DoAction', id: 'render-do', action: { name }, args }));
     await Promise.race([answered, sleep(3000)]);
   } finally {
     try { ws.close(); } catch {}
@@ -364,6 +379,94 @@ try {
       JSON.stringify({ pausedLoop, resumedLoop }));
     const items = await page.locator('.track .seg').first().locator('.item').count();
     check('announce: results intact after takeover', items >= 4, String(items));
+    await closePage(p);
+  }
+
+  // Row 9.2 (ZIP-10): an announcement identical to the one before it (the last one waiting,
+  // or, with none waiting, the one on screen) is dropped: an older Ticker Announce sends
+  // the same line for every gift of a gift bomb. Identical means as shown:
+  // the same pill, text and duration. Once the one before it has gone, the same one shows
+  // again. annShown records each announcement put on the strip, as "pill|text".
+  {
+    const annShown = () => {
+      window.__annShown = [];
+      window.__annKinds = []; // the strip's data-kind for each, beside it
+      document.addEventListener('DOMContentLoaded', () => {
+        const text = document.getElementById('announce-text');
+        const pill = document.getElementById('announce-pill');
+        const wrap = document.getElementById('announce');
+        new MutationObserver((records) => {
+          for (const r of records) {
+            if (!r.addedNodes.length) continue;
+            window.__annShown.push(`${pill.textContent}|${text.textContent}`);
+            window.__annKinds.push(wrap.dataset.kind);
+          }
+        }).observe(text, { childList: true });
+      });
+    };
+    const p = await openPage('announce de-dup page', { width: 1920, height: 72 }, `${HTTP}/zipper-overlay/ticker.html?w=1920&sbport=${WS_PORT}`, { init: annShown });
+    const { page } = p;
+    await page.waitForSelector('.track .seg .item', { timeout: 8000 });
+    const announce = (text, kind, duration = 2) => fetch(`${HTTP}/mock/announce?text=${encodeURIComponent(text)}&kind=${kind}&duration=${duration}`);
+    // The first gift-bomb line shows; its copy, sent while it is on screen, is dropped. The
+    // second line waits behind it; its copy, sent while it waits, is dropped. The same text
+    // under another pill is not the same announcement, nor is one with another duration.
+    await announce('Gifter just subscribed!', 'sub');
+    await announce('Gifter just subscribed!', 'sub');
+    await announce('Second line', 'custom');
+    await announce('Second line', 'custom');
+    await announce('Same text', 'raid');
+    await announce('Same text', 'custom');
+    await announce('Same text', 'custom', 3);
+    await announce('De-dup marker', 'custom');
+    await page.waitForFunction(() => window.__annShown.some((s) => s.endsWith('|De-dup marker')), null, { timeout: 30000 }).catch(() => {});
+    const shown = await page.evaluate(() => window.__annShown.slice());
+    check('announce (row 9.2): two identical announcements in a row show once, whether the first is on screen or still waiting; the same text under another pill, or with another duration, still shows',
+      JSON.stringify(shown) === JSON.stringify(['New Sub|Gifter just subscribed!', 'Announcement|Second line', 'Raid|Same text', 'Announcement|Same text', 'Announcement|Same text', 'Announcement|De-dup marker']),
+      JSON.stringify(shown));
+    // Once the marker has gone, the same announcement is shown again.
+    await page.waitForSelector('.zipper:not(.announcing)', { timeout: 8000 }).catch(() => {});
+    await announce('De-dup marker', 'custom');
+    await page.waitForFunction((n) => window.__annShown.length > n, shown.length, { timeout: 5000 }).catch(() => {});
+    const again = await page.evaluate(() => window.__annShown.slice());
+    check('announce (row 9.2): an announcement the same as one that has finished is shown again',
+      again.length === shown.length + 1 && again[again.length - 1] === 'Announcement|De-dup marker', JSON.stringify(again));
+
+    // Identical means as it would show (review of Sprint 9): a kind the pill does not know is
+    // "custom", the text is trimmed and cut to 200 characters, and the duration is clamped
+    // to 2-30 s, all before the compare. A kind that only an object's prototype answers to
+    // ("constructor", "__proto__") is no pill of its own: it shows as "Announcement", with
+    // data-kind "custom". /mock/announce trims its text and clamps its duration, so the
+    // untrimmed text and the duration below 2 go as a raw ticker:announce through /mock/push,
+    // and the stored payload is put back afterwards.
+    const storedBefore = (await (await fetch(`${HTTP}/mock/stats`)).json()).storedPayload;
+    const raw = (d) => fetch(`${HTTP}/mock/push`, { method: 'POST', body: JSON.stringify({ type: 'ticker:announce', ...d }) });
+    const long = 'L'.repeat(200);
+    await announce('Kind line', 'giftbomb');
+    await announce('Kind line', 'custom');
+    try {
+      await raw({ kind: 'custom', text: '  Spaced line  ', duration: 2 });
+      await raw({ kind: 'custom', text: 'Spaced line', duration: 1 });
+    } finally {
+      if (storedBefore) await fetch(`${HTTP}/mock/push`, { method: 'POST', body: storedBefore });
+    }
+    await announce(long + 'A', 'custom');
+    await announce(long + 'B', 'custom');
+    await announce('Proto line', 'constructor');
+    await announce('Proto line', 'custom');
+    await announce('Proto two', '__proto__');
+    await announce('Norm marker', 'custom');
+    await page.waitForFunction(() => window.__annShown.some((s) => s.endsWith('|Norm marker')), null, { timeout: 30000 }).catch(() => {});
+    const norm = await page.evaluate(() => ({ shown: window.__annShown.slice(), kinds: window.__annKinds.slice() }));
+    const normShown = norm.shown.slice(again.length);
+    const normKinds = norm.kinds.slice(again.length);
+    check('announce (review of Sprint 9): identical means as shown: an unknown kind and "custom", a text with spaces round it and without, two texts the same in their first 200 characters, and durations of 1 and 2 s each show once',
+      JSON.stringify(normShown.filter((s) => !s.includes('|Proto'))) === JSON.stringify(['Announcement|Kind line', 'Announcement|Spaced line', `Announcement|${long}`, 'Announcement|Norm marker']),
+      JSON.stringify(normShown));
+    check('announce (review of Sprint 9): a kind of "constructor" or "__proto__" shows the "Announcement" pill with data-kind "custom", not Object\'s text, and a "constructor" line then sent as "custom" is the same announcement',
+      JSON.stringify(normShown.filter((s) => s.includes('|Proto'))) === JSON.stringify(['Announcement|Proto line', 'Announcement|Proto two'])
+        && normKinds.length === normShown.length && normKinds.every((k) => k === 'custom'),
+      JSON.stringify({ normShown, normKinds }));
     await closePage(p);
   }
 
@@ -959,6 +1062,21 @@ try {
       }
       check('control (ZIP-17): a ticker:error is shown with its message, and outranks "did not answer"',
         (thrown?.sb || '').includes('mock throw for the banner') && !/did not answer/.test(thrown?.sb || '') && thrown.sbShown, JSON.stringify(thrown));
+      // The fixed text the action itself sends when it throws (row 9.4; the throw switch with
+      // no message= sends Ticker Command's own, as its catch block does). The banner names
+      // Streamer.bot's log once, and adds no "(exception)": the message already says it.
+      let realThrown = null;
+      await mockSwitch(`/mock/throw?name=${enc('Ticker Command')}&on=1`);
+      try {
+        await page.click('#btn-poll');
+        await sbNoteHas(/threw an exception/);
+        realThrown = await notesOf(page);
+      } finally {
+        await mockSwitch(`/mock/throw?name=${enc('Ticker Command')}&on=0`);
+      }
+      check('control (row 9.4): the fixed text Ticker Command sends when it throws reads "A Zipper action failed in Streamer.bot: Ticker Command threw an exception. See Streamer.bot\'s log.": the log named once, no "(exception)"',
+        realThrown?.sb === 'A Zipper action failed in Streamer.bot: Ticker Command threw an exception. See Streamer.bot\'s log.'
+          && (realThrown.sb.match(/Streamer\.bot's log/g) || []).length === 1 && realThrown.sbShown, JSON.stringify(realThrown));
       await page.click('#btn-poll');
       await page.waitForFunction(() => (document.getElementById('sb-note')?.textContent ?? 'none') === '', null, { timeout: 4000 }).catch(() => {});
       const cleared = await notesOf(page);
@@ -1018,6 +1136,43 @@ try {
       check('control (row 6.2): a ticker:error that carries a code shows its message with the code after it, and a status clears the line',
         coded?.sb === 'A Zipper action failed in Streamer.bot: A coded failure (ZIP_E42). See Streamer.bot\'s log.' && codedGone.sb === '',
         JSON.stringify({ coded, codedGone }));
+
+      // ticker:error's sender (the owner's ruling of 2026-11-27): an action pasted from 1.0.32
+      // adds action, one pasted before sends none. The page does not read it: the same error
+      // reads the same with action absent, naming the action that sent it, or naming another,
+      // and a status still clears each. Each is read once the line before it has cleared.
+      const senderBanners = {};
+      try {
+        const base = { type: 'ticker:error', code: 'exception', message: 'Ticker Push threw an exception' };
+        for (const [key, err] of [['absent', base], ['own', { ...base, action: 'Ticker Push' }], ['other', { ...base, action: 'Ticker Announce' }]]) {
+          await fetch(`${HTTP}/mock/push`, { method: 'POST', body: JSON.stringify(err) });
+          await sbNoteHas(/Ticker Push threw an exception/);
+          const shown = await notesOf(page);
+          await sendStatus(statusOf({ lastError: `sender mark ${key}` }));
+          await page.waitForFunction(() => (document.getElementById('sb-note')?.textContent ?? 'none') === '', null, { timeout: 4000 }).catch(() => {});
+          const gone = await notesOf(page);
+          senderBanners[key] = { sb: shown?.sb, shown: shown?.sbShown, gone: gone?.sb };
+        }
+      } finally {
+        await fetch(`${HTTP}/mock/push`, { method: 'POST', body: sampleText }); // the store as the checks below expect it
+      }
+      check('control (the owner\'s ruling of 2026-11-27): a ticker:error reads the same with its action absent (an older paste), naming the action that sent it, or naming another: "A Zipper action failed in Streamer.bot: Ticker Push threw an exception. See Streamer.bot\'s log.", and a status clears each; the page does not read the field',
+        ['absent', 'own', 'other'].every((k) => senderBanners[k]?.sb === 'A Zipper action failed in Streamer.bot: Ticker Push threw an exception. See Streamer.bot\'s log.'
+          && senderBanners[k].shown === true && senderBanners[k].gone === ''),
+        JSON.stringify(senderBanners));
+
+      // Ticker Push refusing a payload (row 9.4), through the mock's copy of it: the message,
+      // then its code, and the log named once. The stored payload is left as it was.
+      let badPayload = null;
+      await doAction('Ticker Push', { tickerPayload: 'abc' });
+      await sbNoteHas(/not a JSON object/);
+      badPayload = await notesOf(page);
+      await sendStatus(statusOf({ lastError: 'banner status mark 2' }));
+      await page.waitForFunction(() => (document.getElementById('sb-note')?.textContent ?? 'none') === '', null, { timeout: 4000 }).catch(() => {});
+      const badPayloadGone = await notesOf(page);
+      check('control (row 9.4): Ticker Push refusing a payload reads "A Zipper action failed in Streamer.bot: tickerPayload is not a JSON object (bad-payload). See Streamer.bot\'s log.", and a status clears it',
+        badPayload?.sb === 'A Zipper action failed in Streamer.bot: tickerPayload is not a JSON object (bad-payload). See Streamer.bot\'s log.' && badPayloadGone.sb === '',
+        JSON.stringify({ badPayload, badPayloadGone }));
 
       // The ticker:error line clears on a reconnect. Ticker Command is silent after the
       // reconnect, so the probe's echo (which would clear it too) never comes, and "did

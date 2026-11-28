@@ -8,20 +8,48 @@
 //   kind ∈ sub | raid | milestone | custom   (anything else renders as custom)
 //
 // Call styles:
-//   • SB Twitch triggers — add this action to your Subscription / Gift Sub /
-//     Raid triggers. With no `text` argument it auto-composes one from the
-//     trigger's own arguments (%user%, %viewers%, …):
-//       raid  → "UserName is raiding with 25 viewers!"
-//       sub   → "UserName just subscribed!"
+//   • SB Twitch triggers — add this action to your Subscription, Resubscription,
+//     Gift Subscription, Gift Bomb and Raid triggers. With no `text` argument it
+//     composes one from the trigger's own arguments:
+//       raid      → "UserName is raiding with 25 viewers!"   (user, viewers)
+//       sub       → "UserName just subscribed!"               (user; a resub too)
+//       gift sub  → "Gifter gifted a sub to Recipient!"       (user, recipientUser)
+//       gift bomb → "Gifter gifted 5 subs!", or "Gifter gifted a sub!" for one
+//                                                             (user, gifts)
+//     A missing name reads "Someone", and so does an anonymous gift (its anonymous
+//     argument is true), whatever `user` holds. A Gift Subscription run that is part of a
+//     gift bomb (its fromGiftBomb argument is true) announces nothing, whatever its other
+//     arguments: the Gift Bomb run announces the whole bomb once. So add the Gift Bomb
+//     trigger with the Gift Subscription one, or a bomb is not announced at all, and add
+//     them only once this action is in the blocking queue (QUEUE below): in the Default
+//     queue a bomb's runs, which come together, can mix their arguments, and the Gift
+//     Bomb run can then read a gift sub's fromGiftBomb and be skipped too.
+//     The arguments are the ones Test Trigger gives on Streamer.bot 1.0.7 (its Gift
+//     Subscription test gave fromGiftBomb true, so that test is skipped). NOT checked
+//     against a live gift bomb: whether Gift Subscription fires once per recipient
+//     during one, and in what order (the skip does not depend on the order); what
+//     `user` holds for an anonymous gift; and whether a live Gift Bomb run names its
+//     recipients (not used here).
 //     Pass an explicit `text` argument (Core → Arguments → Set Argument before
-//     this sub-action) to override, e.g. "%user% gifted %giftCount% subs!".
+//     this sub-action) to override, e.g. "%user% gifted %gifts% subs!".
 //   • Control page / Stream Deck — DoAction with args { kind, text, duration }.
 //   • Sidecar milestones — the Zipper sidecar calls this with kind "milestone"
 //     when a StreamElements counter crosses a configured step (README.md).
 //
+// QUEUE: put this action, "Ticker Command" and "Ticker Push" in ONE BLOCKING queue
+// (README, setup step 1). In the Default queue, runs that overlap mix their arguments.
+//
+// ERRORS: an exception is logged here in full, and broadcast as
+// { type:"ticker:error", code:"exception", message:"<fixed text>", action:"Ticker Announce" }:
+// the exception's own message goes to Streamer.bot's log only, never to the pages. action
+// names the sender (ACTION_NAME); the control page and the sidecar do not read it.
+//
 // Setup: add an action named EXACTLY "Ticker Announce" with a single
 // Core -> C# -> Execute C# Code sub-action holding everything below (COMPILE
 // must succeed). Default reference set only — JSON is hand-written.
+//
+// mock-sb-server.mjs (runTickerAnnounce) copies Execute() line for line, and
+// tools/cs/ticker-cases.json is the table both are run against. Change them together.
 
 using System;
 using System.Text;
@@ -29,28 +57,58 @@ using System.Globalization;
 
 public class CPHInline
 {
+    const string EXCEPTION_MESSAGE = "Ticker Announce threw an exception";
+    // This action's exact name, which every ticker:error it sends carries as action.
+    const string ACTION_NAME = "Ticker Announce";
+
     public bool Execute()
     {
         try
         {
+            // A Gift Subscription run that is part of a gift bomb: the Gift Bomb run
+            // announces the bomb once, so this one is skipped. Without this, a bomb of 20
+            // would queue 20 announcements, one per recipient.
+            if (Arg("fromGiftBomb").ToLowerInvariant() == "true")
+            {
+                CPH.LogInfo("[Ticker Announce] a gift sub from a gift bomb: skipped (the Gift Bomb run announces the bomb)");
+                return true;
+            }
+
             string kind = Arg("kind");
             string text = Arg("text");
             string user = FirstArg("user", "userName", "displayName");
 
             // Auto-compose from common Twitch trigger arguments when no explicit
-            // text was set. Raids carry a viewer count; subs carry the user.
+            // text was set. Raids carry a viewer count, a gift bomb its number of gifts,
+            // a gift sub its recipient; subs carry the user.
             if (text.Length == 0)
             {
+                // An anonymous gift (its anonymous argument is true) reads "Someone" whatever
+                // `user` holds: what Streamer.bot puts there for one was not seen.
+                bool anonymous = Arg("anonymous").ToLowerInvariant() == "true";
+                string who = user.Length > 0 && !anonymous ? user : "Someone";
                 string viewers = FirstArg("viewers", "viewerCount", "raiders");
+                string gifts = Arg("gifts");
+                string recipient = Arg("recipientUser");
                 if (viewers.Length > 0)
                 {
                     if (kind.Length == 0) kind = "raid";
-                    text = (user.Length > 0 ? user : "Someone") + " is raiding with " + viewers + " viewers!";
+                    text = who + " is raiding with " + viewers + " viewers!";
+                }
+                else if (gifts.Length > 0)
+                {
+                    if (kind.Length == 0) kind = "sub";
+                    text = gifts == "1" ? who + " gifted a sub!" : who + " gifted " + gifts + " subs!";
+                }
+                else if (recipient.Length > 0)
+                {
+                    if (kind.Length == 0) kind = "sub";
+                    text = who + " gifted a sub to " + recipient + "!";
                 }
                 else if (user.Length > 0)
                 {
                     if (kind.Length == 0) kind = "sub";
-                    text = user + " just subscribed!";
+                    text = who + " just subscribed!";
                 }
             }
             if (kind.Length == 0) kind = "custom";
@@ -74,16 +132,22 @@ public class CPHInline
         }
         catch (Exception ex)
         {
+            // The exception goes to the log. The pages get a code and a fixed text.
             CPH.LogWarn("[Ticker Announce] ERROR: " + ex);
-            CPH.WebsocketBroadcastJson("{\"type\":\"ticker:error\",\"message\":" + JsonStr(ex.Message) + "}");
+            try { CPH.WebsocketBroadcastJson(ErrorJson("exception", EXCEPTION_MESSAGE)); }
+            catch (Exception) { }
             return false;
         }
     }
 
+    // An argument as text, trimmed; "" when it is missing. It is read as an object and
+    // turned into text here, so a trigger's Boolean or Int32 (fromGiftBomb, gifts,
+    // viewers) reads as "True" or "5" whatever Streamer.bot's TryGetArg does when asked
+    // for a string.
     string Arg(string key)
     {
-        string v;
-        return CPH.TryGetArg(key, out v) && v != null ? v.Trim() : "";
+        object v;
+        return CPH.TryGetArg(key, out v) && v != null ? Convert.ToString(v, CultureInfo.InvariantCulture).Trim() : "";
     }
 
     string FirstArg(params string[] keys)
@@ -94,6 +158,13 @@ public class CPHInline
             if (v.Length > 0) return v;
         }
         return "";
+    }
+
+    // { type, code, message, action }, in that order; action is this action's name.
+    static string ErrorJson(string code, string message)
+    {
+        return "{\"type\":\"ticker:error\",\"code\":" + JsonStr(code) + ",\"message\":" + JsonStr(message)
+            + ",\"action\":" + JsonStr(ACTION_NAME) + "}";
     }
 
     // Minimal, correct JSON string encoder (escapes quotes, backslashes, controls).
