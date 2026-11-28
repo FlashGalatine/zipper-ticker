@@ -10,6 +10,43 @@ traceability.
 
 ## [Unreleased]
 
+## [1.0.34] — 2026-11-28
+
+Documentation only. Nothing to copy, re-paste, restart or reload: the three
+action files changed in their comments only, and their code is the same as in
+1.0.32.
+
+### Changed
+
+- **`docs/PROTOCOL.md` matches the code again.** It lists all five payload
+  types, explains every field of `ticker:status`, says when a status is sent,
+  what an empty update holds, how `nextPollAt` is counted, and how a value that
+  is not a number is read by `setOptions` and the single-value commands.
+- **`docs/THEMING.md`** says which CSS rules the `?w`, `?h` and `?speed` params
+  win over, and gives the strip's anatomy and defaults as they are now.
+- **`README.md`** says how to find the hidden sidecar in Task Manager, and that
+  a milestone can repeat after a restart while `config.json` cannot be saved.
+- **The headers of `Ticker Command`, `Ticker Announce` and `Ticker Push`** no
+  longer state anything the code does not do. How a Stream Deck action carries
+  its arguments is marked as not checked.
+- **`docs/control.png` shows the whole control page**, and both strip
+  screenshots are regenerated.
+
+### Development
+
+- `npm run verify` compares the docs with the code: status and config names,
+  limits, defaults and timings are read from the code, and the docs' examples
+  are run through the sidecar's own number reader.
+- `npm run shots` takes the control page as a full page.
+- `npm run verify` 586 checks (was 579), `npm run verify:render` 181,
+  `npm run verify:cs` 45.
+
+### Not checked
+
+- Nothing was looked at in OBS or Streamer.bot.
+- The Task Manager steps were not checked on a live Windows screen.
+- Following the README from a clean folder is still to be done by the owner.
+
 ## [1.0.32] — 2026-11-28
 
 Copy the folder and refresh the OBS overlay source. Then, in Streamer.bot,
@@ -687,7 +724,8 @@ Initial release — scrolling tournament-results ticker for Streamer.bot.
 Live-validated keyless against real start.gg and Challonge brackets across
 pre-start, mid-event and completed states.
 
-[Unreleased]: https://github.com/FlashGalatine/zipper-ticker/compare/v1.0.32...main
+[Unreleased]: https://github.com/FlashGalatine/zipper-ticker/compare/v1.0.34...main
+[1.0.34]: https://github.com/FlashGalatine/zipper-ticker/compare/v1.0.32...v1.0.34
 [1.0.32]: https://github.com/FlashGalatine/zipper-ticker/compare/v1.0.30...v1.0.32
 [1.0.30]: https://github.com/FlashGalatine/zipper-ticker/compare/v1.0.28...v1.0.30
 [1.0.28]: https://github.com/FlashGalatine/zipper-ticker/compare/v1.0.26...v1.0.28
