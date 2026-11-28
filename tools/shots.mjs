@@ -85,7 +85,9 @@ try {
   const page = await browser.newPage({ viewport: { width: 700, height: 900 } });
   await page.goto(`${HTTP}/zipper-shared/control.html?sbport=${WS_PORT}`);
   await page.waitForSelector('#preview .m', { timeout: 8000 });
-  await page.screenshot({ path: resolve(DOCS, 'control.png') });
+  // The whole page, however tall it is: a fixed 900 px frame ended inside it. fullPage
+  // takes the page past the viewport; the ticker shots above keep their fixed frames.
+  await page.screenshot({ path: resolve(DOCS, 'control.png'), fullPage: true });
   await page.close();
   console.log('docs/control.png');
 } catch (err) {

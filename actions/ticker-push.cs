@@ -1,4 +1,4 @@
-// Streamer.bot "Ticker Push" action — the single broadcast surface for Zipper.
+// Streamer.bot "Ticker Push" action — the one way a ticker:update reaches the pages.
 //
 // Dual mode:
 //   • Sidecar path — zipper-sidecar.mjs calls DoAction "Ticker Push" with a
